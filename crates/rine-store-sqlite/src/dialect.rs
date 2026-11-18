@@ -11,7 +11,7 @@ pub struct SqliteDialect;
 
 impl Dialect for SqliteDialect {
     fn create_table_sql() -> &'static str {
-        "CREATE TABLE kine (\
+        "CREATE TABLE rine (\
             id INTEGER PRIMARY KEY AUTOINCREMENT, \
             name VARCHAR(630), \
             created INTEGER DEFAULT 0, \
@@ -35,7 +35,7 @@ impl Dialect for SqliteDialect {
     }
 
     fn probe_sql() -> &'static str {
-        "SELECT 1 FROM kine LIMIT 1"
+        "SELECT 1 FROM rine LIMIT 1"
     }
 
     fn current_revision_sql() -> &'static str {
@@ -43,91 +43,91 @@ impl Dialect for SqliteDialect {
     }
 
     fn compact_revision_sql() -> &'static str {
-        "SELECT MAX(prev_revision) FROM kine WHERE name = 'compact_rev_key'"
+        "SELECT MAX(prev_revision) FROM rine WHERE name = 'compact_rev_key'"
     }
 
     fn compacted_rev_sql() -> &'static str {
-        "SELECT prev_revision FROM kine WHERE name = 'compact_rev_key'"
+        "SELECT prev_revision FROM rine WHERE name = 'compact_rev_key'"
     }
 
     fn live_by_name_sql() -> String {
         format!(
-            "SELECT {COLS} FROM kine WHERE name = ? AND deleted = 0",
+            "SELECT {COLS} FROM rine WHERE name = ? AND deleted = 0",
             COLS = Self::cols()
         )
     }
 
     fn resolve_id_sql() -> &'static str {
-        "SELECT id FROM kine WHERE name = ? AND prev_revision = ?"
+        "SELECT id FROM rine WHERE name = ? AND prev_revision = ?"
     }
 
     fn history_by_name_sql() -> String {
         format!(
-            "SELECT {COLS} FROM kine WHERE name = ? AND id <= ? ORDER BY id DESC",
+            "SELECT {COLS} FROM rine WHERE name = ? AND id <= ? ORDER BY id DESC",
             COLS = Self::cols()
         )
     }
 
     fn events_sql() -> String {
         format!(
-            "SELECT {COLS} FROM kine WHERE id >= ? AND id <= ? ORDER BY id",
+            "SELECT {COLS} FROM rine WHERE id >= ? AND id <= ? ORDER BY id",
             COLS = Self::cols()
         )
     }
 
     fn get_sql() -> String {
         format!(
-            "SELECT {COLS} FROM kine WHERE name = ? AND deleted = 0 ORDER BY id DESC LIMIT 1",
+            "SELECT {COLS} FROM rine WHERE name = ? AND deleted = 0 ORDER BY id DESC LIMIT 1",
             COLS = Self::cols()
         )
     }
 
     fn list_exact_sql() -> String {
         format!(
-            "SELECT {COLS} FROM kine WHERE name = ? AND deleted = 0 ORDER BY name, id",
+            "SELECT {COLS} FROM rine WHERE name = ? AND deleted = 0 ORDER BY name, id",
             COLS = Self::cols()
         )
     }
 
     fn list_ge_sql() -> String {
         format!(
-            "SELECT {COLS} FROM kine WHERE name >= ? AND deleted = 0 ORDER BY name, id",
+            "SELECT {COLS} FROM rine WHERE name >= ? AND deleted = 0 ORDER BY name, id",
             COLS = Self::cols()
         )
     }
 
     fn list_range_sql() -> String {
-        format!("SELECT {COLS} FROM kine WHERE name >= ? AND name < ? AND deleted = 0 ORDER BY name, id", COLS = Self::cols())
+        format!("SELECT {COLS} FROM rine WHERE name >= ? AND name < ? AND deleted = 0 ORDER BY name, id", COLS = Self::cols())
     }
 
     fn insert_sql() -> &'static str {
-        "INSERT INTO kine (name, created, deleted, create_revision, prev_revision, lease, version, value) \
+        "INSERT INTO rine (name, created, deleted, create_revision, prev_revision, lease, version, value) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
     }
 
     fn mark_deleted_sql() -> &'static str {
-        "UPDATE kine SET deleted = ? WHERE name = ? AND deleted = 0"
+        "UPDATE rine SET deleted = ? WHERE name = ? AND deleted = 0"
     }
 
     fn set_deleted_by_id_sql() -> &'static str {
-        "UPDATE kine SET deleted = ? WHERE id = ? AND deleted = 0"
+        "UPDATE rine SET deleted = ? WHERE id = ? AND deleted = 0"
     }
 
     fn set_create_rev_sql() -> &'static str {
-        "UPDATE kine SET create_revision = ? WHERE id = ?"
+        "UPDATE rine SET create_revision = ? WHERE id = ?"
     }
 
     fn compact_delete_sql() -> &'static str {
-        "DELETE FROM kine WHERE id < ? AND name <> 'compact_rev_key' \
-         AND id NOT IN (SELECT MAX(id) FROM kine WHERE id <= ? GROUP BY name)"
+        "DELETE FROM rine WHERE id < ? AND name <> 'compact_rev_key' \
+         AND id NOT IN (SELECT MAX(id) FROM rine WHERE id <= ? GROUP BY name)"
     }
 
     fn set_compact_rev_sql() -> &'static str {
-        "UPDATE kine SET prev_revision = ? WHERE name = 'compact_rev_key'"
+        "UPDATE rine SET prev_revision = ? WHERE name = 'compact_rev_key'"
     }
 
     fn set_compact_rev_insert_sql() -> &'static str {
-        "INSERT INTO kine (name, created, deleted, create_revision, prev_revision, lease) \
+        "INSERT INTO rine (name, created, deleted, create_revision, prev_revision, lease) \
          VALUES ('compact_rev_key', 0, 0, 0, ?, 0)"
     }
 

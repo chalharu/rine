@@ -1,6 +1,6 @@
 //! Lease manager + Lease service.
 //!
-//! kine grants dummy leases; here leases are tracked and expired keys are
+//! rine grants dummy leases; here leases are tracked and expired keys are
 //! deleted by a background task, which is what the k8s apiserver relies on.
 
 use crate::backend::Backend;
