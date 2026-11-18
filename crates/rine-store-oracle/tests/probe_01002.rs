@@ -329,6 +329,20 @@ fn probe_select_shapes() {
     })();
     println!("Q4 resolve_id control: {r:?}");
 
+    // Q6: live_by_name shape + ORDER BY.
+    let r: Result<Vec<Vec<String>>, oracledb::Error> = (|| {
+        let c = conn.query(
+            "SELECT id, name, created, deleted, create_revision, prev_revision, lease, version, value FROM kineq WHERE name = :1 AND deleted = 0 ORDER BY id",
+            &[&"foo" as &dyn oracledb::ToDbValue],
+        )?;
+        let mut out = Vec::new();
+        for row in c {
+            out.push(read_all(&row?)?);
+        }
+        Ok(out)
+    })();
+    println!("Q6 live_by_name + ORDER BY: {r:?}");
+
     let _ = conn.execute("DROP TABLE kineq", &[]);
     conn.commit().unwrap();
 }
