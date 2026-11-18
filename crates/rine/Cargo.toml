@@ -1,6 +1,6 @@
 [package]
 name = "rine"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "rine server binary"
@@ -10,13 +10,13 @@ name = "rine"
 path = "src/main.rs"
 
 [dependencies]
-rine-etcd = { path = "../rine-etcd" }
-rine-store-oracle = { path = "../rine-store-oracle" }
-rine-store-sqlite = { path = "../rine-store-sqlite" }
+rine-etcd.workspace = true
+rine-store-oracle.workspace = true
+rine-store-sqlite.workspace = true
 oracledb.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
-clap = { version = "4", features = ["derive", "env"] }
+clap.workspace = true
