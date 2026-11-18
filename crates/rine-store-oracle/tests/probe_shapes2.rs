@@ -134,4 +134,29 @@ fn probe_table_state_matrix() {
         let _ = conn.execute(&format!("DROP TABLE {t}"), &[]);
     }
     conn.commit().unwrap();
+
+    // Dictionary state: recyclebin leftovers, kine indexes status.
+    let dump_q = |label: &str, sql: &str| {
+        let c = conn.query(sql, &[]).unwrap();
+        let mut out = Vec::new();
+        for row in c {
+            let row = row.unwrap();
+            let a: Option<String> = row.get(0).unwrap();
+            let b: Option<String> = row.get(1).unwrap();
+            out.push(format!("{a:?}/{b:?}"));
+        }
+        println!("DICT {label}: [{}]", out.join(", "));
+    };
+    dump_q(
+        "recyclebin",
+        "SELECT object_name, original_name FROM user_recyclebin ORDER BY 1",
+    );
+    dump_q(
+        "kine tables",
+        "SELECT table_name, status FROM user_tables WHERE table_name LIKE 'KINE%' ORDER BY 1",
+    );
+    dump_q(
+        "kine indexes",
+        "SELECT index_name, status FROM user_indexes WHERE table_name = 'KINE' ORDER BY 1",
+    );
 }
