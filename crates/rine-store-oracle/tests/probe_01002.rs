@@ -220,6 +220,119 @@ fn probe_fetch_01002() {
     conn.commit().unwrap();
 }
 
+/// Bisects the live_by_name blind spot on an isolated table (no `kine`
+/// clashes with the other probe running in parallel).
+#[test]
+fn probe_select_shapes() {
+    if !live_enabled() {
+        eprintln!("skipping probe (RINE_LIVE_ORACLE != 1)");
+        return;
+    }
+    let host = std::env::var("ORACLE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let port = std::env::var("ORACLE_PORT").unwrap_or_else(|_| "1521".into());
+    let service = std::env::var("ORACLE_SERVICE").unwrap_or_else(|_| "XEPDB1".into());
+    let user = std::env::var("ORACLE_USER").unwrap_or_else(|_| "rine".into());
+    let password = std::env::var("ORACLE_PASSWORD").unwrap_or_else(|_| "RinePass123_".into());
+    let conn = oracledb::connect(
+        oracledb::Config::default()
+            .set_credentials(&user, &password)
+            .set_connect_string(&format!("{host}:{port}/{service}"))
+            .unwrap(),
+    )
+    .unwrap();
+    for ddl in [
+        "DROP TABLE kineq",
+        "CREATE TABLE kineq (id NUMBER PRIMARY KEY, name VARCHAR2(630), created NUMBER DEFAULT 0, deleted NUMBER DEFAULT 0, create_revision NUMBER DEFAULT 0, prev_revision NUMBER DEFAULT 0, lease NUMBER DEFAULT 0, version NUMBER DEFAULT 1, value BLOB)",
+    ] {
+        let _ = conn.execute(ddl, &[]);
+    }
+    for (i, (k, v)) in [("foo", "bar"), ("s/a", "1"), ("s/b", "2"), ("s/c", "3")]
+        .into_iter()
+        .enumerate()
+    {
+        let id = i as i64 + 1;
+        let data = v.as_bytes().to_vec();
+        conn.execute(
+            "INSERT INTO kineq (id, name, created, deleted, create_revision, prev_revision, lease, version, value) VALUES (:1, :2, 0, 0, 0, 0, 0, 1, :3)",
+            &[&id as &dyn oracledb::ToDbValue, &k, &data],
+        )
+        .unwrap();
+    }
+    conn.commit().unwrap();
+
+    fn read_all(row: &oracledb::Row) -> Result<Vec<String>, oracledb::Error> {
+        let mut out = Vec::new();
+        for i in [0usize, 1, 2, 3, 4, 5, 6, 7] {
+            let v: Option<i64> = if i == 1 {
+                let s: Option<String> = row.get(i)?;
+                out.push(format!("{s:?}"));
+                continue;
+            } else {
+                row.get(i)?
+            };
+            out.push(format!("{v:?}"));
+        }
+        let b: Option<Vec<u8>> = row.get(8)?;
+        out.push(format!("{:?}", b.map(|v| v.len())));
+        Ok(out)
+    }
+
+    // Q1: exact live_by_name shape with bind.
+    let r: Result<Vec<Vec<String>>, oracledb::Error> = (|| {
+        let c = conn.query(
+            "SELECT id, name, created, deleted, create_revision, prev_revision, lease, version, value FROM kineq WHERE name = :1 AND deleted = 0",
+            &[&"foo" as &dyn oracledb::ToDbValue],
+        )?;
+        let mut out = Vec::new();
+        for row in c {
+            out.push(read_all(&row?)?);
+        }
+        Ok(out)
+    })();
+    println!("Q1 live_by_name bind: {r:?}");
+
+    // Q2: same with literal.
+    let r: Result<Vec<Vec<String>>, oracledb::Error> = (|| {
+        let c = conn.query(
+            "SELECT id, name, created, deleted, create_revision, prev_revision, lease, version, value FROM kineq WHERE name = 'foo' AND deleted = 0",
+            &[],
+        )?;
+        let mut out = Vec::new();
+        for row in c {
+            out.push(read_all(&row?)?);
+        }
+        Ok(out)
+    })();
+    println!("Q2 live_by_name literal: {r:?}");
+
+    // Q3: same shape, different key.
+    let r: Result<Vec<Vec<String>>, oracledb::Error> = (|| {
+        let c = conn.query(
+            "SELECT id, name, created, deleted, create_revision, prev_revision, lease, version, value FROM kineq WHERE name = :1 AND deleted = 0",
+            &[&"s/a" as &dyn oracledb::ToDbValue],
+        )?;
+        let mut out = Vec::new();
+        for row in c {
+            out.push(read_all(&row?)?);
+        }
+        Ok(out)
+    })();
+    println!("Q3 live_by_name other key: {r:?}");
+
+    // Q4: resolve_id shape (control).
+    let r: Result<Option<i64>, oracledb::Error> = (|| {
+        let row = conn.query_row(
+            "SELECT id FROM kineq WHERE name = :1 AND prev_revision = :2",
+            &[&"foo" as &dyn oracledb::ToDbValue, &0i64],
+        )?;
+        Ok(row.get(0)?)
+    })();
+    println!("Q4 resolve_id control: {r:?}");
+
+    let _ = conn.execute("DROP TABLE kineq", &[]);
+    conn.commit().unwrap();
+}
+
 /// Replicates the failing etcdctl sequence through the real backend stack
 /// (OracleDb + OracleBackend): create foo, get foo, create s/*, prefix list.
 #[tokio::test]
