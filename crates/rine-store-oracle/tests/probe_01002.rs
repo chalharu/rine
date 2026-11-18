@@ -237,15 +237,43 @@ async fn probe_backend_prefix_list() {
     let user = std::env::var("ORACLE_USER").unwrap_or_else(|_| "rine".into());
     let password = std::env::var("ORACLE_PASSWORD").unwrap_or_else(|_| "RinePass123_".into());
     let db = OracleDb::connect(&user, &password, &format!("{host}:{port}/{service}")).unwrap();
+    let raw = oracledb::connect(
+        oracledb::Config::default()
+            .set_credentials(&user, &password)
+            .set_connect_string(&format!("{host}:{port}/{service}"))
+            .unwrap(),
+    )
+    .unwrap();
+    let dump = |label: &str| {
+        let c = raw
+            .query(
+                "SELECT id, name, deleted, LENGTH(value) FROM kine ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        let mut rows = Vec::new();
+        for row in c {
+            let row = row.unwrap();
+            let id: Option<i64> = row.get(0).unwrap();
+            let name: Option<String> = row.get(1).unwrap();
+            let deleted: Option<i64> = row.get(2).unwrap();
+            let vlen: Option<i64> = row.get(3).unwrap();
+            rows.push(format!("{id:?}/{name:?}/{deleted:?}/{vlen:?}"));
+        }
+        println!("DUMP {label}: [{}]", rows.join(", "));
+    };
     let _ = db.execute("DROP TABLE kine", vec![]).await;
     let backend = OracleBackend::new(Arc::new(db));
     backend.ensure_schema().await.unwrap();
+    dump("fresh");
 
     backend
         .create(bytes::Bytes::from("foo"), bytes::Bytes::from("bar"), 0)
         .await
         .unwrap();
+    dump("after create foo");
     let (_, kv) = backend.get(b"foo", 0).await.unwrap();
+    println!("GET foo -> {kv:?}");
     assert_eq!(kv.unwrap().value, bytes::Bytes::from("bar"));
     for (k, v) in [("s/b", "2"), ("s/a", "1"), ("s/c", "3")] {
         backend
