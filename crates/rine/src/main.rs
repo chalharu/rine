@@ -1,8 +1,7 @@
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+
 use anyhow::Result;
 use clap::Parser;
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "rine", version)]

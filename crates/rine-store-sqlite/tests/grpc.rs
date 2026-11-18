@@ -1,15 +1,18 @@
 //! gRPC over the SQLite-backed store: proves the full stack serves the
 //! etcd API against a real (in-memory) database.
 
-use rine_etcd::etcdserverpb::compare::{CompareResult, CompareTarget, TargetUnion};
-use rine_etcd::etcdserverpb::kv_client::KvClient;
-use rine_etcd::etcdserverpb::{
-    Compare, PutRequest, RangeRequest, RequestOp, TxnRequest, request_op,
+use std::{sync::Arc, time::Duration};
+
+use rine_etcd::{
+    etcdserverpb::{
+        Compare, PutRequest, RangeRequest, RequestOp, TxnRequest,
+        compare::{CompareResult, CompareTarget, TargetUnion},
+        kv_client::KvClient,
+        request_op,
+    },
+    server::EtcdServer,
 };
-use rine_etcd::server::EtcdServer;
 use rine_store_sqlite::{SqliteBackend, SqliteDb};
-use std::sync::Arc;
-use std::time::Duration;
 
 async fn spawn() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -1,5 +1,6 @@
-use crate::dialect::OracleDialect;
 use rine_store_executor::SqlBackend;
+
+use crate::dialect::OracleDialect;
 
 /// Oracle-flavored [`SqlBackend`].
 pub type OracleBackend<E> = SqlBackend<E, OracleDialect>;

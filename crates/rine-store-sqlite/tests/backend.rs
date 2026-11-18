@@ -3,10 +3,11 @@
 //! Mirrors the MockExec-backed unit tests and the live Oracle test, so the
 //! shared `SqlBackend` logic is validated against a real database locally.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use rine_etcd::backend::{Backend, ListOptions};
 use rine_store_sqlite::{SqliteBackend, SqliteDb};
-use std::sync::Arc;
 
 async fn backend() -> SqliteBackend {
     let db = SqliteDb::open_in_memory().unwrap();

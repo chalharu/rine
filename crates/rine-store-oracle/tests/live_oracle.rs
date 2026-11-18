@@ -8,12 +8,12 @@
 //! `ORACLE_HOST`, `ORACLE_PORT`, `ORACLE_SERVICE`, `ORACLE_USER`,
 //! `ORACLE_PASSWORD`.
 
+use std::{sync::Arc, time::Duration};
+
 use bytes::Bytes;
 use rine_etcd::backend::{Backend, ListOptions};
 use rine_store_executor::{SqlExecutor as _, SqlValue};
 use rine_store_oracle::{OracleBackend, OracleDb};
-use std::sync::Arc;
-use std::time::Duration;
 
 fn live_enabled() -> bool {
     std::env::var("RINE_LIVE_ORACLE").as_deref() == Ok("1")

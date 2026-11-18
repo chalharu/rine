@@ -4,20 +4,27 @@
 //! unused), history replay from `start_revision`, cancel/progress, and cancel
 //! with `compact_revision` when history is unavailable.
 
-use crate::backend::{Backend, Event};
-use crate::etcdserverpb::watch_server::Watch;
-use crate::etcdserverpb::{
-    ResponseHeader, WatchCancelRequest, WatchCreateRequest, WatchProgressRequest, WatchRequest,
-    WatchResponse,
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
+    time::Duration,
 };
-use crate::kv::to_proto_kv;
-use crate::mvccpb;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::Duration;
+
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+
+use crate::{
+    backend::{Backend, Event},
+    etcdserverpb::{
+        ResponseHeader, WatchCancelRequest, WatchCreateRequest, WatchProgressRequest, WatchRequest,
+        WatchResponse, watch_server::Watch,
+    },
+    kv::to_proto_kv,
+    mvccpb,
+};
 
 struct Watcher {
     key: Vec<u8>,

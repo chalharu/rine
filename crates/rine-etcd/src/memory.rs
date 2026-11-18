@@ -5,13 +5,16 @@
 //! Events carry full before/after snapshots so Watch responses include the
 //! metadata (create/mod revision, version, lease) etcd clients expect.
 
-use crate::backend::{Backend, Event, KeyValue, LeaseId, ListOptions, Revision};
-use crate::error::{Error, Result};
+use std::{collections::HashMap, sync::Arc};
+
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
+
+use crate::{
+    backend::{Backend, Event, KeyValue, LeaseId, ListOptions, Revision},
+    error::{Error, Result},
+};
 
 struct Inner {
     rev: Revision,

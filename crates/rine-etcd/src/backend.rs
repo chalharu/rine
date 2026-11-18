@@ -1,9 +1,10 @@
 //! Storage contract. `server.Backend` + `logstructured` MVCC rules.
 
-use crate::error::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::broadcast;
+
+use crate::error::Result;
 
 pub type Revision = i64;
 pub type LeaseId = i64;

@@ -3,19 +3,27 @@
 //! rine grants dummy leases; here leases are tracked and expired keys are
 //! deleted by a background task, which is what the k8s apiserver relies on.
 
-use crate::backend::Backend;
-use crate::etcdserverpb::lease_server::Lease;
-use crate::etcdserverpb::{
-    LeaseGrantRequest, LeaseGrantResponse, LeaseKeepAliveRequest, LeaseKeepAliveResponse,
-    LeaseLeasesRequest, LeaseLeasesResponse, LeaseRevokeRequest, LeaseRevokeResponse, LeaseStatus,
-    LeaseTimeToLiveRequest, LeaseTimeToLiveResponse, ResponseHeader,
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
+    time::{Duration, Instant},
 };
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::{Duration, Instant};
+
 use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
+
+use crate::{
+    backend::Backend,
+    etcdserverpb::{
+        LeaseGrantRequest, LeaseGrantResponse, LeaseKeepAliveRequest, LeaseKeepAliveResponse,
+        LeaseLeasesRequest, LeaseLeasesResponse, LeaseRevokeRequest, LeaseRevokeResponse,
+        LeaseStatus, LeaseTimeToLiveRequest, LeaseTimeToLiveResponse, ResponseHeader,
+        lease_server::Lease,
+    },
+};
 
 struct LeaseEntry {
     ttl: i64,

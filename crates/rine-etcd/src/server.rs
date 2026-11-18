@@ -1,16 +1,18 @@
 //! gRPC server wiring.
 
-use crate::backend::Backend;
-use crate::cluster::{ClusterService, MaintenanceService};
-use crate::etcdserverpb::{
-    cluster_server::ClusterServer, kv_server::KvServer, lease_server::LeaseServer,
-    maintenance_server::MaintenanceServer, watch_server::WatchServer,
+use std::{net::SocketAddr, sync::Arc};
+
+use crate::{
+    backend::Backend,
+    cluster::{ClusterService, MaintenanceService},
+    etcdserverpb::{
+        cluster_server::ClusterServer, kv_server::KvServer, lease_server::LeaseServer,
+        maintenance_server::MaintenanceServer, watch_server::WatchServer,
+    },
+    kv::KvService,
+    lease::{LeaseManager, LeaseService},
+    watch::WatchService,
 };
-use crate::kv::KvService;
-use crate::lease::{LeaseManager, LeaseService};
-use crate::watch::WatchService;
-use std::net::SocketAddr;
-use std::sync::Arc;
 
 pub struct EtcdServer {
     pub backend: Arc<dyn Backend>,

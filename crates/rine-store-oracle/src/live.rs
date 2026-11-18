@@ -9,11 +9,12 @@
 //! `Bytes` -> BLOB, `Null` -> typed BLOB NULL (the only NULL bind the backend
 //! emits is the tombstone `value`).
 
+use std::sync::{Arc, Mutex};
+
 use async_trait::async_trait;
 use oracledb::ToDbValue;
 use rine_etcd::error::{Error, Result};
 use rine_store_executor::{Row, SqlExecutor, SqlValue};
-use std::sync::{Arc, Mutex};
 
 /// Live Oracle connection. `Clone` shares the same underlying session.
 ///

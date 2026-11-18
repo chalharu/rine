@@ -4,19 +4,23 @@
 //! so the k8s apiserver patterns (create/cas/delete/compact-on-key) work
 //! alongside generic clients.
 
-use crate::backend::{Backend, KeyValue, ListOptions};
-use crate::error::Error;
-use crate::etcdserverpb::kv_server::Kv;
-use crate::etcdserverpb::range_request::{SortOrder, SortTarget};
-use crate::etcdserverpb::{
-    CompactionRequest, CompactionResponse, Compare, DeleteRangeRequest, DeleteRangeResponse,
-    PutRequest, PutResponse, RangeRequest, RangeResponse, RequestOp, ResponseHeader, ResponseOp,
-    TxnRequest, TxnResponse,
-};
-use crate::lease::LeaseManager;
-use crate::mvccpb;
-use bytes::Bytes;
 use std::sync::Arc;
+
+use bytes::Bytes;
+
+use crate::{
+    backend::{Backend, KeyValue, ListOptions},
+    error::Error,
+    etcdserverpb::{
+        CompactionRequest, CompactionResponse, Compare, DeleteRangeRequest, DeleteRangeResponse,
+        PutRequest, PutResponse, RangeRequest, RangeResponse, RequestOp, ResponseHeader,
+        ResponseOp, TxnRequest, TxnResponse,
+        kv_server::Kv,
+        range_request::{SortOrder, SortTarget},
+    },
+    lease::LeaseManager,
+    mvccpb,
+};
 
 const MAX_TXN_DEPTH: usize = 8;
 

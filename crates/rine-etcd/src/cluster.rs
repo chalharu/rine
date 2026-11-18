@@ -2,13 +2,15 @@
 //!
 //! Single-member responses sufficient for k8s apiserver health/discovery.
 
-use crate::backend::Backend;
-use crate::etcdserverpb::cluster_server::Cluster;
-use crate::etcdserverpb::maintenance_server::Maintenance;
-use crate::etcdserverpb::{
-    Member, MemberListRequest, MemberListResponse, ResponseHeader, StatusRequest, StatusResponse,
-};
 use std::sync::Arc;
+
+use crate::{
+    backend::Backend,
+    etcdserverpb::{
+        Member, MemberListRequest, MemberListResponse, ResponseHeader, StatusRequest,
+        StatusResponse, cluster_server::Cluster, maintenance_server::Maintenance,
+    },
+};
 
 pub struct ClusterService {
     backend: Arc<dyn Backend>,

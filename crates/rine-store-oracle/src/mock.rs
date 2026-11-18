@@ -3,12 +3,14 @@
 //! Interprets exactly the SQL strings `OracleBackend` generates (see
 //! `dialect`), so backend logic is exercised without a database.
 
-use crate::dialect::OracleDialect;
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use rine_etcd::error::Result;
 use rine_store_executor::{Dialect as _, Row, SqlExecutor, SqlValue};
-use std::collections::HashMap;
 use tokio::sync::Mutex;
+
+use crate::dialect::OracleDialect;
 
 #[derive(Debug, Clone)]
 struct MockRow {

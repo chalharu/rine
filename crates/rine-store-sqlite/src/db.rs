@@ -6,12 +6,16 @@
 //! use sound. Statements autocommit (no explicit transaction handling,
 //! matching the Oracle executor's commit-per-`execute`).
 
-use crate::{Row, SqlExecutor, SqlValue};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
+
 use async_trait::async_trait;
 use rine_etcd::error::{Error, Result};
 use rusqlite::ToSql;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+
+use crate::{Row, SqlExecutor, SqlValue};
 
 /// Live SQLite connection. `Clone` shares the same underlying connection.
 #[derive(Clone, Debug)]

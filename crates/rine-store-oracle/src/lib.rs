@@ -15,7 +15,6 @@ mod mock;
 mod store;
 
 pub use dialect::OracleDialect;
-
 pub use live::OracleDb;
 pub use mock::MockExec;
 pub use store::OracleBackend;

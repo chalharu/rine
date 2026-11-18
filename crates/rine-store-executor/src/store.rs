@@ -1,12 +1,17 @@
-use crate::dialect::Dialect;
-use crate::executor::{Row, SqlExecutor, SqlValue};
+use std::{marker::PhantomData, sync::Arc};
+
 use async_trait::async_trait;
 use bytes::Bytes;
-use rine_etcd::backend::{Backend, Event, KeyValue, LeaseId, ListOptions, Revision};
-use rine_etcd::error::{Error, Result};
-use std::marker::PhantomData;
-use std::sync::Arc;
+use rine_etcd::{
+    backend::{Backend, Event, KeyValue, LeaseId, ListOptions, Revision},
+    error::{Error, Result},
+};
 use tokio::sync::broadcast;
+
+use crate::{
+    dialect::Dialect,
+    executor::{Row, SqlExecutor, SqlValue},
+};
 
 /// kine-style append-only `kine` table over any SQL database.
 ///

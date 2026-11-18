@@ -1,21 +1,25 @@
 //! End-to-end tests: real gRPC client against an in-process server.
 
-use rine_etcd::etcdserverpb::cluster_client::ClusterClient;
-use rine_etcd::etcdserverpb::compare::{CompareResult, CompareTarget, TargetUnion};
-use rine_etcd::etcdserverpb::kv_client::KvClient;
-use rine_etcd::etcdserverpb::lease_client::LeaseClient;
-use rine_etcd::etcdserverpb::maintenance_client::MaintenanceClient;
-use rine_etcd::etcdserverpb::range_request::{SortOrder, SortTarget};
-use rine_etcd::etcdserverpb::watch_client::WatchClient;
-use rine_etcd::etcdserverpb::{
-    CompactionRequest, Compare, DeleteRangeRequest, LeaseGrantRequest, MemberListRequest,
-    PutRequest, RangeRequest, RequestOp, StatusRequest, TxnRequest, WatchCancelRequest,
-    WatchCreateRequest, WatchRequest,
+use std::{sync::Arc, time::Duration};
+
+use rine_etcd::{
+    MemoryBackend,
+    etcdserverpb::{
+        CompactionRequest, Compare, DeleteRangeRequest, LeaseGrantRequest, MemberListRequest,
+        PutRequest, RangeRequest, RequestOp, StatusRequest, TxnRequest, WatchCancelRequest,
+        WatchCreateRequest, WatchRequest,
+        cluster_client::ClusterClient,
+        compare::{CompareResult, CompareTarget, TargetUnion},
+        kv_client::KvClient,
+        lease_client::LeaseClient,
+        maintenance_client::MaintenanceClient,
+        range_request::{SortOrder, SortTarget},
+        request_op,
+        watch_client::WatchClient,
+        watch_request,
+    },
+    server::EtcdServer,
 };
-use rine_etcd::etcdserverpb::{request_op, watch_request};
-use rine_etcd::{MemoryBackend, server::EtcdServer};
-use std::sync::Arc;
-use std::time::Duration;
 
 async fn spawn() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
