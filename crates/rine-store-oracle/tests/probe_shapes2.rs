@@ -160,3 +160,103 @@ fn probe_table_state_matrix() {
         "SELECT index_name, status FROM user_indexes WHERE table_name = 'KINE' ORDER BY 1",
     );
 }
+
+/// Decisive bisect: `Connection::query_row` forces
+/// `prefetch_rows(1).fetch_array_size(1)` while `Connection::query` uses
+/// defaults. Same connection, same row, both paths.
+#[test]
+fn probe_query_row_vs_query() {
+    if !live_enabled() {
+        eprintln!("skipping probe (RINE_LIVE_ORACLE != 1)");
+        return;
+    }
+    let conn = connect();
+    let _ = conn.execute("DROP TABLE qr1", &[]);
+    conn.execute(
+        "CREATE TABLE qr1 (id NUMBER PRIMARY KEY, name VARCHAR2(630), value BLOB)",
+        &[],
+    )
+    .unwrap();
+    let data = b"bar".to_vec();
+    conn.execute(
+        "INSERT INTO qr1 (id, name, value) VALUES (1, 'foo', :1)",
+        &[&data as &dyn oracledb::ToDbValue],
+    )
+    .unwrap();
+    conn.commit().unwrap();
+
+    const FULL: &str = "SELECT id, name, value FROM qr1 WHERE name = :1";
+    const NOLOB: &str = "SELECT id, name FROM qr1 WHERE name = :1";
+
+    // S1: query_row with BLOB (the live_by_name path).
+    let s1: Result<Option<i64>, oracledb::Error> = (|| match conn
+        .query_row(FULL, &[&"foo" as &dyn oracledb::ToDbValue])
+    {
+        Ok(row) => Ok(row.get(0)?),
+        Err(e)
+            if e.kind() == &oracledb::ErrorKind::NoDataFound || e.db_error_code() == Some(1403) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    })();
+    println!("S1 query_row with BLOB: {s1:?}");
+
+    // S2: query + iterate with BLOB (control).
+    let s2: Result<Vec<i64>, oracledb::Error> = (|| {
+        let c = conn.query(FULL, &[&"foo" as &dyn oracledb::ToDbValue])?;
+        let mut out = Vec::new();
+        for row in c {
+            out.push(row?.get(0)?);
+        }
+        Ok(out)
+    })();
+    println!("S2 query with BLOB: {s2:?}");
+
+    // S3: query_row without BLOB (LOB-trigger check).
+    let s3: Result<Option<i64>, oracledb::Error> = (|| match conn
+        .query_row(NOLOB, &[&"foo" as &dyn oracledb::ToDbValue])
+    {
+        Ok(row) => Ok(row.get(0)?),
+        Err(e)
+            if e.kind() == &oracledb::ErrorKind::NoDataFound || e.db_error_code() == Some(1403) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    })();
+    println!("S3 query_row no LOB: {s3:?}");
+
+    // S4: builder with prefetch(1)/array(1) + cursor iterate (fetch-setting check).
+    let s4: Result<Vec<i64>, oracledb::Error> = (|| {
+        let c = conn
+            .statement(FULL)?
+            .prefetch_rows(1)
+            .fetch_array_size(1)
+            .build()?
+            .query(&[&"foo" as &dyn oracledb::ToDbValue])?;
+        let mut out = Vec::new();
+        for row in c {
+            out.push(row?.get(0)?);
+        }
+        Ok(out)
+    })();
+    println!("S4 cursor with prefetch(1)/array(1): {s4:?}");
+
+    // S5: query_row repeated (cache second-hit check).
+    let s5: Result<Option<i64>, oracledb::Error> = (|| match conn
+        .query_row(FULL, &[&"foo" as &dyn oracledb::ToDbValue])
+    {
+        Ok(row) => Ok(row.get(0)?),
+        Err(e)
+            if e.kind() == &oracledb::ErrorKind::NoDataFound || e.db_error_code() == Some(1403) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    })();
+    println!("S5 query_row repeat: {s5:?}");
+
+    let _ = conn.execute("DROP TABLE qr1", &[]);
+    conn.commit().unwrap();
+}
