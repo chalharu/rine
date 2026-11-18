@@ -15,6 +15,9 @@ struct Args {
     /// descriptor, or a TNS alias (resolved via TNS_ADMIN or --wallet-dir).
     #[arg(long, env = "RINE_ORACLE_CONNECT")]
     oracle_connect: Option<String>,
+    /// SQLite database file path (for `--backend sqlite`).
+    #[arg(long, default_value = "rine.db", env = "RINE_SQLITE_PATH")]
+    sqlite_path: PathBuf,
     /// Wallet directory (`tnsnames.ora` + `ewallet.pem`): used as the Oracle
     /// Net configuration directory and wallet location.
     #[arg(long, env = "RINE_WALLET_DIR")]
@@ -39,6 +42,14 @@ async fn main() -> Result<()> {
                 .serve(args.listen)
                 .await?;
         }
+        "sqlite" => {
+            let db = rine_store_sqlite::SqliteDb::open(&args.sqlite_path)?;
+            let backend = Arc::new(rine_store_sqlite::SqliteBackend::new(Arc::new(db)));
+            backend.ensure_schema().await?;
+            rine_etcd::server::EtcdServer::new(backend)
+                .serve(args.listen)
+                .await?;
+        }
         "oracle" => {
             let connect = args.oracle_connect.clone().ok_or_else(|| {
                 anyhow::anyhow!("oracle backend needs --oracle-connect (or RINE_ORACLE_CONNECT)")
@@ -59,7 +70,7 @@ async fn main() -> Result<()> {
                 .serve(args.listen)
                 .await?;
         }
-        other => anyhow::bail!("unknown backend: {other} (expected memory|oracle)"),
+        other => anyhow::bail!("unknown backend: {other} (expected memory|sqlite|oracle)"),
     }
     Ok(())
 }

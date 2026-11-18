@@ -4,18 +4,27 @@ An etcd-API-compatible key-value store backed by Oracle Database, aimed at
 running Kubernetes on Oracle Cloud Infrastructure without etcd.
 
 - `crates/rine-etcd`: etcd API (KV, Watch, Lease, Maintenance, Cluster) over a
-  pluggable `Backend`; includes an in-memory `MemoryBackend`.
-- `crates/rine-store-oracle`: kine-style `OracleBackend` on the `kine` table,
-  plus a `MockExec` for unit tests.
-- `crates/rine`: server binary (`memory` or `oracle` backend).
-- Storage driver: the official [`oracledb`](https://crates.io/crates/oracledb)
-  crate (thin mode, no Oracle Client libraries needed).
+  pluggable `Backend` trait object (`Arc<dyn Backend>`); includes an in-memory
+  `MemoryBackend`.
+- `crates/rine-store-oracle`: shared kine-style `SqlBackend` over a `Dialect`
+  plus the Oracle `OracleDialect`, the live `OracleDb` executor (official
+  `oracledb` driver), and a `MockExec` for unit tests.
+- `crates/rine-store-sqlite`: same backend on SQLite (`SqliteDialect` +
+  `SqliteDb` over rusqlite) — runs locally without any database server.
+- `crates/rine`: server binary (`memory`, `sqlite` or `oracle` backend,
+  selected with `--backend` like kine).
+- Storage drivers: the official [`oracledb`](https://crates.io/crates/oracledb)
+  crate (thin mode, no Oracle Client libraries needed) and
+  [`rusqlite`](https://crates.io/crates/rusqlite) (bundled SQLite).
 
 ## Run
 
 ```sh
 # in-memory backend
 cargo run -p rine
+
+# SQLite backend (file is created on demand, schema auto-created)
+RINE_BACKEND=sqlite RINE_SQLITE_PATH=/tmp/rine.db cargo run -p rine
 
 # Oracle backend (Easy Connect, full descriptor, or TNS alias)
 RINE_BACKEND=oracle \

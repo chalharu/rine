@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 rine-etcd = { path = "../rine-etcd" }
 rine-store-oracle = { path = "../rine-store-oracle" }
+rine-store-sqlite = { path = "../rine-store-sqlite" }
 oracledb.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
