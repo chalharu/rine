@@ -2,6 +2,7 @@
 members = [
     "crates/rine-etcd",
     "crates/rine-store-oracle",
+    "crates/rine-store-sqlite",
     "crates/rine",
 ]
 resolver = "2"
