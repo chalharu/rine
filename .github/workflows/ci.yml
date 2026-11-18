@@ -1,0 +1,187 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unit:
+    name: unit tests (no DB)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: unit tests
+        run: cargo test --workspace
+      - name: clippy
+        run: cargo clippy --workspace --tests
+
+  oracle-xe:
+    name: integration tests (Oracle XE)
+    runs-on: ubuntu-latest
+    services:
+      oracle:
+        image: gvenzl/oracle-xe:21-slim
+        env:
+          ORACLE_PASSWORD: TestPass123_
+          APP_USER: rine
+          APP_USER_PASSWORD: RinePass123_
+        ports:
+          - 1521:1521
+        options: >-
+          --health-cmd healthcheck.sh
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ORACLE_HOST: 127.0.0.1
+      ORACLE_PORT: 1521
+      ORACLE_SERVICE: XEPDB1
+      ORACLE_USER: rine
+      ORACLE_PASSWORD: RinePass123_
+      RINE_LIVE_ORACLE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: wait for Oracle XE (TCP + PDB open)
+        run: |
+          for i in $(seq 1 60); do
+            if (echo > /dev/tcp/127.0.0.1/1521) 2>/dev/null; then
+              echo "port 1521 open after $((i * 10))s"
+              exit 0
+            fi
+            echo "waiting for 1521... ($i/60)"
+            sleep 10
+          done
+          echo "Oracle XE did not open port 1521 in time"
+          exit 1
+      - name: backend integration test (live XE)
+        run: cargo test -p rine-store-oracle --test live_oracle -- --nocapture
+      - name: full workspace tests against live XE
+        run: cargo test --workspace
+
+  sqlite-e2e:
+    name: official client e2e (etcdctl vs SQLite backend)
+    runs-on: ubuntu-latest
+    env:
+      RINE_BACKEND: sqlite
+      RINE_SQLITE_PATH: /tmp/rine.db
+      RINE_LISTEN: 127.0.0.1:2379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build rine
+        run: cargo build -p rine
+      - name: start rine on the SQLite backend
+        run: |
+          rm -f /tmp/rine.db
+          ./target/debug/rine > /tmp/rine.log 2>&1 &
+          echo $! > /tmp/rine.pid
+          echo "rine started"
+      - name: wait for the etcd API
+        run: |
+          for i in $(seq 1 60); do
+            if (echo > /dev/tcp/127.0.0.1/2379) 2>/dev/null; then
+              echo "port 2379 open after $((i * 5))s"
+              exit 0
+            fi
+            echo "waiting for 2379... ($i/60)"
+            sleep 5
+          done
+          echo "rine did not open port 2379 in time"
+          cat /tmp/rine.log
+          exit 1
+      - name: download official etcdctl (v3.5.35)
+        run: |
+          curl -sL https://github.com/etcd-io/etcd/releases/download/v3.5.35/etcd-v3.5.35-linux-amd64.tar.gz -o /tmp/etcd.tgz
+          tar xzf /tmp/etcd.tgz -C /tmp
+          /tmp/etcd-v3.5.35-linux-amd64/etcdctl version
+      - name: official-client conformance
+        run: ENDPOINT=127.0.0.1:2379 ETCDCTL=/tmp/etcd-v3.5.35-linux-amd64/etcdctl bash e2e/etcdctl.sh
+      - name: rine server log
+        if: failure()
+        run: cat /tmp/rine.log
+
+  etcdctl-e2e:
+    name: official client e2e (etcdctl vs Oracle backend)
+    runs-on: ubuntu-latest
+    services:
+      oracle:
+        image: gvenzl/oracle-xe:21-slim
+        env:
+          ORACLE_PASSWORD: TestPass123_
+          APP_USER: rine
+          APP_USER_PASSWORD: RinePass123_
+        ports:
+          - 1521:1521
+        options: >-
+          --health-cmd healthcheck.sh
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      RINE_BACKEND: oracle
+      RINE_ORACLE_CONNECT: 127.0.0.1:1521/XEPDB1
+      RINE_ORACLE_USER: rine
+      RINE_ORACLE_PASSWORD: RinePass123_
+      RINE_LISTEN: 127.0.0.1:2379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: wait for Oracle XE (TCP + PDB open)
+        run: |
+          for i in $(seq 1 60); do
+            if (echo > /dev/tcp/127.0.0.1/1521) 2>/dev/null; then
+              echo "port 1521 open after $((i * 10))s"
+              exit 0
+            fi
+            echo "waiting for 1521... ($i/60)"
+            sleep 10
+          done
+          echo "Oracle XE did not open port 1521 in time"
+          exit 1
+      - name: build rine
+        run: cargo build -p rine
+      - name: start rine on the Oracle backend
+        run: |
+          ./target/debug/rine > /tmp/rine.log 2>&1 &
+          echo $! > /tmp/rine.pid
+          echo "rine started"
+      - name: wait for the etcd API
+        run: |
+          for i in $(seq 1 60); do
+            if (echo > /dev/tcp/127.0.0.1/2379) 2>/dev/null; then
+              echo "port 2379 open after $((i * 5))s"
+              exit 0
+            fi
+            echo "waiting for 2379... ($i/60)"
+            sleep 5
+          done
+          echo "rine did not open port 2379 in time"
+          cat /tmp/rine.log
+          exit 1
+      - name: download official etcdctl (v3.5.35)
+        run: |
+          curl -sL https://github.com/etcd-io/etcd/releases/download/v3.5.35/etcd-v3.5.35-linux-amd64.tar.gz -o /tmp/etcd.tgz
+          tar xzf /tmp/etcd.tgz -C /tmp
+          /tmp/etcd-v3.5.35-linux-amd64/etcdctl version
+      - name: official-client conformance
+        run: ENDPOINT=127.0.0.1:2379 ETCDCTL=/tmp/etcd-v3.5.35-linux-amd64/etcdctl bash e2e/etcdctl.sh
+      - name: rine server log
+        if: failure()
+        run: cat /tmp/rine.log

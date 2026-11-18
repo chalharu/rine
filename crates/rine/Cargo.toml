@@ -1,0 +1,22 @@
+[package]
+name = "rine"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "rine server binary"
+
+[[bin]]
+name = "rine"
+path = "src/main.rs"
+
+[dependencies]
+rine-etcd = { path = "../rine-etcd" }
+rine-store-oracle = { path = "../rine-store-oracle" }
+rine-store-sqlite = { path = "../rine-store-sqlite" }
+oracledb.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
