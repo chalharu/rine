@@ -18,11 +18,19 @@ async fn backend() -> SqliteBackend {
 #[tokio::test]
 async fn sqlite_crud() {
     let b = backend().await;
-    let r1 = b.create(Bytes::from("a"), Bytes::from("1"), 0).await.unwrap();
-    assert!(b.create(Bytes::from("a"), Bytes::from("x"), 0).await.is_err());
+    let r1 = b
+        .create(Bytes::from("a"), Bytes::from("1"), 0)
+        .await
+        .unwrap();
+    assert!(b
+        .create(Bytes::from("a"), Bytes::from("x"), 0)
+        .await
+        .is_err());
     let (_, kv) = b.get(b"a", 0).await.unwrap();
     assert_eq!(kv.unwrap().value, Bytes::from("1"));
-    b.update(Bytes::from("a"), Bytes::from("2"), 0, 0).await.unwrap();
+    b.update(Bytes::from("a"), Bytes::from("2"), 0, 0)
+        .await
+        .unwrap();
     let (_, kvs, count) = b.list(b"a", None, ListOptions::default()).await.unwrap();
     assert_eq!(count, 1);
     assert_eq!(kvs[0].version, 2);
@@ -34,8 +42,13 @@ async fn sqlite_crud() {
 #[tokio::test]
 async fn sqlite_history_compact_events() {
     let b = backend().await;
-    b.create(Bytes::from("k"), Bytes::from("v1"), 0).await.unwrap();
-    let r2 = b.update(Bytes::from("k"), Bytes::from("v2"), 0, 0).await.unwrap();
+    b.create(Bytes::from("k"), Bytes::from("v1"), 0)
+        .await
+        .unwrap();
+    let r2 = b
+        .update(Bytes::from("k"), Bytes::from("v2"), 0, 0)
+        .await
+        .unwrap();
     let (_, kv) = b.get(b"k", r2 - 1).await.unwrap();
     assert_eq!(kv.unwrap().value, Bytes::from("v1"));
     let evs = b.events(r2 - 1, r2).await.unwrap();
@@ -54,7 +67,9 @@ async fn sqlite_ensure_schema_is_idempotent() {
     let b = SqliteBackend::new(Arc::new(db));
     b.ensure_schema().await.unwrap();
     b.ensure_schema().await.unwrap();
-    b.create(Bytes::from("a"), Bytes::from("1"), 0).await.unwrap();
+    b.create(Bytes::from("a"), Bytes::from("1"), 0)
+        .await
+        .unwrap();
     let (_, kv) = b.get(b"a", 0).await.unwrap();
     assert_eq!(kv.unwrap().value, Bytes::from("1"));
 }

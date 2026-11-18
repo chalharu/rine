@@ -3,7 +3,9 @@
 
 use rine_etcd::etcdserverpb::compare::{CompareResult, CompareTarget, TargetUnion};
 use rine_etcd::etcdserverpb::kv_client::KvClient;
-use rine_etcd::etcdserverpb::{request_op, Compare, PutRequest, RangeRequest, RequestOp, TxnRequest};
+use rine_etcd::etcdserverpb::{
+    request_op, Compare, PutRequest, RangeRequest, RequestOp, TxnRequest,
+};
 use rine_etcd::server::EtcdServer;
 use rine_store_sqlite::{SqliteBackend, SqliteDb};
 use std::sync::Arc;
@@ -22,7 +24,13 @@ async fn spawn() -> String {
     });
     for _ in 0..50 {
         if let Ok(mut c) = KvClient::connect(endpoint.clone()).await {
-            if c.range(RangeRequest { key: b"x".to_vec(), ..Default::default() }).await.is_ok() {
+            if c.range(RangeRequest {
+                key: b"x".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .is_ok()
+            {
                 break;
             }
         }
@@ -61,7 +69,10 @@ async fn sqlite_backend_serves_kv_and_txn() {
     assert!(r.succeeded);
 
     let got = kv
-        .range(RangeRequest { key: b"ok".to_vec(), ..Default::default() })
+        .range(RangeRequest {
+            key: b"ok".to_vec(),
+            ..Default::default()
+        })
         .await
         .unwrap()
         .into_inner();
@@ -70,11 +81,18 @@ async fn sqlite_backend_serves_kv_and_txn() {
     assert_eq!(got.kvs[0].version, 1);
 
     // direct put bumps version, preserves create_revision
-    kv.put(PutRequest { key: b"ok".to_vec(), value: b"v2".to_vec(), ..Default::default() })
-        .await
-        .unwrap();
+    kv.put(PutRequest {
+        key: b"ok".to_vec(),
+        value: b"v2".to_vec(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
     let got = kv
-        .range(RangeRequest { key: b"ok".to_vec(), ..Default::default() })
+        .range(RangeRequest {
+            key: b"ok".to_vec(),
+            ..Default::default()
+        })
         .await
         .unwrap()
         .into_inner();
