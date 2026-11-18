@@ -136,27 +136,30 @@ impl SqlExecutor for MockExec {
         }
         if sql == OracleDialect::set_compact_rev_sql() {
             let rev = Self::int_param(&params, 0);
-            match rows
-                .iter_mut()
-                .find(|r| r.name == crate::ddl::COMPACT_REV_KEY)
-            {
-                Some(r) => r.prev_revision = rev,
-                None => {
-                    let mut next = self.next_id.lock().await;
-                    rows.push(MockRow {
-                        id: *next,
-                        name: crate::ddl::COMPACT_REV_KEY.into(),
-                        created: 0,
-                        deleted: 0,
-                        create_revision: 0,
-                        prev_revision: rev,
-                        lease: 0,
-                        version: 1,
-                        value: None,
-                    });
-                    *next += 1;
+            let mut n = 0;
+            for r in rows.iter_mut() {
+                if r.name == crate::ddl::COMPACT_REV_KEY {
+                    r.prev_revision = rev;
+                    n += 1;
                 }
             }
+            return Ok(n);
+        }
+        if sql == OracleDialect::set_compact_rev_insert_sql() {
+            let rev = Self::int_param(&params, 0);
+            let mut next = self.next_id.lock().await;
+            rows.push(MockRow {
+                id: *next,
+                name: crate::ddl::COMPACT_REV_KEY.into(),
+                created: 0,
+                deleted: 0,
+                create_revision: 0,
+                prev_revision: rev,
+                lease: 0,
+                version: 1,
+                value: None,
+            });
+            *next += 1;
             return Ok(1);
         }
         if sql == OracleDialect::compact_delete_sql() {

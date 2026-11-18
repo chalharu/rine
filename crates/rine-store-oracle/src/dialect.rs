@@ -59,7 +59,10 @@ pub trait Dialect: Send + Sync + 'static {
     /// Drop history below `rev`, keeping the newest row at or below `rev`
     /// per key (that row is the historical read base).
     fn compact_delete_sql() -> &'static str;
+    /// Upsert of the compaction watermark, expressed as update ...
     fn set_compact_rev_sql() -> &'static str;
+    /// ... followed by insert-if-missing (for dialects without `MERGE`).
+    fn set_compact_rev_insert_sql() -> &'static str;
 
     fn db_size_sql() -> &'static str;
 
@@ -152,10 +155,12 @@ impl Dialect for OracleDialect {
     }
 
     fn set_compact_rev_sql() -> &'static str {
-        "MERGE INTO kine USING DUAL ON (name = 'compact_rev_key') \
-         WHEN MATCHED THEN UPDATE SET prev_revision = :1 \
-         WHEN NOT MATCHED THEN INSERT (name, created, deleted, create_revision, prev_revision, lease) \
-         VALUES ('compact_rev_key', 0, 0, 0, :2, 0)"
+        "UPDATE kine SET prev_revision = :1 WHERE name = 'compact_rev_key'"
+    }
+
+    fn set_compact_rev_insert_sql() -> &'static str {
+        "INSERT INTO kine (name, created, deleted, create_revision, prev_revision, lease) \
+         VALUES ('compact_rev_key', 0, 0, 0, :1, 0)"
     }
 
     fn db_size_sql() -> &'static str {
@@ -218,6 +223,7 @@ mod tests {
             OracleDialect::insert_sql(),
             OracleDialect::mark_deleted_sql(),
             OracleDialect::set_compact_rev_sql(),
+            OracleDialect::set_compact_rev_insert_sql(),
             OracleDialect::compact_delete_sql(),
             OracleDialect::set_deleted_by_id_sql(),
             OracleDialect::set_create_rev_sql(),

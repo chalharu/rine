@@ -377,12 +377,18 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
                 current: cur,
             });
         }
-        self.exec
-            .execute(
-                D::set_compact_rev_sql(),
-                vec![SqlValue::Int(revision), SqlValue::Int(revision)],
-            )
+        let n = self
+            .exec
+            .execute(D::set_compact_rev_sql(), vec![SqlValue::Int(revision)])
             .await?;
+        if n == 0 {
+            self.exec
+                .execute(
+                    D::set_compact_rev_insert_sql(),
+                    vec![SqlValue::Int(revision)],
+                )
+                .await?;
+        }
         self.exec
             .execute(
                 D::compact_delete_sql(),
