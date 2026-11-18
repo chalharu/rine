@@ -13,8 +13,8 @@ use crate::etcdserverpb::{
 use crate::kv::to_proto_kv;
 use crate::mvccpb;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -235,25 +235,19 @@ async fn handle_create(
         c.start_revision
     };
     // Pre-check compaction before registering (avoids leaking dead watchers).
-    if start <= cur {
-        match backend.events(start, cur).await {
-            Err(_) => {
-                let compacted = backend.compacted_revision().await;
-                let _ = tx
-                    .send(Ok(WatchResponse {
-                        header: Some(header(compacted)),
-                        watch_id: id,
-                        canceled: true,
-                        compact_revision: compacted,
-                        cancel_reason: "etcdserver: mvcc: required revision has been compacted"
-                            .into(),
-                        ..Default::default()
-                    }))
-                    .await;
-                return;
-            }
-            Ok(_) => {}
-        }
+    if start <= cur && backend.events(start, cur).await.is_err() {
+        let compacted = backend.compacted_revision().await;
+        let _ = tx
+            .send(Ok(WatchResponse {
+                header: Some(header(compacted)),
+                watch_id: id,
+                canceled: true,
+                compact_revision: compacted,
+                cancel_reason: "etcdserver: mvcc: required revision has been compacted".into(),
+                ..Default::default()
+            }))
+            .await;
+        return;
     }
     watchers.insert(id, watcher);
     let _ = tx

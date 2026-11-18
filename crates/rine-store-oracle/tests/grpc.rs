@@ -4,7 +4,7 @@
 use rine_etcd::etcdserverpb::compare::{CompareResult, CompareTarget, TargetUnion};
 use rine_etcd::etcdserverpb::kv_client::KvClient;
 use rine_etcd::etcdserverpb::{
-    request_op, Compare, PutRequest, RangeRequest, RequestOp, TxnRequest,
+    Compare, PutRequest, RangeRequest, RequestOp, TxnRequest, request_op,
 };
 use rine_etcd::server::EtcdServer;
 use rine_store_oracle::{MockExec, OracleBackend};

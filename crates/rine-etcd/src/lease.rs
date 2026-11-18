@@ -11,10 +11,10 @@ use crate::etcdserverpb::{
     LeaseTimeToLiveRequest, LeaseTimeToLiveResponse, ResponseHeader,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 struct LeaseEntry {
@@ -71,10 +71,10 @@ impl LeaseManager {
                 for (id, keys) in expired {
                     for k in keys {
                         // Only delete while the key still belongs to this lease.
-                        if let Ok((_, Some(kv))) = backend.get(&k, 0).await {
-                            if kv.lease == id {
-                                let _ = backend.delete(&k).await;
-                            }
+                        if let Ok((_, Some(kv))) = backend.get(&k, 0).await
+                            && kv.lease == id
+                        {
+                            let _ = backend.delete(&k).await;
                         }
                     }
                 }
@@ -107,10 +107,10 @@ impl LeaseManager {
     }
 
     pub async fn attach(&self, id: i64, key: Vec<u8>) {
-        if let Some(e) = self.inner.write().await.get_mut(&id) {
-            if !e.keys.contains(&key) {
-                e.keys.push(key);
-            }
+        if let Some(e) = self.inner.write().await.get_mut(&id)
+            && !e.keys.contains(&key)
+        {
+            e.keys.push(key);
         }
     }
 
@@ -123,10 +123,10 @@ impl LeaseManager {
             .map(|e| e.keys)
             .unwrap_or_default();
         for k in keys {
-            if let Ok((_, Some(kv))) = self.backend.get(&k, 0).await {
-                if kv.lease == id {
-                    let _ = self.backend.delete(&k).await;
-                }
+            if let Ok((_, Some(kv))) = self.backend.get(&k, 0).await
+                && kv.lease == id
+            {
+                let _ = self.backend.delete(&k).await;
             }
         }
     }

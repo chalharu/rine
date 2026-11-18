@@ -9,7 +9,7 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
-    use rine_etcd::{backend::ListOptions, Backend as _};
+    use rine_etcd::{Backend as _, backend::ListOptions};
 
     use super::*;
     use crate::mock::MockExec;
@@ -35,10 +35,11 @@ mod tests {
             .create(Bytes::from("a"), Bytes::from("1"), 0)
             .await
             .unwrap();
-        assert!(b
-            .create(Bytes::from("a"), Bytes::from("x"), 0)
-            .await
-            .is_err());
+        assert!(
+            b.create(Bytes::from("a"), Bytes::from("x"), 0)
+                .await
+                .is_err()
+        );
         let (_, kv) = b.get(b"a", 0).await.unwrap();
         assert_eq!(kv.unwrap().value, Bytes::from("1"));
         b.update(Bytes::from("a"), Bytes::from("2"), 0, 0)

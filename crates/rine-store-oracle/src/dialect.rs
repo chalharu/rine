@@ -63,7 +63,10 @@ impl Dialect for OracleDialect {
     }
 
     fn get_sql() -> String {
-        format!("SELECT {COLS} FROM rine WHERE name = :1 AND deleted = 0 AND ROWNUM = 1 ORDER BY id DESC", COLS = Self::cols())
+        format!(
+            "SELECT {COLS} FROM rine WHERE name = :1 AND deleted = 0 AND ROWNUM = 1 ORDER BY id DESC",
+            COLS = Self::cols()
+        )
     }
 
     fn list_exact_sql() -> String {
@@ -81,7 +84,10 @@ impl Dialect for OracleDialect {
     }
 
     fn list_range_sql() -> String {
-        format!("SELECT {COLS} FROM rine WHERE name >= :1 AND name < :2 AND deleted = 0 ORDER BY name, id", COLS = Self::cols())
+        format!(
+            "SELECT {COLS} FROM rine WHERE name >= :1 AND name < :2 AND deleted = 0 ORDER BY name, id",
+            COLS = Self::cols()
+        )
     }
 
     fn insert_sql() -> &'static str {

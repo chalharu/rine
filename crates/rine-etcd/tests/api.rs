@@ -7,13 +7,13 @@ use rine_etcd::etcdserverpb::lease_client::LeaseClient;
 use rine_etcd::etcdserverpb::maintenance_client::MaintenanceClient;
 use rine_etcd::etcdserverpb::range_request::{SortOrder, SortTarget};
 use rine_etcd::etcdserverpb::watch_client::WatchClient;
-use rine_etcd::etcdserverpb::{request_op, watch_request};
 use rine_etcd::etcdserverpb::{
     CompactionRequest, Compare, DeleteRangeRequest, LeaseGrantRequest, MemberListRequest,
     PutRequest, RangeRequest, RequestOp, StatusRequest, TxnRequest, WatchCancelRequest,
     WatchCreateRequest, WatchRequest,
 };
-use rine_etcd::{server::EtcdServer, MemoryBackend};
+use rine_etcd::etcdserverpb::{request_op, watch_request};
+use rine_etcd::{MemoryBackend, server::EtcdServer};
 use std::sync::Arc;
 use std::time::Duration;
 

@@ -439,10 +439,10 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
                             vec![SqlValue::Str(r.get_str(1)?), SqlValue::Int(ev.revision - 1)],
                         )
                         .await?;
-                    if let Some(p) = pred.first() {
-                        if p.get_int(3).unwrap_or(1) == 0 {
-                            ev.prev_kv = Some(row_to_kv(p)?);
-                        }
+                    if let Some(p) = pred.first()
+                        && p.get_int(3).unwrap_or(1) == 0
+                    {
+                        ev.prev_kv = Some(row_to_kv(p)?);
                     }
                 }
             }

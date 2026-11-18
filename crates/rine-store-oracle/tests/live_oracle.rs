@@ -72,10 +72,12 @@ async fn live_backend_crud_and_compact() {
         .create(Bytes::from("live/a"), Bytes::from("1"), 0)
         .await
         .expect("create");
-    assert!(backend
-        .create(Bytes::from("live/a"), Bytes::from("x"), 0)
-        .await
-        .is_err());
+    assert!(
+        backend
+            .create(Bytes::from("live/a"), Bytes::from("x"), 0)
+            .await
+            .is_err()
+    );
     let (_, kv) = backend.get(b"live/a", 0).await.expect("get");
     assert_eq!(kv.expect("kv present").value, Bytes::from("1"));
 
@@ -92,12 +94,14 @@ async fn live_backend_crud_and_compact() {
     assert_eq!(kvs[0].create_revision, r1);
 
     backend.delete(b"live/a").await.expect("delete");
-    assert!(backend
-        .get(b"live/a", 0)
-        .await
-        .expect("get after delete")
-        .1
-        .is_none());
+    assert!(
+        backend
+            .get(b"live/a", 0)
+            .await
+            .expect("get after delete")
+            .1
+            .is_none()
+    );
 
     // --- history + compact ---
     backend

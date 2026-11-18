@@ -97,7 +97,10 @@ impl Dialect for SqliteDialect {
     }
 
     fn list_range_sql() -> String {
-        format!("SELECT {COLS} FROM rine WHERE name >= ? AND name < ? AND deleted = 0 ORDER BY name, id", COLS = Self::cols())
+        format!(
+            "SELECT {COLS} FROM rine WHERE name >= ? AND name < ? AND deleted = 0 ORDER BY name, id",
+            COLS = Self::cols()
+        )
     }
 
     fn insert_sql() -> &'static str {

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 
 struct Inner {
     rev: Revision,

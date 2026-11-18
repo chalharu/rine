@@ -150,7 +150,7 @@ impl KvService {
                 None => {
                     return Err(tonic::Status::invalid_argument(
                         "etcdserver: ignore_value/ignore_lease on missing key",
-                    ))
+                    ));
                 }
                 Some(p) => (
                     if req.ignore_value {
@@ -225,10 +225,10 @@ impl KvService {
         for kv in &kvs {
             let (r, prev) = self.backend.delete(&kv.key).await.map_err(status_err)?;
             rev = r;
-            if req.prev_kv {
-                if let Some(p) = prev {
-                    prev_kvs.push(to_proto_kv(p));
-                }
+            if req.prev_kv
+                && let Some(p) = prev
+            {
+                prev_kvs.push(to_proto_kv(p));
             }
         }
         // NOTE: revision is not bumped when nothing matched; etcd bumps it.
@@ -276,7 +276,7 @@ impl KvService {
                 _ => {
                     return Err(tonic::Status::invalid_argument(
                         "etcdserver: compare target/type mismatch",
-                    ))
+                    ));
                 }
             };
             let ok = match result {
@@ -394,11 +394,7 @@ fn sort_kvs(kvs: &mut [KeyValue], order: i32, target: i32) {
             x if x == SortTarget::Value as i32 => a.value.cmp(&b.value),
             _ => a.key.cmp(&b.key),
         };
-        if asc {
-            o
-        } else {
-            o.reverse()
-        }
+        if asc { o } else { o.reverse() }
     });
 }
 
