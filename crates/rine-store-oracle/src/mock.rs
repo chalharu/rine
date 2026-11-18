@@ -3,7 +3,7 @@
 //! Interprets exactly the SQL strings `OracleBackend` generates (see
 //! `dialect`), so backend logic is exercised without a database.
 
-use crate::dialect::Dialect;
+use crate::dialect::{Dialect, OracleDialect};
 use crate::executor::{Row, SqlExecutor, SqlValue};
 use async_trait::async_trait;
 use rine_etcd::error::Result;
@@ -83,7 +83,7 @@ impl Default for MockExec {
 impl SqlExecutor for MockExec {
     async fn execute(&self, sql: &str, params: Vec<SqlValue>) -> Result<u64> {
         let mut rows = self.rows.lock().await;
-        if sql == Dialect::insert_sql() {
+        if sql == OracleDialect::insert_sql() {
             let mut next = self.next_id.lock().await;
             rows.push(MockRow {
                 id: *next,
@@ -103,7 +103,7 @@ impl SqlExecutor for MockExec {
             *next += 1;
             return Ok(1);
         }
-        if sql == Dialect::set_deleted_by_id_sql() {
+        if sql == OracleDialect::set_deleted_by_id_sql() {
             let (new_del, id) = (Self::int_param(&params, 0), Self::int_param(&params, 1));
             for r in rows.iter_mut() {
                 if r.id == id && r.deleted == 0 {
@@ -113,7 +113,7 @@ impl SqlExecutor for MockExec {
             }
             return Ok(0);
         }
-        if sql == Dialect::set_create_rev_sql() {
+        if sql == OracleDialect::set_create_rev_sql() {
             let (rev, id) = (Self::int_param(&params, 0), Self::int_param(&params, 1));
             for r in rows.iter_mut() {
                 if r.id == id {
@@ -123,7 +123,7 @@ impl SqlExecutor for MockExec {
             }
             return Ok(0);
         }
-        if sql == Dialect::mark_deleted_sql() {
+        if sql == OracleDialect::mark_deleted_sql() {
             let (new_del, name) = (Self::int_param(&params, 0), Self::str_param(&params, 1));
             let mut n = 0;
             for r in rows.iter_mut() {
@@ -134,7 +134,7 @@ impl SqlExecutor for MockExec {
             }
             return Ok(n);
         }
-        if sql == Dialect::set_compact_rev_sql() {
+        if sql == OracleDialect::set_compact_rev_sql() {
             let rev = Self::int_param(&params, 0);
             match rows
                 .iter_mut()
@@ -159,7 +159,7 @@ impl SqlExecutor for MockExec {
             }
             return Ok(1);
         }
-        if sql == Dialect::compact_delete_sql() {
+        if sql == OracleDialect::compact_delete_sql() {
             let rev = Self::int_param(&params, 0);
             // newest row at or below rev per name survives
             let mut keep: HashMap<String, i64> = HashMap::new();
@@ -186,19 +186,19 @@ impl SqlExecutor for MockExec {
 
     async fn query_row(&self, sql: &str, params: Vec<SqlValue>) -> Result<Option<Row>> {
         let rows = self.rows.lock().await;
-        if sql == Dialect::probe_sql() {
+        if sql == OracleDialect::probe_sql() {
             // Mock table always exists.
             return Ok(Some(Row {
                 values: vec![SqlValue::Int(1)],
             }));
         }
-        if sql == Dialect::current_revision_sql() {
+        if sql == OracleDialect::current_revision_sql() {
             let max = rows.iter().map(|r| r.id).max();
             return Ok(max.map(|m| Row {
                 values: vec![SqlValue::Int(m)],
             }));
         }
-        if sql == Dialect::compact_revision_sql() {
+        if sql == OracleDialect::compact_revision_sql() {
             let max = rows
                 .iter()
                 .filter(|r| r.name == crate::ddl::COMPACT_REV_KEY)
@@ -208,7 +208,7 @@ impl SqlExecutor for MockExec {
                 values: vec![SqlValue::Int(m)],
             }));
         }
-        if sql == Dialect::compacted_rev_sql() {
+        if sql == OracleDialect::compacted_rev_sql() {
             return Ok(rows
                 .iter()
                 .find(|r| r.name == crate::ddl::COMPACT_REV_KEY)
@@ -216,14 +216,14 @@ impl SqlExecutor for MockExec {
                     values: vec![SqlValue::Int(r.prev_revision)],
                 }));
         }
-        if sql == Dialect::live_by_name_sql() {
+        if sql == OracleDialect::live_by_name_sql() {
             let name = Self::str_param(&params, 0);
             return Ok(rows
                 .iter()
                 .find(|r| r.name == name && r.deleted == 0)
                 .map(MockRow::to_row));
         }
-        if sql == Dialect::resolve_id_sql() {
+        if sql == OracleDialect::resolve_id_sql() {
             let (name, prev) = (Self::str_param(&params, 0), Self::int_param(&params, 1));
             return Ok(rows
                 .iter()
@@ -232,7 +232,7 @@ impl SqlExecutor for MockExec {
                     values: vec![SqlValue::Int(r.id)],
                 }));
         }
-        if sql == Dialect::db_size_sql() {
+        if sql == OracleDialect::db_size_sql() {
             let sum: i64 = rows
                 .iter()
                 .map(|r| {
@@ -248,7 +248,7 @@ impl SqlExecutor for MockExec {
 
     async fn query_all(&self, sql: &str, params: Vec<SqlValue>) -> Result<Vec<Row>> {
         let rows = self.rows.lock().await;
-        if sql == Dialect::history_by_name_sql() {
+        if sql == OracleDialect::history_by_name_sql() {
             let (name, max_id) = (Self::str_param(&params, 0), Self::int_param(&params, 1));
             let mut out: Vec<&MockRow> = rows
                 .iter()
@@ -257,16 +257,16 @@ impl SqlExecutor for MockExec {
             out.sort_by_key(|r| -r.id);
             return Ok(out.into_iter().map(MockRow::to_row).collect());
         }
-        if sql == Dialect::events_sql() {
+        if sql == OracleDialect::events_sql() {
             let (from, to) = (Self::int_param(&params, 0), Self::int_param(&params, 1));
             let mut out: Vec<&MockRow> =
                 rows.iter().filter(|r| r.id >= from && r.id <= to).collect();
             out.sort_by_key(|r| r.id);
             return Ok(out.into_iter().map(MockRow::to_row).collect());
         }
-        let is_exact = sql == Dialect::list_exact_sql();
-        let is_ge = sql == Dialect::list_ge_sql();
-        let is_range = sql == Dialect::list_range_sql();
+        let is_exact = sql == OracleDialect::list_exact_sql();
+        let is_ge = sql == OracleDialect::list_ge_sql();
+        let is_range = sql == OracleDialect::list_range_sql();
         assert!(
             is_exact || is_ge || is_range,
             "mock query_all: unknown sql {sql}"

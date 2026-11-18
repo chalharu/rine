@@ -1,37 +1,47 @@
-use crate::dialect::Dialect;
+use crate::dialect::{Dialect, OracleDialect};
 use crate::executor::{Row, SqlExecutor, SqlValue};
 use async_trait::async_trait;
 use bytes::Bytes;
 use rine_etcd::backend::{Backend, Event, KeyValue, LeaseId, ListOptions, Revision};
 use rine_etcd::error::{Error, Result};
+use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-/// Oracle `Backend` with a kine-style append-only `kine` table.
+/// kine-style append-only `kine` table over any SQL database.
 ///
 /// Assumes a single writer (like kine on SQLite): ids come from an
-/// `IDENTITY` column, so the newest row for a key resolves via the
+/// auto-increment column, so the newest row for a key resolves via the
 /// `(name, prev_revision)` unique index. Multi-writer leader election is
 /// future work; concurrent writers surface as `Backend` errors, never as
 /// silent corruption.
-pub struct OracleBackend<E: SqlExecutor> {
+pub struct SqlBackend<E: SqlExecutor, D: Dialect> {
     exec: Arc<E>,
     tx: broadcast::Sender<Event>,
+    _dialect: PhantomData<D>,
 }
 
-impl<E: SqlExecutor> OracleBackend<E> {
+/// Oracle-flavored [`SqlBackend`].
+pub type OracleBackend<E> = SqlBackend<E, OracleDialect>;
+
+impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
     pub fn new(exec: Arc<E>) -> Self {
         let (tx, _) = broadcast::channel(1024);
-        Self { exec, tx }
+        Self {
+            exec,
+            tx,
+            _dialect: PhantomData,
+        }
     }
 
     /// Create the schema if the `kine` table is missing (server startup path).
-    /// A concurrent creator racing us surfaces ORA-00955, which is tolerated.
+    /// A concurrent creator racing us surfaces an already-exists error,
+    /// which is tolerated.
     pub async fn ensure_schema(&self) -> Result<()> {
-        match self.exec.query_row(Dialect::probe_sql(), vec![]).await {
+        match self.exec.query_row(D::probe_sql(), vec![]).await {
             Ok(_) => Ok(()),
-            Err(Error::Backend(m)) if m.contains("ORA-00942") => match self.create_schema().await {
-                Err(Error::Backend(m)) if m.contains("ORA-00955") => Ok(()),
+            Err(Error::Backend(m)) if D::is_missing_table(&m) => match self.create_schema().await {
+                Err(Error::Backend(m)) if D::is_already_exists(&m) => Ok(()),
                 r => r,
             },
             Err(e) => Err(e),
@@ -41,8 +51,8 @@ impl<E: SqlExecutor> OracleBackend<E> {
     /// Run the DDL. Idempotent only when the table does not exist yet;
     /// migrations are out of scope for now.
     pub async fn create_schema(&self) -> Result<()> {
-        for stmt in std::iter::once(crate::ddl::CREATE_TABLE)
-            .chain(crate::ddl::CREATE_INDEXES.iter().copied())
+        for stmt in
+            std::iter::once(D::create_table_sql()).chain(D::create_indexes_sql().iter().copied())
         {
             self.exec.execute(stmt, vec![]).await?;
         }
@@ -52,16 +62,13 @@ impl<E: SqlExecutor> OracleBackend<E> {
     async fn current_rev_inner(&self) -> Result<Revision> {
         let row = self
             .exec
-            .query_row(Dialect::current_revision_sql(), vec![])
+            .query_row(D::current_revision_sql(), vec![])
             .await?;
         Ok(row.map(|r| r.get_int(0).unwrap_or(1)).unwrap_or(1))
     }
 
     async fn compacted_inner(&self) -> Result<Revision> {
-        let row = self
-            .exec
-            .query_row(Dialect::compacted_rev_sql(), vec![])
-            .await?;
+        let row = self.exec.query_row(D::compacted_rev_sql(), vec![]).await?;
         Ok(match row {
             Some(r) if !r.is_null(0) => r.get_int(0).unwrap_or(0),
             _ => 0,
@@ -90,10 +97,7 @@ impl<E: SqlExecutor> OracleBackend<E> {
 
     async fn live_row(&self, key: &[u8]) -> Result<Option<Row>> {
         self.exec
-            .query_row(
-                &Dialect::live_by_name_sql(),
-                vec![SqlValue::Str(key_str(key))],
-            )
+            .query_row(&D::live_by_name_sql(), vec![SqlValue::Str(key_str(key))])
             .await
     }
 
@@ -101,7 +105,7 @@ impl<E: SqlExecutor> OracleBackend<E> {
         let row = self
             .exec
             .query_row(
-                Dialect::resolve_id_sql(),
+                D::resolve_id_sql(),
                 vec![SqlValue::Str(key_str(key)), SqlValue::Int(prev_revision)],
             )
             .await?;
@@ -145,7 +149,7 @@ fn row_to_event(row: &Row) -> Result<Event> {
 }
 
 #[async_trait]
-impl<E: SqlExecutor + 'static> Backend for OracleBackend<E> {
+impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
     async fn current_revision(&self) -> Revision {
         self.current_rev_inner().await.unwrap_or(1)
     }
@@ -166,7 +170,7 @@ impl<E: SqlExecutor + 'static> Backend for OracleBackend<E> {
         let rows = self
             .exec
             .query_all(
-                &Dialect::history_by_name_sql(),
+                &D::history_by_name_sql(),
                 vec![SqlValue::Str(key_str(key)), SqlValue::Int(revision)],
             )
             .await?;
@@ -190,7 +194,7 @@ impl<E: SqlExecutor + 'static> Backend for OracleBackend<E> {
         }
         self.exec
             .execute(
-                Dialect::insert_sql(),
+                D::insert_sql(),
                 vec![
                     SqlValue::Str(key_str(&key)),
                     SqlValue::Int(0),
@@ -206,7 +210,7 @@ impl<E: SqlExecutor + 'static> Backend for OracleBackend<E> {
         let id = self.resolve_id(&key, 0).await?;
         self.exec
             .execute(
-                Dialect::set_create_rev_sql(),
+                D::set_create_rev_sql(),
                 vec![SqlValue::Int(id), SqlValue::Int(id)],
             )
             .await?;
@@ -245,7 +249,7 @@ impl<E: SqlExecutor + 'static> Backend for OracleBackend<E> {
         }
         self.exec
             .execute(
-                Dialect::insert_sql(),
+                D::insert_sql(),
                 vec![
                     SqlValue::Str(key_str(&key)),
                     SqlValue::Int(0),
@@ -262,7 +266,7 @@ impl<E: SqlExecutor + 'static> Backend for OracleBackend<E> {
         let n = self
             .exec
             .execute(
-                Dialect::set_deleted_by_id_sql(),
+                D::set_deleted_by_id_sql(),
                 vec![SqlValue::Int(id), SqlValue::Int(prev.mod_revision)],
             )
             .await?;
@@ -298,7 +302,7 @@ impl<E: SqlExecutor + 'static> Backend for OracleBackend<E> {
         };
         self.exec
             .execute(
-                Dialect::insert_sql(),
+                D::insert_sql(),
                 vec![
                     SqlValue::Str(key_str(key)),
                     SqlValue::Int(0),
@@ -315,7 +319,7 @@ impl<E: SqlExecutor + 'static> Backend for OracleBackend<E> {
         if let Some(p) = &prev {
             self.exec
                 .execute(
-                    Dialect::set_deleted_by_id_sql(),
+                    D::set_deleted_by_id_sql(),
                     vec![SqlValue::Int(tomb_id), SqlValue::Int(p.mod_revision)],
                 )
                 .await?;
@@ -338,13 +342,10 @@ impl<E: SqlExecutor + 'static> Backend for OracleBackend<E> {
     ) -> Result<(Revision, Vec<KeyValue>, i64)> {
         let cur = self.check_rev(opts.revision).await?;
         let (sql, params) = match range_end {
-            None | Some([]) => (
-                Dialect::list_exact_sql(),
-                vec![SqlValue::Str(key_str(prefix))],
-            ),
-            Some([0]) => (Dialect::list_ge_sql(), vec![SqlValue::Str(key_str(prefix))]),
+            None | Some([]) => (D::list_exact_sql(), vec![SqlValue::Str(key_str(prefix))]),
+            Some([0]) => (D::list_ge_sql(), vec![SqlValue::Str(key_str(prefix))]),
             Some(end) => (
-                Dialect::list_range_sql(),
+                D::list_range_sql(),
                 vec![SqlValue::Str(key_str(prefix)), SqlValue::Str(key_str(end))],
             ),
         };
@@ -378,13 +379,13 @@ impl<E: SqlExecutor + 'static> Backend for OracleBackend<E> {
         }
         self.exec
             .execute(
-                Dialect::set_compact_rev_sql(),
+                D::set_compact_rev_sql(),
                 vec![SqlValue::Int(revision), SqlValue::Int(revision)],
             )
             .await?;
         self.exec
             .execute(
-                Dialect::compact_delete_sql(),
+                D::compact_delete_sql(),
                 vec![SqlValue::Int(revision), SqlValue::Int(revision)],
             )
             .await?;
@@ -393,7 +394,7 @@ impl<E: SqlExecutor + 'static> Backend for OracleBackend<E> {
 
     async fn db_size(&self) -> i64 {
         self.exec
-            .query_row(Dialect::db_size_sql(), vec![])
+            .query_row(D::db_size_sql(), vec![])
             .await
             .ok()
             .flatten()
@@ -412,7 +413,7 @@ impl<E: SqlExecutor + 'static> Backend for OracleBackend<E> {
         let rows = self
             .exec
             .query_all(
-                &Dialect::events_sql(),
+                &D::events_sql(),
                 vec![SqlValue::Int(from), SqlValue::Int(to)],
             )
             .await?;
@@ -431,7 +432,7 @@ impl<E: SqlExecutor + 'static> Backend for OracleBackend<E> {
                     let pred = self
                         .exec
                         .query_all(
-                            &Dialect::history_by_name_sql(),
+                            &D::history_by_name_sql(),
                             vec![SqlValue::Str(r.get_str(1)?), SqlValue::Int(ev.revision - 1)],
                         )
                         .await?;
@@ -452,9 +453,9 @@ impl<E: SqlExecutor + 'static> Backend for OracleBackend<E> {
     }
 }
 
-impl<E: SqlExecutor> std::fmt::Debug for OracleBackend<E> {
+impl<E: SqlExecutor, D: Dialect> std::fmt::Debug for SqlBackend<E, D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("OracleBackend")
+        f.write_str("SqlBackend")
     }
 }
 

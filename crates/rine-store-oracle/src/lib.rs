@@ -15,7 +15,9 @@ pub mod live;
 pub mod mock;
 pub mod store;
 
+pub use dialect::{Dialect, OracleDialect};
+
 pub use executor::{Row, SqlExecutor, SqlValue};
 pub use live::OracleDb;
 pub use mock::MockExec;
-pub use store::OracleBackend;
+pub use store::{OracleBackend, SqlBackend};
