@@ -66,6 +66,8 @@ jobs:
           exit 1
       - name: backend integration test (live XE)
         run: cargo test -p rine-store-oracle --test live_oracle -- --nocapture
+      - name: table-state matrix probe
+        run: cargo test -p rine-store-oracle --test probe_shapes2 -- --nocapture
       - name: ORA-01002 probe matrix
         run: cargo test -p rine-store-oracle --test probe_01002 -- --nocapture
       - name: full workspace tests against live XE
