@@ -10,15 +10,15 @@ use crate::etcdserverpb::{
 };
 use std::sync::Arc;
 
-pub struct ClusterService<B: Backend> {
-    backend: Arc<B>,
+pub struct ClusterService {
+    backend: Arc<dyn Backend>,
     member_id: u64,
     member_name: String,
     client_url: String,
 }
 
-impl<B: Backend> ClusterService<B> {
-    pub fn new(backend: Arc<B>, client_url: String) -> Self {
+impl ClusterService {
+    pub fn new(backend: Arc<dyn Backend>, client_url: String) -> Self {
         Self {
             backend,
             member_id: 0x7269_6e65_0000_0002,
@@ -29,7 +29,7 @@ impl<B: Backend> ClusterService<B> {
 }
 
 #[tonic::async_trait]
-impl<B: Backend> Cluster for ClusterService<B> {
+impl Cluster for ClusterService {
     async fn member_list(
         &self,
         _request: tonic::Request<MemberListRequest>,
@@ -53,13 +53,13 @@ impl<B: Backend> Cluster for ClusterService<B> {
     }
 }
 
-pub struct MaintenanceService<B: Backend> {
-    backend: Arc<B>,
+pub struct MaintenanceService {
+    backend: Arc<dyn Backend>,
     member_id: u64,
 }
 
-impl<B: Backend> MaintenanceService<B> {
-    pub fn new(backend: Arc<B>) -> Self {
+impl MaintenanceService {
+    pub fn new(backend: Arc<dyn Backend>) -> Self {
         Self {
             backend,
             member_id: 0x7269_6e65_0000_0002,
@@ -68,7 +68,7 @@ impl<B: Backend> MaintenanceService<B> {
 }
 
 #[tonic::async_trait]
-impl<B: Backend> Maintenance for MaintenanceService<B> {
+impl Maintenance for MaintenanceService {
     async fn status(
         &self,
         _request: tonic::Request<StatusRequest>,

@@ -34,15 +34,15 @@ pub(crate) fn status_err(e: Error) -> tonic::Status {
     }
 }
 
-pub struct KvService<B: Backend> {
-    backend: Arc<B>,
-    leases: LeaseManager<B>,
+pub struct KvService {
+    backend: Arc<dyn Backend>,
+    leases: LeaseManager,
     pub cluster_id: u64,
     pub member_id: u64,
 }
 
-impl<B: Backend> KvService<B> {
-    pub fn new(backend: Arc<B>, leases: LeaseManager<B>) -> Self {
+impl KvService {
+    pub fn new(backend: Arc<dyn Backend>, leases: LeaseManager) -> Self {
         Self {
             backend,
             leases,
@@ -403,7 +403,7 @@ fn sort_kvs(kvs: &mut [KeyValue], order: i32, target: i32) {
 }
 
 #[tonic::async_trait]
-impl<B: Backend> Kv for KvService<B> {
+impl Kv for KvService {
     async fn range(
         &self,
         request: tonic::Request<RangeRequest>,

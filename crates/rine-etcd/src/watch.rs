@@ -71,15 +71,15 @@ fn to_proto_event(e: &Event, want_prev: bool) -> mvccpb::Event {
     }
 }
 
-pub struct WatchService<B: Backend> {
-    backend: Arc<B>,
+pub struct WatchService {
+    backend: Arc<dyn Backend>,
     next_id: Arc<AtomicI64>,
     cluster_id: u64,
     member_id: u64,
 }
 
-impl<B: Backend> WatchService<B> {
-    pub fn new(backend: Arc<B>) -> Self {
+impl WatchService {
+    pub fn new(backend: Arc<dyn Backend>) -> Self {
         Self {
             backend,
             next_id: Arc::new(AtomicI64::new(1)),
@@ -90,7 +90,7 @@ impl<B: Backend> WatchService<B> {
 }
 
 #[tonic::async_trait]
-impl<B: Backend> Watch for WatchService<B> {
+impl Watch for WatchService {
     type WatchStream = ReceiverStream<Result<WatchResponse, tonic::Status>>;
 
     async fn watch(
@@ -206,8 +206,8 @@ impl<B: Backend> Watch for WatchService<B> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_create<B: Backend>(
-    backend: &Arc<B>,
+async fn handle_create(
+    backend: &Arc<dyn Backend>,
     next_id: &AtomicI64,
     header: &impl Fn(i64) -> ResponseHeader,
     tx: &mpsc::Sender<Result<WatchResponse, tonic::Status>>,

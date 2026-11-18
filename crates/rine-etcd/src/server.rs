@@ -12,12 +12,12 @@ use crate::watch::WatchService;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-pub struct EtcdServer<B: Backend> {
-    pub backend: Arc<B>,
+pub struct EtcdServer {
+    pub backend: Arc<dyn Backend>,
 }
 
-impl<B: Backend> EtcdServer<B> {
-    pub fn new(backend: Arc<B>) -> Self {
+impl EtcdServer {
+    pub fn new(backend: Arc<dyn Backend>) -> Self {
         Self { backend }
     }
 

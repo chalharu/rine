@@ -24,13 +24,13 @@ struct LeaseEntry {
     keys: Vec<Vec<u8>>,
 }
 
-pub struct LeaseManager<B: Backend> {
+pub struct LeaseManager {
     inner: Arc<RwLock<HashMap<i64, LeaseEntry>>>,
-    backend: Arc<B>,
+    backend: Arc<dyn Backend>,
     next_id: Arc<AtomicI64>,
 }
 
-impl<B: Backend> Clone for LeaseManager<B> {
+impl Clone for LeaseManager {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -40,8 +40,8 @@ impl<B: Backend> Clone for LeaseManager<B> {
     }
 }
 
-impl<B: Backend> LeaseManager<B> {
-    pub fn new(backend: Arc<B>) -> Self {
+impl LeaseManager {
+    pub fn new(backend: Arc<dyn Backend>) -> Self {
         let mgr = Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             backend,
@@ -156,15 +156,15 @@ impl<B: Backend> LeaseManager<B> {
     }
 }
 
-pub struct LeaseService<B: Backend> {
-    backend: Arc<B>,
-    leases: LeaseManager<B>,
+pub struct LeaseService {
+    backend: Arc<dyn Backend>,
+    leases: LeaseManager,
     cluster_id: u64,
     member_id: u64,
 }
 
-impl<B: Backend> LeaseService<B> {
-    pub fn new(backend: Arc<B>, leases: LeaseManager<B>) -> Self {
+impl LeaseService {
+    pub fn new(backend: Arc<dyn Backend>, leases: LeaseManager) -> Self {
         Self {
             backend,
             leases,
@@ -184,7 +184,7 @@ impl<B: Backend> LeaseService<B> {
 }
 
 #[tonic::async_trait]
-impl<B: Backend> Lease for LeaseService<B> {
+impl Lease for LeaseService {
     async fn lease_grant(
         &self,
         request: tonic::Request<LeaseGrantRequest>,
