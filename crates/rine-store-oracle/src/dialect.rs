@@ -1,8 +1,8 @@
 //! Oracle SQL dialect for the kine-compatible `kine` table.
 //!
-//! The live `Connection` executes these statements once the step-1 driver
-//! finishes its TNS/TLS dial; until then the strings and row mapping are
-//! covered by unit tests so SQL regressions are caught without a database.
+//! The strings and row mapping are covered by unit tests (via `MockExec`)
+//! so SQL regressions are caught without a database; the live Oracle XE
+//! test in CI covers them against a real database.
 
 use rine_etcd::error::{Error, Result};
 
@@ -15,6 +15,11 @@ const COLS: &str =
     "id, name, created, deleted, create_revision, prev_revision, lease, version, value";
 
 impl Dialect {
+    /// Schema probe for `OracleBackend::ensure_schema`.
+    pub fn probe_sql() -> &'static str {
+        "SELECT 1 FROM kine WHERE ROWNUM = 1"
+    }
+
     pub fn current_revision_sql() -> &'static str {
         "SELECT MAX(id) FROM kine"
     }

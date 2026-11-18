@@ -54,6 +54,7 @@ async fn main() -> Result<()> {
             let config = config.set_connect_string(&connect)?;
             let db = rine_store_oracle::OracleDb::connect_with_config(config)?;
             let backend = Arc::new(rine_store_oracle::OracleBackend::new(Arc::new(db)));
+            backend.ensure_schema().await?;
             rine_etcd::server::EtcdServer::new(backend)
                 .serve(args.listen)
                 .await?;

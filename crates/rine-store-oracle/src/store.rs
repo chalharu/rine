@@ -25,6 +25,19 @@ impl<E: SqlExecutor> OracleBackend<E> {
         Self { exec, tx }
     }
 
+    /// Create the schema if the `kine` table is missing (server startup path).
+    /// A concurrent creator racing us surfaces ORA-00955, which is tolerated.
+    pub async fn ensure_schema(&self) -> Result<()> {
+        match self.exec.query_row(Dialect::probe_sql(), vec![]).await {
+            Ok(_) => Ok(()),
+            Err(Error::Backend(m)) if m.contains("ORA-00942") => match self.create_schema().await {
+                Err(Error::Backend(m)) if m.contains("ORA-00955") => Ok(()),
+                r => r,
+            },
+            Err(e) => Err(e),
+        }
+    }
+
     /// Run the DDL. Idempotent only when the table does not exist yet;
     /// migrations are out of scope for now.
     pub async fn create_schema(&self) -> Result<()> {
@@ -452,6 +465,16 @@ mod tests {
 
     fn backend() -> OracleBackend<MockExec> {
         OracleBackend::new(Arc::new(MockExec::new()))
+    }
+
+    #[tokio::test]
+    async fn ensure_schema_is_noop_when_table_exists() {
+        let b = backend();
+        b.ensure_schema().await.unwrap();
+        // Still functional afterwards.
+        b.create(Bytes::from("a"), Bytes::from("1"), 0)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

@@ -63,7 +63,8 @@ async fn live_backend_crud_and_compact() {
     let _ = db.execute("DROP TABLE kine", vec![]).await;
 
     let backend = OracleBackend::new(Arc::new(db));
-    backend.create_schema().await.expect("create_schema");
+    // Creation path: table was just dropped, so this builds the schema.
+    backend.ensure_schema().await.expect("ensure_schema");
 
     // --- CRUD (mirrors the MockExec sql_crud test) ---
     let r1 = backend

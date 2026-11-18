@@ -186,6 +186,12 @@ impl SqlExecutor for MockExec {
 
     async fn query_row(&self, sql: &str, params: Vec<SqlValue>) -> Result<Option<Row>> {
         let rows = self.rows.lock().await;
+        if sql == Dialect::probe_sql() {
+            // Mock table always exists.
+            return Ok(Some(Row {
+                values: vec![SqlValue::Int(1)],
+            }));
+        }
         if sql == Dialect::current_revision_sql() {
             let max = rows.iter().map(|r| r.id).max();
             return Ok(max.map(|m| Row {
