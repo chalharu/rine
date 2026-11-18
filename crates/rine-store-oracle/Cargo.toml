@@ -1,26 +1,26 @@
 [package]
-name = "rine-store-oracle"
-version.workspace = true
+description = "Oracle DB backend for rine-etcd (official oracledb driver)"
 edition.workspace = true
 license.workspace = true
-description = "Oracle DB backend for rine-etcd (official oracledb driver)"
+name = "rine-store-oracle"
+version.workspace = true
 
 [lib]
 name = "rine_store_oracle"
 path = "src/lib.rs"
 
 [dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+oracledb.workspace = true
 rine-etcd.workspace = true
 rine-store-executor.workspace = true
-oracledb.workspace = true
-tokio.workspace = true
-thiserror.workspace = true
-async-trait.workspace = true
-tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-bytes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-tonic.workspace = true
 tokio-stream.workspace = true
+tonic.workspace = true

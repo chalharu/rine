@@ -1,21 +1,21 @@
 [package]
-name = "rine-store-executor"
-version.workspace = true
+description = "Executor backend for rine-etcd, providing a standardized interface for executing store operations"
 edition.workspace = true
 license.workspace = true
-description = "Executor backend for rine-etcd, providing a standardized interface for executing store operations"
+name = "rine-store-executor"
+version.workspace = true
 
 [lib]
 name = "rine_store_executor"
 path = "src/lib.rs"
 
 [dependencies]
-rine-etcd.workspace = true
-tokio.workspace = true
 async-trait.workspace = true
-thiserror.workspace = true
 bytes.workspace = true
+rine-etcd.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
-tonic.workspace = true
 tokio-stream.workspace = true
+tonic.workspace = true

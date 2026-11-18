@@ -1,24 +1,23 @@
 [package]
-name = "rine-store-sqlite"
-version.workspace = true
+description = "SQLite backend for rine-etcd (rusqlite)"
 edition.workspace = true
 license.workspace = true
-description = "SQLite backend for rine-etcd (rusqlite)"
+name = "rine-store-sqlite"
+version.workspace = true
 
 [lib]
 name = "rine_store_sqlite"
 path = "src/lib.rs"
 
 [dependencies]
+async-trait.workspace = true
+bytes.workspace = true
 rine-etcd.workspace = true
 rine-store-executor.workspace = true
 rusqlite.workspace = true
-tokio.workspace = true
-async-trait.workspace = true
 thiserror.workspace = true
-bytes.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
-tonic.workspace = true
 tokio-stream.workspace = true
-    
+tonic.workspace = true
