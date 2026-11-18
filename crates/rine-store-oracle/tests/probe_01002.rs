@@ -243,6 +243,11 @@ fn probe_select_shapes() {
     for ddl in [
         "DROP TABLE kineq",
         "CREATE TABLE kineq (id NUMBER PRIMARY KEY, name VARCHAR2(630), created NUMBER DEFAULT 0, deleted NUMBER DEFAULT 0, create_revision NUMBER DEFAULT 0, prev_revision NUMBER DEFAULT 0, lease NUMBER DEFAULT 0, version NUMBER DEFAULT 1, value BLOB)",
+        "CREATE INDEX kineq_name_index ON kineq(name)",
+        "CREATE INDEX kineq_name_id_index ON kineq(name, id)",
+        "CREATE INDEX kineq_id_deleted_index ON kineq(id, deleted)",
+        "CREATE INDEX kineq_prev_revision_index ON kineq(prev_revision)",
+        "CREATE UNIQUE INDEX kineq_name_prev_revision_uindex ON kineq(name, prev_revision)",
     ] {
         let _ = conn.execute(ddl, &[]);
     }
@@ -342,6 +347,20 @@ fn probe_select_shapes() {
         Ok(out)
     })();
     println!("Q6 live_by_name + ORDER BY: {r:?}");
+
+    // R1: kine-shaped + all indexes (the remaining difference vs kine).
+    let r: Result<Vec<Vec<String>>, oracledb::Error> = (|| {
+        let c = conn.query(
+            "SELECT id, name, created, deleted, create_revision, prev_revision, lease, version, value FROM kineq WHERE name = :1 AND deleted = 0",
+            &[&"foo" as &dyn oracledb::ToDbValue],
+        )?;
+        let mut out = Vec::new();
+        for row in c {
+            out.push(read_all(&row?)?);
+        }
+        Ok(out)
+    })();
+    println!("R1 kine-shaped + indexes: {r:?}");
 
     let _ = conn.execute("DROP TABLE kineq", &[]);
     conn.commit().unwrap();
