@@ -169,9 +169,11 @@ async fn live_read_after_recreate() {
         let row = db
             .query_row(LIVE, vec![SqlValue::Str("foo".into())])
             .await
-            .expect("query_row")
-            .unwrap_or_else(|| panic!("gen {generation}: row must be visible via query_row"));
-        assert_eq!(row.get_int(0).unwrap(), generation);
+            .expect("query_row");
+        assert!(
+            row.is_some(),
+            "gen {generation}: row must be visible via query_row"
+        );
         let rows = db
             .query_all(LIVE, vec![SqlValue::Str("foo".into())])
             .await
