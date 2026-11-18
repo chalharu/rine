@@ -420,6 +420,23 @@ async fn probe_backend_prefix_list() {
     dump("after create foo");
     let (_, kv) = backend.get(b"foo", 0).await.unwrap();
     println!("GET foo -> {kv:?}");
+    // Raw-driver cross-check of the exact same shape.
+    let raw_rows = {
+        let c = raw
+            .query(
+                "SELECT id, name, created, deleted, create_revision, prev_revision, lease, version, value FROM kine WHERE name = :1 AND deleted = 0",
+                &[&"foo"],
+            )
+            .unwrap();
+        let mut n = 0;
+        for row in c {
+            let row = row.unwrap();
+            let id: Option<i64> = row.get(0).unwrap();
+            n += if id.is_some() { 1 } else { 0 };
+        }
+        n
+    };
+    println!("RAW live_by_name rows: {raw_rows}");
     assert_eq!(kv.unwrap().value, bytes::Bytes::from("bar"));
     for (k, v) in [("s/b", "2"), ("s/a", "1"), ("s/c", "3")] {
         backend
