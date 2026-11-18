@@ -26,8 +26,10 @@ fn setup(conn: &Connection) {
     for ddl in [
         "DROP TABLE probe_nolob",
         "DROP TABLE probe_lob",
+        "DROP TABLE probe_kine",
         "CREATE TABLE probe_nolob (id NUMBER PRIMARY KEY, name VARCHAR2(100))",
         "CREATE TABLE probe_lob (id NUMBER PRIMARY KEY, v BLOB)",
+        "CREATE TABLE probe_kine (id NUMBER PRIMARY KEY, name VARCHAR2(630), created NUMBER DEFAULT 0, deleted NUMBER DEFAULT 0, create_revision NUMBER DEFAULT 0, prev_revision NUMBER DEFAULT 0, lease NUMBER DEFAULT 0, version NUMBER DEFAULT 1, value BLOB)",
     ] {
         let _ = conn.execute(ddl, &[]);
     }
@@ -41,6 +43,12 @@ fn setup(conn: &Connection) {
         conn.execute(
             "INSERT INTO probe_lob (id, v) VALUES (:1, :2)",
             &[&i, &data],
+        )
+        .unwrap();
+        let name = format!("s/{i}");
+        conn.execute(
+            "INSERT INTO probe_kine (id, name, created, deleted, create_revision, prev_revision, lease, version, value) VALUES (:1, :2, 0, 0, 0, 0, 0, 1, :3)",
+            &[&i, &name, &data],
         )
         .unwrap();
     }
@@ -154,7 +162,58 @@ fn probe_fetch_01002() {
     })();
     println!("E multi-row BLOB locators: {r:?}");
 
-    for ddl in ["DROP TABLE probe_nolob", "DROP TABLE probe_lob"] {
+    // H. kine-shaped 9-col query with binds (the failing etcdctl shape).
+    let r: Result<usize, oracledb::Error> = (|| {
+        let c = conn.query(
+            "SELECT id, name, created, deleted, create_revision, prev_revision, lease, version, value FROM probe_kine WHERE name >= :1 AND name < :2 AND deleted = 0 ORDER BY name, id",
+            &[&"s/" as &dyn oracledb::ToDbValue, &"s0"],
+        )?;
+        let mut n = 0;
+        for row in c {
+            let row = row?;
+            let v: Option<Vec<u8>> = row.get(8)?;
+            n += v.map(|b| b.len()).unwrap_or(0);
+        }
+        Ok(n)
+    })();
+    println!("H kine-shaped 9col binds: {r:?}");
+
+    // I. same shape, literal predicates (no binds).
+    let r: Result<usize, oracledb::Error> = (|| {
+        let c = conn.query(
+            "SELECT id, name, created, deleted, create_revision, prev_revision, lease, version, value FROM probe_kine WHERE name >= 's/' AND name < 's0' AND deleted = 0 ORDER BY name, id",
+            &[],
+        )?;
+        let mut n = 0;
+        for row in c {
+            let row = row?;
+            let v: Option<Vec<u8>> = row.get(8)?;
+            n += v.map(|b| b.len()).unwrap_or(0);
+        }
+        Ok(n)
+    })();
+    println!("I kine-shaped 9col literals: {r:?}");
+
+    // J. 8 columns (no BLOB) with binds.
+    let r: Result<usize, oracledb::Error> = (|| {
+        let c = conn.query(
+            "SELECT id, name, created, deleted, create_revision, prev_revision, lease, version FROM probe_kine WHERE name >= :1 AND name < :2 ORDER BY name, id",
+            &[&"s/" as &dyn oracledb::ToDbValue, &"s0"],
+        )?;
+        let mut n = 0;
+        for row in c {
+            let _: i64 = row?.get(0)?;
+            n += 1;
+        }
+        Ok(n)
+    })();
+    println!("J 8col binds no-LOB: {r:?}");
+
+    for ddl in [
+        "DROP TABLE probe_nolob",
+        "DROP TABLE probe_lob",
+        "DROP TABLE probe_kine",
+    ] {
         let _ = conn.execute(ddl, &[]);
     }
     conn.commit().unwrap();
