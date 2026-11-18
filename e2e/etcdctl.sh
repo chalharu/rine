@@ -10,6 +10,7 @@
 # Only RPCs the server implements are covered (KV/Watch/Lease/Status/
 # MemberList). Alarm/Defrag/Snapshot/Auth/Lock/Election are out of scope.
 set -euo pipefail
+trap 'echo "FAILED at: $BASH_COMMAND" >&2' ERR
 
 EP="${ENDPOINT:-127.0.0.1:2379}"
 CTL="${ETCDCTL:?set ETCDCTL to the etcdctl binary}"

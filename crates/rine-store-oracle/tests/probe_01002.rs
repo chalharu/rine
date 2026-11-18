@@ -4,6 +4,7 @@
 //! identifies the trigger. Uses `oracledb` directly (not `OracleDb`).
 
 use oracledb::Connection;
+use std::sync::Arc;
 
 fn live_enabled() -> bool {
     std::env::var("RINE_LIVE_ORACLE").as_deref() == Ok("1")
@@ -149,7 +150,7 @@ fn probe_fetch_01002() {
             .map_err(|e| e.to_string())?;
         let mut n = 0;
         let mut bytes = 0;
-        for mut row in c {
+        for row in c {
             let mut row = row.map_err(|e| e.to_string())?;
             let mut lob: oracledb::Lob = row.take(1).map_err(|e| e.to_string())?;
             let mut buf = Vec::new();
@@ -217,4 +218,55 @@ fn probe_fetch_01002() {
         let _ = conn.execute(ddl, &[]);
     }
     conn.commit().unwrap();
+}
+
+/// Replicates the failing etcdctl sequence through the real backend stack
+/// (OracleDb + OracleBackend): create foo, get foo, create s/*, prefix list.
+#[tokio::test]
+async fn probe_backend_prefix_list() {
+    use rine_etcd::backend::{Backend, ListOptions};
+    use rine_store_oracle::{OracleBackend, OracleDb, SqlExecutor};
+
+    if !live_enabled() {
+        eprintln!("skipping probe (RINE_LIVE_ORACLE != 1)");
+        return;
+    }
+    let host = std::env::var("ORACLE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let port = std::env::var("ORACLE_PORT").unwrap_or_else(|_| "1521".into());
+    let service = std::env::var("ORACLE_SERVICE").unwrap_or_else(|_| "XEPDB1".into());
+    let user = std::env::var("ORACLE_USER").unwrap_or_else(|_| "rine".into());
+    let password = std::env::var("ORACLE_PASSWORD").unwrap_or_else(|_| "RinePass123_".into());
+    let db = OracleDb::connect(&user, &password, &format!("{host}:{port}/{service}")).unwrap();
+    let _ = db.execute("DROP TABLE kine", vec![]).await;
+    let backend = OracleBackend::new(Arc::new(db));
+    backend.ensure_schema().await.unwrap();
+
+    backend
+        .create(bytes::Bytes::from("foo"), bytes::Bytes::from("bar"), 0)
+        .await
+        .unwrap();
+    let (_, kv) = backend.get(b"foo", 0).await.unwrap();
+    assert_eq!(kv.unwrap().value, bytes::Bytes::from("bar"));
+    for (k, v) in [("s/b", "2"), ("s/a", "1"), ("s/c", "3")] {
+        backend
+            .create(bytes::Bytes::from(k), bytes::Bytes::from(v), 0)
+            .await
+            .unwrap();
+    }
+    let (rev, kvs, count) = backend
+        .list(
+            b"s",
+            Some(b"t".as_slice()),
+            ListOptions {
+                keys_only: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    println!(
+        "L backend prefix list: rev={rev} count={count} rows={}",
+        kvs.len()
+    );
+    assert_eq!(count, 3);
 }
