@@ -373,6 +373,21 @@ fn probe_oracledb_sequence() {
             if c_row.is_some() { "FOUND" } else { "MISS" }
         );
 
+        // Phase D: same second-gen table, cursor path first, then query_row.
+        let d_all = db
+            .query_all(LIVE, vec![SqlValue::Str("foo".into())])
+            .await
+            .unwrap();
+        println!("D query_all after MISS: rows={}", d_all.len());
+        let d_row = db
+            .query_row(LIVE, vec![SqlValue::Str("foo".into())])
+            .await
+            .unwrap();
+        println!(
+            "D query_row after query_all: {}",
+            if d_row.is_some() { "FOUND" } else { "MISS" }
+        );
+
         let _ = db.execute("DROP TABLE kx1", vec![]).await;
     });
 }
