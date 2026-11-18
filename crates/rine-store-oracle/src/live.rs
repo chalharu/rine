@@ -16,6 +16,12 @@ use rine_etcd::error::{Error, Result};
 use std::sync::{Arc, Mutex};
 
 /// Live Oracle connection. `Clone` shares the same underlying session.
+///
+/// Reads bypass the driver's statement cache (`exclude_from_cache`): a cached
+/// SELECT re-executed after the table was dropped and recreated (or after an
+/// empty first fetch) can return a stale empty result / ORA-01002 instead of
+/// re-parsing. Writes keep using the cache; they surface hard errors, never
+/// silent empty results.
 #[derive(Clone, Debug)]
 pub struct OracleDb {
     conn: Arc<Mutex<oracledb::Connection>>,
@@ -137,7 +143,8 @@ impl SqlExecutor for OracleDb {
         self.run_blocking(move |conn| {
             let owned: Vec<OwnedParam> = params.iter().map(OwnedParam::from).collect();
             let refs: Vec<&dyn ToDbValue> = owned.iter().map(as_bind).collect();
-            match conn.query_row(&sql, &refs) {
+            let stmt = conn.statement(&sql)?.exclude_from_cache().build()?;
+            match stmt.query_row(&refs) {
                 Ok(row) => read_row(&row).map(Some),
                 Err(e) if is_no_data(&e) => Ok(None),
                 Err(e) => Err(e),
@@ -151,7 +158,8 @@ impl SqlExecutor for OracleDb {
         self.run_blocking(move |conn| {
             let owned: Vec<OwnedParam> = params.iter().map(OwnedParam::from).collect();
             let refs: Vec<&dyn ToDbValue> = owned.iter().map(as_bind).collect();
-            let cursor = conn.query(&sql, &refs)?;
+            let stmt = conn.statement(&sql)?.exclude_from_cache().build()?;
+            let cursor = stmt.query(&refs)?;
             let mut out = Vec::new();
             for row in cursor {
                 out.push(read_row(&row?)?);
