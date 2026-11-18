@@ -192,7 +192,10 @@ impl<E: SqlExecutor + 'static> Backend for OracleBackend<E> {
             .await?;
         let id = self.resolve_id(&key, 0).await?;
         self.exec
-            .execute(Dialect::set_create_rev_sql(), vec![SqlValue::Int(id)])
+            .execute(
+                Dialect::set_create_rev_sql(),
+                vec![SqlValue::Int(id), SqlValue::Int(id)],
+            )
             .await?;
         let kv = KeyValue {
             key: key.clone(),
@@ -363,11 +366,14 @@ impl<E: SqlExecutor + 'static> Backend for OracleBackend<E> {
         self.exec
             .execute(
                 Dialect::set_compact_rev_sql(),
-                vec![SqlValue::Int(revision)],
+                vec![SqlValue::Int(revision), SqlValue::Int(revision)],
             )
             .await?;
         self.exec
-            .execute(Dialect::compact_delete_sql(), vec![SqlValue::Int(revision)])
+            .execute(
+                Dialect::compact_delete_sql(),
+                vec![SqlValue::Int(revision), SqlValue::Int(revision)],
+            )
             .await?;
         Ok(revision)
     }

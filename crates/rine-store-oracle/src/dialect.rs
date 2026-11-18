@@ -86,21 +86,21 @@ impl Dialect {
     }
 
     pub fn set_create_rev_sql() -> &'static str {
-        "UPDATE kine SET create_revision = :1 WHERE id = :1"
+        "UPDATE kine SET create_revision = :1 WHERE id = :2"
     }
 
     /// Drop history below `rev`, keeping the newest row at or below `rev`
     /// per key (that row is the historical read base).
     pub fn compact_delete_sql() -> &'static str {
         "DELETE FROM kine WHERE id < :1 AND name <> 'compact_rev_key' \
-         AND id NOT IN (SELECT MAX(id) FROM kine WHERE id <= :1 GROUP BY name)"
+         AND id NOT IN (SELECT MAX(id) FROM kine WHERE id <= :2 GROUP BY name)"
     }
 
     pub fn set_compact_rev_sql() -> &'static str {
         "MERGE INTO kine USING DUAL ON (name = 'compact_rev_key') \
          WHEN MATCHED THEN UPDATE SET prev_revision = :1 \
          WHEN NOT MATCHED THEN INSERT (name, created, deleted, create_revision, prev_revision, lease) \
-         VALUES ('compact_rev_key', 0, 0, 0, :1, 0)"
+         VALUES ('compact_rev_key', 0, 0, 0, :2, 0)"
     }
 
     pub fn db_size_sql() -> &'static str {

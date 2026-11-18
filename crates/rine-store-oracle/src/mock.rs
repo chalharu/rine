@@ -114,10 +114,10 @@ impl SqlExecutor for MockExec {
             return Ok(0);
         }
         if sql == Dialect::set_create_rev_sql() {
-            let id = Self::int_param(&params, 0);
+            let (rev, id) = (Self::int_param(&params, 0), Self::int_param(&params, 1));
             for r in rows.iter_mut() {
                 if r.id == id {
-                    r.create_revision = id;
+                    r.create_revision = rev;
                     return Ok(1);
                 }
             }
