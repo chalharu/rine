@@ -1,0 +1,25 @@
+[package]
+name = "rine-store-oracle"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Oracle DB backend for rine-etcd (official oracledb driver)"
+
+[lib]
+name = "rine_store_oracle"
+path = "src/lib.rs"
+
+[dependencies]
+rine-etcd = { path = "../rine-etcd" }
+oracledb.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+tonic = { workspace = true }
+tokio-stream = { version = "0.1", features = ["sync"] }

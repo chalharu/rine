@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unit:
+    name: unit tests (no DB)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: unit tests
+        run: cargo test --workspace
+      - name: clippy
+        run: cargo clippy --workspace --tests
+
+  oracle-xe:
+    name: integration tests (Oracle XE)
+    runs-on: ubuntu-latest
+    services:
+      oracle:
+        image: gvenzl/oracle-xe:21-slim
+        env:
+          ORACLE_PASSWORD: TestPass123_
+          APP_USER: rine
+          APP_USER_PASSWORD: RinePass123_
+        ports:
+          - 1521:1521
+        options: >-
+          --health-cmd healthcheck.sh
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ORACLE_HOST: 127.0.0.1
+      ORACLE_PORT: 1521
+      ORACLE_SERVICE: XEPDB1
+      ORACLE_USER: rine
+      ORACLE_PASSWORD: RinePass123_
+      RINE_LIVE_ORACLE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: wait for Oracle XE (TCP + PDB open)
+        run: |
+          for i in $(seq 1 60); do
+            if (echo > /dev/tcp/127.0.0.1/1521) 2>/dev/null; then
+              echo "port 1521 open after $((i * 10))s"
+              exit 0
+            fi
+            echo "waiting for 1521... ($i/60)"
+            sleep 10
+          done
+          echo "Oracle XE did not open port 1521 in time"
+          exit 1
+      - name: backend integration test (live XE)
+        run: cargo test -p rine-store-oracle --test live_oracle -- --nocapture
+      - name: full workspace tests against live XE
+        run: cargo test --workspace
