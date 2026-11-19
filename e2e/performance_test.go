@@ -67,6 +67,28 @@ func TestPerformance(t *testing.T) {
 		if !writesComplete {
 			return
 		}
+		// k8s-style conditional write: compare the key's version, then write
+		// the same key. Exercises the per-key revalidation path (compare key
+		// == written key), the dominant txn shape of the apiserver.
+		t.Run("Txn", func(t *testing.T) {
+			run(t, func(ctx context.Context, key string) error {
+				key = key + "/txn"
+				resp, err := c.Txn(ctx).If(
+					clientv3.Compare(clientv3.Version(key), "=", 0),
+				).Then(
+					clientv3.OpPut(key, value),
+				).Else(
+					clientv3.OpGet(key),
+				).Commit()
+				if err != nil {
+					return err
+				}
+				if !resp.Succeeded {
+					return fmt.Errorf("txn on fresh key %q did not succeed", key)
+				}
+				return nil
+			})
+		})
 		t.Run("Get", func(t *testing.T) {
 			run(t, func(ctx context.Context, key string) error {
 				r, err := c.Get(ctx, key)

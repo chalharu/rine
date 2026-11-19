@@ -243,7 +243,6 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         &self,
         reads: &ReadSet,
         events: Vec<Event>,
-        staged: Revision,
     ) -> Result<(Revision, Vec<Event>)> {
         let mut seen: HashSet<&[u8]> = HashSet::new();
         for (key, expected) in &reads.points {
@@ -296,7 +295,7 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
             }
             let (create, lease, version, value) = match &event.kv {
                 Some(kv) => (
-                    if kv.create_revision == staged {
+                    if kv.create_revision == event.revision {
                         fresh
                     } else {
                         kv.create_revision
@@ -326,6 +325,7 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         let rebased = events
             .into_iter()
             .map(|mut event| {
+                let staged = event.revision;
                 event.revision = fresh;
                 if let Some(kv) = event.kv.as_mut() {
                     kv.mod_revision = fresh;
@@ -518,8 +518,7 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
     async fn commit(&self, reads: ReadSet, events: Vec<Event>) -> Result<Revision> {
         let _guard = self.writes.lock().await;
         self.exec.begin_unit().await?;
-        let staged = events.first().map(|e| e.revision).unwrap_or(0);
-        match self.commit_guarded(&reads, events, staged).await {
+        match self.commit_guarded(&reads, events).await {
             Ok((fresh, rebased)) => {
                 self.exec.end_unit(true).await?;
                 if !rebased.is_empty() {

@@ -327,9 +327,9 @@ impl Backend for MemoryBackend {
             return Ok(g.rev);
         }
         let fresh = g.rev + 1;
-        let staged = events.first().map(|e| e.revision).unwrap_or(fresh);
         let mut rebased = Vec::with_capacity(events.len());
         for mut event in events {
+            let staged = event.revision;
             event.revision = fresh;
             if let Some(kv) = event.kv.as_mut() {
                 kv.mod_revision = fresh;
