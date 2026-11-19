@@ -18,6 +18,7 @@ rine-store-oracle = { optional = true, workspace = true }
 rine-store-sqlite = { optional = true, workspace = true }
 serde.workspace = true
 tokio.workspace = true
+tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

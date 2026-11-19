@@ -16,6 +16,17 @@ EP="${ENDPOINT:-127.0.0.1:2379}"
 CTL="${ETCDCTL:?set ETCDCTL to the etcdctl binary}"
 export ETCDCTL_API=3
 
+# TLS: set TLS_CA (and TLS_CERT/TLS_KEY for mTLS) to talk to a
+# TLS-enabled server. ENDPOINT must use the https:// scheme then.
+if [ -n "${TLS_CA:-}" ]; then
+    TLS_FLAGS=(--cacert="$TLS_CA")
+    if [ -n "${TLS_CERT:-}" ]; then
+        TLS_FLAGS+=(--cert="$TLS_CERT" --key="$TLS_KEY")
+    fi
+else
+    TLS_FLAGS=()
+fi
+
 PASS=0
 fail() {
     echo "FAIL: $1 (expected: [$2], got: [$3])" >&2
@@ -30,7 +41,7 @@ check() { # check <label> <expected> <actual>
 }
 
 ectl() {
-    "$CTL" --endpoints="$EP" "$@"
+    "$CTL" --endpoints="$EP" "${TLS_FLAGS[@]}" "$@"
 }
 
 revision() {
@@ -111,7 +122,7 @@ check "revoked key gone" "" "$(ectl get lk --print-value-only)"
 echo "== watch replay =="
 ectl put w/1 a >/dev/null
 ectl put w/2 b >/dev/null
-timeout 10 env ETCDCTL_API=3 "$CTL" --endpoints="$EP" watch w --prefix --rev=1 > /tmp/rine-watch.log 2>&1 || true
+timeout 10 env ETCDCTL_API=3 "$CTL" --endpoints="$EP" "${TLS_FLAGS[@]}" watch w --prefix --rev=1 > /tmp/rine-watch.log 2>&1 || true
 grep -q "PUT" /tmp/rine-watch.log || fail "watch PUT event" "PUT" "$(cat /tmp/rine-watch.log)"
 grep -q "w/1" /tmp/rine-watch.log || fail "watch w/1" "w/1" "$(cat /tmp/rine-watch.log)"
 grep -q "w/2" /tmp/rine-watch.log || fail "watch w/2" "w/2" "$(cat /tmp/rine-watch.log)"
