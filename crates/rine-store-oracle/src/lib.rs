@@ -15,7 +15,7 @@ mod mock;
 mod store;
 
 pub use live::OracleDb;
-#[cfg(any(feature = "mock"))]
+#[cfg(feature = "mock")]
 pub use mock::MockExec;
 use rine_store_executor::SqlBackend;
 
