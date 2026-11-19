@@ -260,11 +260,15 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
             guard_only.push(key);
         }
         // One trip for all guard-only reads plus the revision assignment.
+        // The newest physical row carries the highest logical revision:
+        // revisions are assigned strictly increasing, so ordering by id and
+        // taking the first row is an indexed lookup, unlike MAX() which would
+        // scan the whole table on every commit.
         let mut batch: Vec<(String, Vec<SqlValue>)> = guard_only
             .iter()
             .map(|key| (D::live_by_name_sql(), vec![SqlValue::Str(key_str(key))]))
             .collect();
-        batch.push((D::max_revision_sql(), vec![]));
+        batch.push((D::current_revision_sql(), vec![]));
         let mut results = self.exec.query_batch(batch).await?.into_iter();
         for key in guard_only {
             let expected = reads
