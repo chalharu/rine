@@ -13,7 +13,7 @@ use crate::{
     executor::{Row, SqlExecutor, SqlValue},
 };
 
-/// kine-style append-only `kine` table over any SQL database.
+/// kine-style append-only `rine` table over any SQL database.
 ///
 /// Assumes a single writer (like kine on SQLite): ids come from an
 /// auto-increment column, so the newest row for a key resolves via the
@@ -36,7 +36,7 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         }
     }
 
-    /// Create the schema if the `kine` table is missing (server startup path).
+    /// Create the schema if the `rine` table is missing (server startup path).
     /// A concurrent creator racing us surfaces an already-exists error,
     /// which is tolerated.
     pub async fn ensure_schema(&self) -> Result<()> {

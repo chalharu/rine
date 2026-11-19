@@ -1,4 +1,4 @@
-//! SQL dialects for kine-style `kine` backends.
+//! SQL dialects for kine-style `rine` backends.
 //!
 //! [`Dialect`] abstracts the per-database SQL (`:1` vs `?` placeholders,
 //! DDL, a few functions); the MVCC logic in `SqlBackend` is shared. The
@@ -64,7 +64,7 @@ pub trait Dialect: Send + Sync + 'static {
     /// True when `msg` reports a name clash from a concurrent creator.
     fn is_already_exists(msg: &str) -> bool;
 
-    /// Revision bookkeeping mirrors kine's `compact_rev_key` row.
+    /// Revision bookkeeping mirrors rine's `compact_rev_key` row.
     fn compacted_rev_key() -> &'static str {
         "compact_rev_key"
     }

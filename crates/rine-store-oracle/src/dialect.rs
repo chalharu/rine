@@ -1,4 +1,4 @@
-//! SQL dialects for kine-style `kine` backends.
+//! SQL dialects for `rine` backends.
 //!
 //! [`Dialect`] abstracts the per-database SQL (`:1` vs `?` placeholders,
 //! DDL, a few functions); the MVCC logic in `SqlBackend` is shared. The
@@ -26,7 +26,7 @@ impl Dialect for OracleDialect {
     }
 
     fn current_revision_sql() -> &'static str {
-        "SELECT MAX(id) FROM kine"
+        "SELECT MAX(id) FROM rine"
     }
 
     fn compact_revision_sql() -> &'static str {
@@ -122,7 +122,7 @@ impl Dialect for OracleDialect {
     }
 
     fn db_size_sql() -> &'static str {
-        "SELECT NVL(SUM(LENGTH(name) + NVL(DBMS_LOB.GETLENGTH(value), 0)), 0) FROM kine"
+        "SELECT NVL(SUM(LENGTH(name) + NVL(DBMS_LOB.GETLENGTH(value), 0)), 0) FROM rine"
     }
 
     fn is_missing_table(msg: &str) -> bool {

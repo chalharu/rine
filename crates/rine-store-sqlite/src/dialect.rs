@@ -1,4 +1,4 @@
-//! SQLite SQL dialect for the kine-style `kine` table.
+//! SQLite SQL dialect for `rine` table.
 //!
 //! Positional `?` binds; `AUTOINCREMENT` ids; `COALESCE` instead of `NVL`;
 //! `LIMIT 1` instead of `ROWNUM = 1`. The compact-revision bookkeeping is an
@@ -26,11 +26,11 @@ impl Dialect for SqliteDialect {
 
     fn create_indexes_sql() -> &'static [&'static str] {
         &[
-            "CREATE INDEX kine_name_index ON kine(name)",
-            "CREATE INDEX kine_name_id_index ON kine(name, id)",
-            "CREATE INDEX kine_id_deleted_index ON kine(id, deleted)",
-            "CREATE INDEX kine_prev_revision_index ON kine(prev_revision)",
-            "CREATE UNIQUE INDEX kine_name_prev_revision_uindex ON kine(name, prev_revision)",
+            "CREATE INDEX rine_name_index ON rine(name)",
+            "CREATE INDEX rine_name_id_index ON rine(name, id)",
+            "CREATE INDEX rine_id_deleted_index ON rine(id, deleted)",
+            "CREATE INDEX rine_prev_revision_index ON rine(prev_revision)",
+            "CREATE UNIQUE INDEX rine_name_prev_revision_uindex ON rine(name, prev_revision)",
         ]
     }
 
@@ -39,7 +39,7 @@ impl Dialect for SqliteDialect {
     }
 
     fn current_revision_sql() -> &'static str {
-        "SELECT MAX(id) FROM kine"
+        "SELECT MAX(id) FROM rine"
     }
 
     fn compact_revision_sql() -> &'static str {
@@ -135,7 +135,7 @@ impl Dialect for SqliteDialect {
     }
 
     fn db_size_sql() -> &'static str {
-        "SELECT COALESCE(SUM(LENGTH(name) + LENGTH(value)), 0) FROM kine"
+        "SELECT COALESCE(SUM(LENGTH(name) + LENGTH(value)), 0) FROM rine"
     }
 
     fn is_missing_table(msg: &str) -> bool {

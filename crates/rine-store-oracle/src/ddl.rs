@@ -1,4 +1,4 @@
-/// Oracle DDL for the kine-compatible `kine` table.
+/// Oracle DDL for the `rine` table.
 ///
 /// `value` is a BLOB: the official `oracledb` driver handles temporary LOBs
 /// (bind + inline fetch) natively.
@@ -17,9 +17,9 @@ CREATE TABLE rine (
 "#;
 
 pub const CREATE_INDEXES: &[&str] = &[
-    "CREATE INDEX kine_name_index ON kine(name)",
-    "CREATE INDEX kine_name_id_index ON kine(name, id)",
-    "CREATE INDEX kine_id_deleted_index ON kine(id, deleted)",
-    "CREATE INDEX kine_prev_revision_index ON kine(prev_revision)",
-    "CREATE UNIQUE INDEX kine_name_prev_revision_index ON kine(name, prev_revision)",
+    "CREATE INDEX rine_name_index ON rine(name)",
+    "CREATE INDEX rine_name_id_index ON rine(name, id)",
+    "CREATE INDEX rine_id_deleted_index ON rine(id, deleted)",
+    "CREATE INDEX rine_prev_revision_index ON rine(prev_revision)",
+    "CREATE UNIQUE INDEX rine_name_prev_revision_index ON rine(name, prev_revision)",
 ];
