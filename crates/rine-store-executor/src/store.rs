@@ -1,4 +1,4 @@
-use std::{collections::HashSet, marker::PhantomData, sync::Arc};
+use std::{collections::HashSet, marker::PhantomData, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -43,27 +43,43 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
     pub async fn ensure_schema(&self) -> Result<()> {
         match self.exec.query_row(D::probe_sql(), vec![]).await {
             Ok(_) => Ok(()),
-            Err(Error::Backend(m)) if D::is_missing_table(&m) => match self.create_schema().await {
-                Err(Error::Backend(m)) if D::is_already_exists(&m) => Ok(()),
-                r => r,
-            },
+            Err(Error::Backend(m)) if D::is_missing_table(&m) => self.create_schema().await,
             Err(e) => Err(e),
         }?;
         for stmt in D::ensure_indexes_sql() {
-            self.exec.execute(stmt, vec![]).await?;
+            self.create_statement_with_retry(stmt).await?;
         }
         Ok(())
     }
 
-    /// Run the DDL. Idempotent only when the table does not exist yet;
-    /// migrations are out of scope for now.
+    /// Run the DDL. Each statement tolerates a concurrent creator
+    /// (already-exists) and retries a transient lock conflict with a
+    /// concurrent writer (e.g. `CREATE INDEX` racing DML on a fresh database),
+    /// so simultaneous startups on any number of nodes converge.
+    /// Migrations are out of scope for now.
     pub async fn create_schema(&self) -> Result<()> {
         for stmt in
             std::iter::once(D::create_table_sql()).chain(D::create_indexes_sql().iter().copied())
         {
-            self.exec.execute(stmt, vec![]).await?;
+            self.create_statement_with_retry(stmt).await?;
         }
         Ok(())
+    }
+
+    async fn create_statement_with_retry(&self, stmt: &str) -> Result<()> {
+        let mut delay = Duration::from_millis(50);
+        for _ in 0..10 {
+            match self.exec.execute(stmt, vec![]).await {
+                Ok(_) => return Ok(()),
+                Err(Error::Backend(m)) if D::is_already_exists(&m) => return Ok(()),
+                Err(Error::Backend(m)) if D::is_lock_contention(&m) => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(2));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.exec.execute(stmt, vec![]).await.map(|_| ())
     }
 
     async fn current_rev_inner(&self) -> Result<Revision> {

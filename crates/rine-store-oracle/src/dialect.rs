@@ -138,6 +138,10 @@ impl Dialect for OracleDialect {
         msg.contains("ORA-00955")
     }
 
+    fn is_lock_contention(msg: &str) -> bool {
+        msg.contains("ORA-00054")
+    }
+
     fn is_unique_violation(msg: &str) -> bool {
         msg.contains("ORA-00001")
     }

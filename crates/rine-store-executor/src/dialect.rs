@@ -135,6 +135,11 @@ pub trait Dialect: Send + Sync + 'static {
     fn is_missing_table(msg: &str) -> bool;
     /// True when `msg` reports a name clash from a concurrent creator.
     fn is_already_exists(msg: &str) -> bool;
+    /// True when `msg` reports a transient lock conflict with a concurrent
+    /// creator or writer (worth a bounded retry, e.g. DDL racing DML).
+    fn is_lock_contention(_msg: &str) -> bool {
+        false
+    }
     /// True when `msg` reports a unique-constraint violation: another writer
     /// committed a conflicting row first. Callers treat it as an optimistic
     /// concurrency conflict, never as corruption.

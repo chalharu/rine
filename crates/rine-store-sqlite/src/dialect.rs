@@ -183,6 +183,10 @@ impl Dialect for SqliteDialect {
         msg.contains("already exists")
     }
 
+    fn is_lock_contention(msg: &str) -> bool {
+        msg.contains("database is locked")
+    }
+
     fn is_unique_violation(msg: &str) -> bool {
         msg.contains("UNIQUE constraint failed")
     }
