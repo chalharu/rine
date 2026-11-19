@@ -189,7 +189,7 @@ impl KvService {
             Ok(fresh)
         })
         .await
-        .map_err(|error| Error::Backend(format!("commit task failed: {error}").into()))?
+        .map_err(|error| Error::task("commit task failed", error))?
     }
 
     /// Rewrite staged (`base + 1`) header revisions with the assigned one.

@@ -73,7 +73,7 @@ impl OracleDb {
             op(&guard).map_err(cvt_error)
         })
         .await
-        .map_err(|e| Error::Backend(format!("db task failed: {e}").into()))?
+        .map_err(|e| Error::task("db task failed", e))?
     }
 }
 

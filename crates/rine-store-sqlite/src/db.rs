@@ -70,7 +70,7 @@ impl SqliteDb {
         let guard = self.conn.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || op(&guard).map_err(cvt_error))
             .await
-            .map_err(|e| Error::Backend(format!("db task failed: {e}").into()))?
+            .map_err(|e| Error::task("db task failed", e))?
     }
 }
 
