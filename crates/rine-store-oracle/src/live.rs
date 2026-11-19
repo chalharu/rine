@@ -73,7 +73,7 @@ impl OracleDb {
             op(&guard).map_err(cvt_error)
         })
         .await
-        .map_err(|e| Error::Backend(format!("db task failed: {e}")))?
+        .map_err(|e| Error::Backend(format!("db task failed: {e}").into()))?
     }
 }
 
@@ -92,7 +92,8 @@ fn cvt_error(e: oracledb::Error) -> Error {
         Some(942) => Error::TableMissing(msg),
         Some(955) => Error::AlreadyExists(msg),
         Some(54) => Error::LockContention(msg),
-        _ => Error::Backend(msg),
+        // Unknown errors keep the original value verbatim: no re-stringify.
+        _ => Error::Backend(e.into()),
     }
 }
 

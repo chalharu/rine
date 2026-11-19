@@ -26,16 +26,20 @@ impl Row {
     pub fn get_int(&self, i: usize) -> Result<i64> {
         match self.values.get(i) {
             Some(SqlValue::Int(v)) => Ok(*v),
-            Some(v) => Err(Error::Backend(format!("column {i} is not a number: {v:?}"))),
-            None => Err(Error::Backend(format!("missing column {i}"))),
+            Some(v) => Err(Error::Backend(
+                format!("column {i} is not a number: {v:?}").into(),
+            )),
+            None => Err(Error::Backend(format!("missing column {i}").into())),
         }
     }
 
     pub fn get_str(&self, i: usize) -> Result<String> {
         match self.values.get(i) {
             Some(SqlValue::Str(s)) => Ok(s.clone()),
-            Some(v) => Err(Error::Backend(format!("column {i} is not a string: {v:?}"))),
-            None => Err(Error::Backend(format!("missing column {i}"))),
+            Some(v) => Err(Error::Backend(
+                format!("column {i} is not a string: {v:?}").into(),
+            )),
+            None => Err(Error::Backend(format!("missing column {i}").into())),
         }
     }
 
@@ -43,8 +47,10 @@ impl Row {
         match self.values.get(i) {
             Some(SqlValue::Bytes(b)) => Ok(b.clone()),
             Some(SqlValue::Null) => Ok(Vec::new()),
-            Some(v) => Err(Error::Backend(format!("column {i} is not bytes: {v:?}"))),
-            None => Err(Error::Backend(format!("missing column {i}"))),
+            Some(v) => Err(Error::Backend(
+                format!("column {i} is not bytes: {v:?}").into(),
+            )),
+            None => Err(Error::Backend(format!("missing column {i}").into())),
         }
     }
 

@@ -123,11 +123,14 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         if missing.is_empty() {
             return Ok(());
         }
-        Err(Error::Backend(format!(
-            "rine schema is incomplete (missing: {}) and automatic creation failed ({err}); \
+        Err(Error::Backend(
+            format!(
+                "rine schema is incomplete (missing: {}) and automatic creation failed ({err}); \
              pre-create the table and required indexes with a privileged user, then restart",
-            missing.join(", ")
-        )))
+                missing.join(", ")
+            )
+            .into(),
+        ))
     }
 
     /// Names of absent objects: the table and/or required index names.

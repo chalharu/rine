@@ -37,7 +37,7 @@ pub(crate) fn status_err(e: Error) -> tonic::Status {
         Error::NotSupported(s) => tonic::Status::unimplemented(s),
         Error::Conflict => tonic::Status::aborted("storage revision changed during transaction"),
         Error::KeyExists(_) => tonic::Status::already_exists("key already exists"),
-        Error::Backend(s) => tonic::Status::internal(s),
+        Error::Backend(s) => tonic::Status::internal(s.to_string()),
         Error::TableMissing(s) | Error::AlreadyExists(s) | Error::LockContention(s) => {
             tonic::Status::internal(s)
         }
@@ -189,7 +189,7 @@ impl KvService {
             Ok(fresh)
         })
         .await
-        .map_err(|error| Error::Backend(format!("commit task failed: {error}")))?
+        .map_err(|error| Error::Backend(format!("commit task failed: {error}").into()))?
     }
 
     /// Rewrite staged (`base + 1`) header revisions with the assigned one.

@@ -12,8 +12,11 @@ pub enum Error {
     Conflict,
     #[error("not supported: {0}")]
     NotSupported(String),
+    /// Pass-through for errors the backend does not classify: the original
+    /// driver error is boxed verbatim (message, chain and downcastability
+    /// preserved), never re-stringified and re-parsed.
     #[error("backend: {0}")]
-    Backend(String),
+    Backend(Box<dyn std::error::Error + Send + Sync>),
     /// Schema probe hit a database without the `rine` table (fresh database).
     /// Carries the driver message for logs; match on the variant, not the text.
     #[error("table missing: {0}")]

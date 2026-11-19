@@ -70,7 +70,7 @@ impl SqliteDb {
         let guard = self.conn.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || op(&guard).map_err(cvt_error))
             .await
-            .map_err(|e| Error::Backend(format!("db task failed: {e}")))?
+            .map_err(|e| Error::Backend(format!("db task failed: {e}").into()))?
     }
 }
 
@@ -97,7 +97,8 @@ fn cvt_error(e: rusqlite::Error) -> Error {
     if msg.contains("already exists") {
         return Error::AlreadyExists(msg);
     }
-    Error::Backend(msg)
+    // Unknown errors keep the original value verbatim: no re-stringify.
+    Error::Backend(e.into())
 }
 
 struct Bind<'a>(&'a SqlValue);
