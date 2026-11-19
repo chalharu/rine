@@ -96,11 +96,7 @@ impl KvService {
         }
     }
 
-    async fn commit(
-        &self,
-        batch: WriteBatch,
-        guard: OwnedMutexGuard<()>,
-    ) -> Result<(), tonic::Status> {
+    async fn commit(&self, batch: WriteBatch, guard: OwnedMutexGuard<()>) -> Result<(), Error> {
         if batch.events.is_empty() {
             return Ok(());
         }
@@ -115,22 +111,15 @@ impl KvService {
             .collect();
         if changes.is_empty() && self.backend.commit_is_cancel_safe() {
             let _guard = guard;
-            return self
-                .backend
-                .commit(batch.base, batch.events)
-                .await
-                .map_err(status_err);
+            return self.backend.commit(batch.base, batch.events).await;
         }
         // Once the database commit starts, a dropped RPC must not interrupt
         // watch publication or lease bookkeeping.
         let backend = self.backend.clone();
         let leases = self.leases.clone();
-        tokio::spawn(async move {
+        let result = tokio::spawn(async move {
             let _guard = guard;
-            backend
-                .commit(batch.base, batch.events)
-                .await
-                .map_err(status_err)?;
+            backend.commit(batch.base, batch.events).await?;
             for (key, old, new) in changes {
                 if old != 0 {
                     leases.detach(old, &key).await;
@@ -142,7 +131,8 @@ impl KvService {
             Ok(())
         })
         .await
-        .map_err(|error| tonic::Status::internal(format!("commit task failed: {error}")))?
+        .map_err(|error| Error::Backend(format!("commit task failed: {error}")))?;
+        result
     }
 
     async fn list(
@@ -541,7 +531,7 @@ impl Kv for KvService {
         let guard = self.leases.writes.clone().lock_owned().await;
         let mut batch = self.batch().await;
         let response = self.do_put(&request.into_inner(), &mut batch).await?;
-        self.commit(batch, guard).await?;
+        self.commit(batch, guard).await.map_err(status_err)?;
         Ok(tonic::Response::new(response))
     }
 
@@ -552,7 +542,7 @@ impl Kv for KvService {
         let guard = self.leases.writes.clone().lock_owned().await;
         let mut batch = self.batch().await;
         let response = self.do_delete(&request.into_inner(), &mut batch).await?;
-        self.commit(batch, guard).await?;
+        self.commit(batch, guard).await.map_err(status_err)?;
         Ok(tonic::Response::new(response))
     }
 
@@ -561,10 +551,32 @@ impl Kv for KvService {
         request: tonic::Request<TxnRequest>,
     ) -> Result<tonic::Response<TxnResponse>, tonic::Status> {
         let guard = self.leases.writes.clone().lock_owned().await;
+        let req = request.into_inner();
         let mut batch = self.batch().await;
-        let response = self.do_txn(&request.into_inner(), 0, &mut batch).await?;
-        self.commit(batch, guard).await?;
-        Ok(tonic::Response::new(response))
+        let response = self.do_txn(&req, 0, &mut batch).await?;
+        match self.commit(batch, guard).await {
+            Ok(()) => Ok(tonic::Response::new(response)),
+            Err(Error::Conflict) => {
+                // Another writer committed under us. etcd reports this as a
+                // transaction conflict (succeeded=false), not an error: the
+                // staged success-branch writes were rolled back, so run the
+                // failure branch against the new state instead.
+                let guard = self.leases.writes.clone().lock_owned().await;
+                let mut retry = self.batch().await;
+                let mut responses = Vec::with_capacity(req.failure.len());
+                for op in &req.failure {
+                    responses.push(self.apply_op(op, 0, &mut retry).await?);
+                }
+                let revision = self.backend.current_revision().await;
+                self.commit(retry, guard).await.map_err(status_err)?;
+                Ok(tonic::Response::new(TxnResponse {
+                    header: Some(self.header(revision)),
+                    succeeded: false,
+                    responses,
+                }))
+            }
+            Err(other) => Err(status_err(other)),
+        }
     }
 
     async fn compact(

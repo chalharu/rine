@@ -135,6 +135,10 @@ pub trait Dialect: Send + Sync + 'static {
     fn is_missing_table(msg: &str) -> bool;
     /// True when `msg` reports a name clash from a concurrent creator.
     fn is_already_exists(msg: &str) -> bool;
+    /// True when `msg` reports a unique-constraint violation: another writer
+    /// committed a conflicting row first. Callers treat it as an optimistic
+    /// concurrency conflict, never as corruption.
+    fn is_unique_violation(msg: &str) -> bool;
 
     /// Revision bookkeeping mirrors rine's `compact_rev_key` row.
     fn compacted_rev_key() -> &'static str {

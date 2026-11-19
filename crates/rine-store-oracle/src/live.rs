@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use oracledb::ToDbValue;
 use rine_etcd::error::{Error, Result};
-use rine_store_executor::{Row, SqlExecutor, SqlValue};
+use rine_store_executor::{Dialect, Row, SqlExecutor, SqlValue};
 
 /// Live Oracle connection. `Clone` shares the same underlying session.
 ///
@@ -65,11 +65,25 @@ impl OracleDb {
             let guard = conn
                 .lock()
                 .map_err(|_| Error::Backend("db mutex poisoned".into()))?;
-            op(&guard).map_err(|e| Error::Backend(e.to_string()))
+            op(&guard).map_err(cvt_error)
         })
         .await
         .map_err(|e| Error::Backend(format!("db task failed: {e}")))?
     }
+}
+
+/// A unique-constraint violation means another writer committed a conflicting
+/// row first: report it as an optimistic-concurrency conflict, never as a
+/// backend failure.
+fn cvt_error(e: oracledb::Error) -> Error {
+    if e.db_error_code() == Some(1) {
+        return Error::Conflict;
+    }
+    let msg = e.to_string();
+    if crate::dialect::OracleDialect::is_unique_violation(&msg) {
+        return Error::Conflict;
+    }
+    Error::Backend(msg)
 }
 
 /// Owned bind values; [`as_bind`] re-exports them as `&dyn ToDbValue`.

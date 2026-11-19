@@ -11,7 +11,10 @@
 use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use rine_etcd::backend::{Backend, ListOptions};
+use rine_etcd::{
+    backend::{Backend, ListOptions},
+    error::Error,
+};
 use rine_store_executor::{SqlExecutor as _, SqlValue};
 use rine_store_oracle::{OracleBackend, OracleDb};
 
@@ -191,4 +194,23 @@ async fn live_read_after_recreate() {
             .await
             .expect("drop");
     }
+}
+
+/// A commit against a base the storage has moved past is an optimistic
+/// concurrency conflict, even when the batch itself is empty. Zero writes:
+/// safe to run in parallel with the other live tests on the same table.
+#[tokio::test]
+async fn live_stale_base_commit_is_conflict() {
+    if !live_enabled() {
+        eprintln!("skipping live OracleBackend test (RINE_LIVE_ORACLE != 1)");
+        return;
+    }
+    let db = connect_retry().await;
+    let backend = OracleBackend::new(Arc::new(db));
+    backend.ensure_schema().await.expect("ensure_schema");
+    let cur = backend.current_revision().await;
+    assert!(cur >= 1);
+    let err = backend.commit(0, vec![]).await.unwrap_err();
+    assert!(matches!(err, Error::Conflict));
+    backend.commit(cur, vec![]).await.expect("fresh base");
 }

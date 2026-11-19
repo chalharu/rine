@@ -182,6 +182,10 @@ impl Dialect for SqliteDialect {
     fn is_already_exists(msg: &str) -> bool {
         msg.contains("already exists")
     }
+
+    fn is_unique_violation(msg: &str) -> bool {
+        msg.contains("UNIQUE constraint failed")
+    }
 }
 
 #[cfg(test)]

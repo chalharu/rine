@@ -8,7 +8,7 @@ use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use rine_etcd::error::{Error, Result};
-use rine_store_executor::{Row, SqlExecutor, SqlValue};
+use rine_store_executor::{Dialect, Row, SqlExecutor, SqlValue};
 use rusqlite::{ToSql, types::ToSqlOutput};
 use tokio::sync::Mutex;
 
@@ -51,10 +51,26 @@ impl SqliteDb {
         F: FnOnce(&rusqlite::Connection) -> Result<T, rusqlite::Error> + Send + 'static,
     {
         let guard = self.conn.clone().lock_owned().await;
-        tokio::task::spawn_blocking(move || op(&guard).map_err(|e| Error::Backend(e.to_string())))
+        tokio::task::spawn_blocking(move || op(&guard).map_err(cvt_error))
             .await
             .map_err(|e| Error::Backend(format!("db task failed: {e}")))?
     }
+}
+
+/// A unique-constraint violation means another writer committed a conflicting
+/// row first: report it as an optimistic-concurrency conflict, never as a
+/// backend failure.
+fn cvt_error(e: rusqlite::Error) -> Error {
+    if let rusqlite::Error::SqliteFailure(failure, _) = &e
+        && failure.code == rusqlite::ErrorCode::ConstraintViolation
+    {
+        return Error::Conflict;
+    }
+    let msg = e.to_string();
+    if crate::dialect::SqliteDialect::is_unique_violation(&msg) {
+        return Error::Conflict;
+    }
+    Error::Backend(msg)
 }
 
 struct Bind<'a>(&'a SqlValue);

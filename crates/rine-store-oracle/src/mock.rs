@@ -95,7 +95,9 @@ impl MockExec {
                 .iter()
                 .any(|r| r.id == id || (r.name == name && r.prev_revision == prev_revision))
             {
-                return Err(Error::Backend("duplicate event row".into()));
+                // Same as a real unique-constraint violation: another writer
+                // committed a conflicting row first.
+                return Err(Error::Conflict);
             }
             rows.push(MockRow {
                 id,

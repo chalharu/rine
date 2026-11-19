@@ -137,6 +137,10 @@ impl Dialect for OracleDialect {
     fn is_already_exists(msg: &str) -> bool {
         msg.contains("ORA-00955")
     }
+
+    fn is_unique_violation(msg: &str) -> bool {
+        msg.contains("ORA-00001")
+    }
 }
 
 impl OracleDialect {

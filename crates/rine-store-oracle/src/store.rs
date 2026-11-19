@@ -80,4 +80,50 @@ mod tests {
         assert!(!ev.deleted);
         assert_eq!(ev.kv.unwrap().version, 1);
     }
+
+    #[tokio::test]
+    async fn commit_rejects_stale_base() {
+        use rine_etcd::error::Error;
+
+        let b = backend();
+        b.ensure_schema().await.unwrap();
+        let cur = b.current_revision().await;
+        assert!(cur >= 1);
+        // No writes involved: a base the storage has moved past is rejected.
+        let err = b.commit(0, vec![]).await.unwrap_err();
+        assert!(matches!(err, Error::Conflict));
+        b.commit(cur, vec![]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn commit_duplicate_events_conflict_atomically() {
+        use rine_etcd::{
+            backend::{Event, KeyValue},
+            error::Error,
+        };
+
+        let b = backend();
+        b.ensure_schema().await.unwrap();
+        let cur = b.current_revision().await;
+        let put = || Event {
+            revision: cur + 1,
+            key: Bytes::from("k"),
+            deleted: false,
+            kv: Some(KeyValue {
+                key: Bytes::from("k"),
+                value: Bytes::from("v"),
+                create_revision: cur + 1,
+                mod_revision: cur + 1,
+                version: 1,
+                lease: 0,
+            }),
+            prev_kv: None,
+        };
+        // Same key twice in one batch violates the (name, prev_revision)
+        // unique index on the second row.
+        let err = b.commit(cur, vec![put(), put()]).await.unwrap_err();
+        assert!(matches!(err, Error::Conflict));
+        // The failed batch left nothing behind.
+        assert!(b.get(b"k", 0).await.unwrap().1.is_none());
+    }
 }

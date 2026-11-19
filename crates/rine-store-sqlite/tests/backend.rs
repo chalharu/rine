@@ -191,3 +191,37 @@ async fn sqlite_live_range_counts_only_visible_rows_before_limiting() {
     assert!(rows.is_empty());
     assert_eq!(count, 0);
 }
+
+#[tokio::test]
+async fn sqlite_unique_violation_maps_to_conflict() {
+    use rine_etcd::error::Error;
+    use rine_store_executor::{Dialect, SqlExecutor, SqlValue};
+    use rine_store_sqlite::SqliteDialect;
+
+    let db = SqliteDb::open_in_memory().unwrap();
+    let b = SqliteBackend::new(Arc::new(db.clone()));
+    b.ensure_schema().await.unwrap();
+    // (id, name, revision, deleted, create_rev, prev_rev, lease, version, value):
+    // the second identical insert violates the (name, prev_revision) index.
+    let row = || {
+        vec![
+            SqlValue::Int(1),
+            SqlValue::Str("k".into()),
+            SqlValue::Int(1),
+            SqlValue::Int(0),
+            SqlValue::Int(1),
+            SqlValue::Int(0),
+            SqlValue::Int(0),
+            SqlValue::Int(1),
+            SqlValue::Bytes(b"v".to_vec()),
+        ]
+    };
+    db.execute(&SqliteDialect::insert_event_sql(), row())
+        .await
+        .unwrap();
+    let err = db
+        .execute(&SqliteDialect::insert_event_sql(), row())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Conflict), "got {err:?}");
+}
