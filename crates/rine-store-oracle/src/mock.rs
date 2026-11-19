@@ -253,6 +253,12 @@ impl SqlExecutor for MockExec {
                 values: vec![SqlValue::Int(1)],
             }));
         }
+        if sql == OracleDialect::index_probe_sql() {
+            // Mock schema always carries the required indexes.
+            return Ok(Some(Row {
+                values: vec![SqlValue::Int(1)],
+            }));
+        }
         if sql == OracleDialect::current_revision_sql() {
             let max = rows.iter().max_by_key(|r| r.id).map(MockRow::revision);
             return Ok(max.map(|m| Row {

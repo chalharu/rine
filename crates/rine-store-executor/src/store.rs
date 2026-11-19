@@ -37,10 +37,21 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         }
     }
 
-    /// Create the schema if the `rine` table is missing (server startup path).
+    /// Bring the schema to the state the backend needs (server startup path),
+    /// creating only what is missing:
+    /// - table absent → create table plus all indexes;
+    /// - table present but a required index absent → create just that index;
+    /// - everything present (e.g. DBA-prepared, no DDL privilege on our
+    ///   side) → do nothing.
+    ///
     /// A concurrent creator racing us surfaces `AlreadyExists`, which is
     /// tolerated. Classification happens in the driver (`cvt_error`), so the
     /// generic code matches typed variants instead of parsing messages.
+    ///
+    /// When creation fails (e.g. insufficient privileges) the schema is
+    /// re-probed: if another node or the DBA converged it meanwhile we
+    /// proceed; otherwise startup aborts with an actionable error naming the
+    /// missing objects instead of running degraded.
     pub async fn ensure_schema(&self) -> Result<()> {
         match self.exec.query_row(D::probe_sql(), vec![]).await {
             Ok(_) => Ok(()),
@@ -50,21 +61,90 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         for stmt in D::ensure_indexes_sql() {
             self.create_statement_with_retry(stmt).await?;
         }
-        Ok(())
+        self.ensure_required_indexes().await
+    }
+
+    /// DDL statements that fully provision the schema, for operators who
+    /// pre-create objects with a privileged user (no DDL privilege needed at
+    /// runtime as long as table plus [`Dialect::required_indexes`] exist).
+    pub fn schema_statements() -> Vec<&'static str> {
+        std::iter::once(D::create_table_sql())
+            .chain(D::create_indexes_sql().iter().copied())
+            .chain(D::ensure_indexes_sql().iter().copied())
+            .collect()
     }
 
     /// Run the DDL. Each statement tolerates a concurrent creator
     /// (already-exists) and retries a transient lock conflict with a
     /// concurrent writer (e.g. `CREATE INDEX` racing DML on a fresh database),
-    /// so simultaneous startups on any number of nodes converge.
+    /// so simultaneous startups on any number of nodes converge. If a
+    /// statement still fails (e.g. no DDL privilege), re-probe: a schema
+    /// converged by someone else is accepted, otherwise the error names the
+    /// missing objects so the operator knows what to pre-create.
     /// Migrations are out of scope for now.
     pub async fn create_schema(&self) -> Result<()> {
         for stmt in
             std::iter::once(D::create_table_sql()).chain(D::create_indexes_sql().iter().copied())
         {
-            self.create_statement_with_retry(stmt).await?;
+            if let Err(e) = self.create_statement_with_retry(stmt).await {
+                return self.converged_or_err(e).await;
+            }
         }
         Ok(())
+    }
+
+    /// Create required indexes absent from a pre-existing table. Same
+    /// converge-or-explain rule as [`Self::create_schema`].
+    async fn ensure_required_indexes(&self) -> Result<()> {
+        for (name, ddl) in D::required_indexes() {
+            if self.index_present(name).await? {
+                continue;
+            }
+            if let Err(e) = self.create_statement_with_retry(ddl).await {
+                return self.converged_or_err(e).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// True when the required index `name` already exists.
+    async fn index_present(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .exec
+            .query_row(&D::index_probe_sql(), vec![SqlValue::Str(name.to_string())])
+            .await?
+            .is_some())
+    }
+
+    /// After a DDL failure, accept a schema someone else converged and
+    /// otherwise explain exactly what is missing (plus the original error).
+    async fn converged_or_err(&self, err: Error) -> Result<()> {
+        let missing = self.missing_objects().await?;
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(Error::Backend(format!(
+            "rine schema is incomplete (missing: {}) and automatic creation failed ({err}); \
+             pre-create the table and required indexes with a privileged user, then restart",
+            missing.join(", ")
+        )))
+    }
+
+    /// Names of absent objects: the table and/or required index names.
+    /// Best-effort: probe errors here are reported as missing, since the
+    /// caller already holds the original failure.
+    async fn missing_objects(&self) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        match self.exec.query_row(D::probe_sql(), vec![]).await {
+            Ok(_) => {}
+            Err(_) => return Ok(vec!["table `rine`".into()]),
+        }
+        for (name, _) in D::required_indexes() {
+            if !self.index_present(name).await.unwrap_or(true) {
+                out.push(format!("index `{name}`"));
+            }
+        }
+        Ok(out)
     }
 
     async fn create_statement_with_retry(&self, stmt: &str) -> Result<()> {

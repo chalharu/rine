@@ -219,6 +219,46 @@ async fn sqlite_driver_errors_are_typed() {
 }
 
 #[tokio::test]
+async fn sqlite_ensure_schema_adds_missing_unique_index() {
+    // A DBA-prepared table without the backstop index: startup must add the
+    // index itself instead of failing or running degraded.
+    let db = SqliteDb::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE rine (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(630), created INTEGER DEFAULT 0, deleted INTEGER DEFAULT 0, create_revision INTEGER DEFAULT 0, prev_revision INTEGER DEFAULT 0, lease INTEGER DEFAULT 0, version INTEGER DEFAULT 1, value BLOB)",
+        vec![],
+    )
+    .await
+    .unwrap();
+    let before = db
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'rine_name_prev_revision_uindex'",
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert!(before.is_none());
+    let b = SqliteBackend::new(Arc::new(db.clone()));
+    b.ensure_schema().await.unwrap();
+    let after = db
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'rine_name_prev_revision_uindex'",
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert!(after.is_some());
+    // The backend is fully functional on the adopted table.
+    b.create(Bytes::from("a"), Bytes::from("1"), 0)
+        .await
+        .unwrap();
+    assert!(
+        b.create(Bytes::from("a"), Bytes::from("x"), 0)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn sqlite_unique_violation_maps_to_conflict() {
     use rine_etcd::error::Error;
     use rine_store_executor::{Dialect, SqlExecutor, SqlValue};

@@ -128,6 +128,21 @@ impl Dialect for OracleDialect {
     fn db_size_sql() -> &'static str {
         "SELECT NVL(SUM(LENGTH(name) + NVL(DBMS_LOB.GETLENGTH(value), 0)), 0) FROM rine"
     }
+
+    fn required_indexes() -> &'static [(&'static str, &'static str)] {
+        // Unquoted identifiers are stored uppercase in `user_indexes`.
+        &[(
+            "RINE_NAME_PREV_REVISION_INDEX",
+            "CREATE UNIQUE INDEX rine_name_prev_revision_index ON rine(name, prev_revision)",
+        )]
+    }
+
+    fn index_probe_sql() -> String {
+        format!(
+            "SELECT 1 FROM user_indexes WHERE index_name = {}",
+            Self::bind(1)
+        )
+    }
 }
 
 #[cfg(test)]

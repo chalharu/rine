@@ -131,6 +131,18 @@ pub trait Dialect: Send + Sync + 'static {
 
     fn db_size_sql() -> &'static str;
 
+    /// Correctness-critical indexes as (probe name, creation DDL) pairs.
+    ///
+    /// The unique backstop index is required for optimistic-concurrency
+    /// safety; without it a concurrent commit could slip through. Startup
+    /// verifies these and creates what is missing, so a DBA-prepared table
+    /// without DDL privileges on our side still works as long as the objects
+    /// exist. Performance-only indexes do not belong here.
+    fn required_indexes() -> &'static [(&'static str, &'static str)];
+
+    /// `SELECT 1`-style probe for one index by name (single bind parameter).
+    fn index_probe_sql() -> String;
+
     /// Revision bookkeeping mirrors rine's `compact_rev_key` row.
     fn compacted_rev_key() -> &'static str {
         "compact_rev_key"

@@ -174,6 +174,17 @@ impl Dialect for SqliteDialect {
     fn db_size_sql() -> &'static str {
         "SELECT COALESCE(SUM(LENGTH(name) + LENGTH(value)), 0) FROM rine"
     }
+
+    fn required_indexes() -> &'static [(&'static str, &'static str)] {
+        &[(
+            "rine_name_prev_revision_uindex",
+            "CREATE UNIQUE INDEX IF NOT EXISTS rine_name_prev_revision_uindex ON rine(name, prev_revision)",
+        )]
+    }
+
+    fn index_probe_sql() -> String {
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?".into()
+    }
 }
 
 #[cfg(test)]
