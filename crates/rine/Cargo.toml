@@ -16,8 +16,6 @@ rine-etcd.workspace = true
 rine-store-oracle = { optional = true, workspace = true }
 rine-store-sqlite = { optional = true, workspace = true }
 tokio.workspace = true
-tonic.workspace = true
-tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]

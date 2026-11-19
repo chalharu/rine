@@ -1609,8 +1609,6 @@ dependencies = [
  "rine-store-oracle",
  "rine-store-sqlite",
  "tokio",
- "tonic",
- "tracing",
  "tracing-subscriber",
 ]
 
@@ -1621,7 +1619,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
- "futures-core",
  "prost",
  "protoc-bin-vendored",
  "rcgen",
@@ -1651,7 +1648,6 @@ dependencies = [
  "async-trait",
  "bytes",
  "rine-etcd",
- "thiserror",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -1670,11 +1666,8 @@ dependencies = [
  "rine-store-conformance",
  "rine-store-executor",
  "rine-store-oracle",
- "thiserror",
  "tokio",
- "tokio-stream",
  "tonic",
- "tracing",
 ]
 
 [[package]]
@@ -1689,9 +1682,7 @@ dependencies = [
  "rine-store-conformance",
  "rine-store-executor",
  "rusqlite",
- "thiserror",
  "tokio",
- "tokio-stream",
  "tonic",
 ]
 
