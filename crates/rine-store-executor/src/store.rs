@@ -239,32 +239,58 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
 
     /// Validate `reads`, assign `MAX(revision) + 1` to `events`, and write
     /// them. The caller holds the commit unit (cross-node lock) across this.
+    ///
+    /// Guard reads on keys this batch also writes are folded into the
+    /// predecessor lookup below instead of costing an extra round trip (the
+    /// k8s compare-and-write-same-key pattern); guard-only keys share one
+    /// batched read with the revision assignment.
     async fn commit_guarded(
         &self,
         reads: &ReadSet,
         events: Vec<Event>,
     ) -> Result<(Revision, Vec<Event>)> {
+        let written: HashSet<&[u8]> = events.iter().map(|e| e.key.as_ref()).collect();
         let mut seen: HashSet<&[u8]> = HashSet::new();
-        for (key, expected) in &reads.points {
-            if !seen.insert(key.as_ref()) {
+        let mut guard_only: Vec<&[u8]> = Vec::new();
+        for (key, _) in &reads.points {
+            let key: &[u8] = key.as_ref();
+            if written.contains(key) || !seen.insert(key) {
                 continue;
             }
-            let current = match self.live_row(key).await? {
-                Some(row) => Some(row_to_kv(&row)?.mod_revision),
-                None => None,
-            };
-            if current != *expected {
+            guard_only.push(key);
+        }
+        // One trip for all guard-only reads plus the revision assignment.
+        let mut batch: Vec<(String, Vec<SqlValue>)> = guard_only
+            .iter()
+            .map(|key| (D::live_by_name_sql(), vec![SqlValue::Str(key_str(key))]))
+            .collect();
+        batch.push((D::max_revision_sql(), vec![]));
+        let mut results = self.exec.query_batch(batch).await?.into_iter();
+        for key in guard_only {
+            let expected = reads
+                .points
+                .iter()
+                .find(|(k, _)| k.as_ref() == key)
+                .and_then(|(_, rev)| *rev);
+            let rows = results
+                .next()
+                .ok_or_else(|| Error::Backend("missing guard read".into()))?;
+            let current = rows
+                .into_iter()
+                .next()
+                .map(|row| row_to_kv(&row).map(|kv| kv.mod_revision))
+                .transpose()?;
+            if current != expected {
                 return Err(Error::Conflict);
             }
         }
-        for range in &reads.ranges {
-            self.check_range(range).await?;
-        }
-        let row = self.exec.query_row(&D::max_revision_sql(), vec![]).await?;
-        let fresh = match row {
+        let fresh = match results.next().as_ref().and_then(|rows| rows.first()) {
             Some(r) if !r.is_null(0) => r.get_int(0)?.max(1),
             _ => 1,
         } + 1;
+        for range in &reads.ranges {
+            self.check_range(range).await?;
+        }
         if events.is_empty() {
             return Ok((fresh - 1, events));
         }
@@ -281,11 +307,33 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
                     "key is reserved for compaction metadata".into(),
                 ));
             }
-            let row = self
-                .exec
-                .query_row(&D::latest_by_name_sql(), vec![SqlValue::Str(name.clone())])
-                .await?;
-            let previous = row.map(|row| row.get_int(0)).transpose()?.unwrap_or(0);
+            // The predecessor lookup doubles as the guard validation for keys
+            // this batch also writes: same lock, same state, no extra query.
+            let live = self.live_row(&event.key).await?;
+            if let Some(expected) = reads
+                .points
+                .iter()
+                .find(|(k, _)| k.as_ref() == event.key.as_ref())
+                .map(|(_, rev)| *rev)
+            {
+                let current = live
+                    .as_ref()
+                    .map(|row| row_to_kv(row).map(|kv| kv.mod_revision))
+                    .transpose()?;
+                if current != expected {
+                    return Err(Error::Conflict);
+                }
+            }
+            let previous = match live {
+                Some(row) => row.get_int(0)?,
+                None => self
+                    .exec
+                    .query_row(&D::latest_by_name_sql(), vec![SqlValue::Str(name.clone())])
+                    .await?
+                    .map(|row| row.get_int(0))
+                    .transpose()?
+                    .unwrap_or(0),
+            };
             id += 1;
             if event.prev_kv.is_some() {
                 statements.push((

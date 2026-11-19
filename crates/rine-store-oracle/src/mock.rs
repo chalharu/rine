@@ -333,6 +333,20 @@ impl SqlExecutor for MockExec {
         panic!("mock query_row: unknown sql {sql}");
     }
 
+    async fn query_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<Vec<Vec<Row>>> {
+        // Guard reads are single-row lookups; route them through `query_row`.
+        let mut out = Vec::with_capacity(statements.len());
+        for (sql, params) in statements {
+            if sql == OracleDialect::live_by_name_sql() || sql == OracleDialect::max_revision_sql()
+            {
+                out.push(self.query_row(&sql, params).await?.into_iter().collect());
+            } else {
+                out.push(self.query_all(&sql, params).await?);
+            }
+        }
+        Ok(out)
+    }
+
     async fn query_all(&self, sql: &str, params: Vec<SqlValue>) -> Result<Vec<Row>> {
         let rows = self.rows.lock().await;
         if sql == OracleDialect::history_by_name_sql() {
