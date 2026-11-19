@@ -197,6 +197,28 @@ async fn sqlite_live_range_counts_only_visible_rows_before_limiting() {
 }
 
 #[tokio::test]
+async fn sqlite_driver_errors_are_typed() {
+    use rine_etcd::error::Error;
+
+    let db = SqliteDb::open_in_memory().unwrap();
+    // Missing table surfaces as TableMissing, not a plain Backend string.
+    let err = db
+        .query_row("SELECT 1 FROM no_such_table_xyz", vec![])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::TableMissing(_)), "got {err:?}");
+    // A concurrent creator's DDL surfaces as AlreadyExists.
+    db.execute("CREATE TABLE dup (id INTEGER PRIMARY KEY)", vec![])
+        .await
+        .unwrap();
+    let err = db
+        .execute("CREATE TABLE dup (id INTEGER PRIMARY KEY)", vec![])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::AlreadyExists(_)), "got {err:?}");
+}
+
+#[tokio::test]
 async fn sqlite_unique_violation_maps_to_conflict() {
     use rine_etcd::error::Error;
     use rine_store_executor::{Dialect, SqlExecutor, SqlValue};

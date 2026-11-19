@@ -174,22 +174,6 @@ impl Dialect for SqliteDialect {
     fn db_size_sql() -> &'static str {
         "SELECT COALESCE(SUM(LENGTH(name) + LENGTH(value)), 0) FROM rine"
     }
-
-    fn is_missing_table(msg: &str) -> bool {
-        msg.contains("no such table")
-    }
-
-    fn is_already_exists(msg: &str) -> bool {
-        msg.contains("already exists")
-    }
-
-    fn is_lock_contention(msg: &str) -> bool {
-        msg.contains("database is locked")
-    }
-
-    fn is_unique_violation(msg: &str) -> bool {
-        msg.contains("UNIQUE constraint failed")
-    }
 }
 
 #[cfg(test)]

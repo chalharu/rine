@@ -38,6 +38,9 @@ pub(crate) fn status_err(e: Error) -> tonic::Status {
         Error::Conflict => tonic::Status::aborted("storage revision changed during transaction"),
         Error::KeyExists(_) => tonic::Status::already_exists("key already exists"),
         Error::Backend(s) => tonic::Status::internal(s),
+        Error::TableMissing(s) | Error::AlreadyExists(s) | Error::LockContention(s) => {
+            tonic::Status::internal(s)
+        }
     }
 }
 

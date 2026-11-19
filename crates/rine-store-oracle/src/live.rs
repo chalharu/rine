@@ -17,7 +17,7 @@ use std::sync::{
 use async_trait::async_trait;
 use oracledb::ToDbValue;
 use rine_etcd::error::{Error, Result};
-use rine_store_executor::{Dialect, Row, SqlExecutor, SqlValue};
+use rine_store_executor::{Row, SqlExecutor, SqlValue};
 
 /// Live Oracle connection. `Clone` shares the same underlying session.
 ///
@@ -77,18 +77,23 @@ impl OracleDb {
     }
 }
 
-/// A unique-constraint violation means another writer committed a conflicting
-/// row first: report it as an optimistic-concurrency conflict, never as a
-/// backend failure.
+/// Classify driver errors at the boundary, where the typed `oracledb::Error`
+/// (including its numeric ORA code) is still in scope. Generic code above
+/// this layer matches the typed [`Error`] variants and never parses messages:
+/// - ORA-00001 (unique violation): another writer committed first →
+///   optimistic-concurrency [`Error::Conflict`], never a backend failure.
+/// - ORA-00942: fresh database without the `rine` table.
+/// - ORA-00955: a concurrent creator already ran the DDL.
+/// - ORA-00054: transient lock conflict with a concurrent creator/writer.
 fn cvt_error(e: oracledb::Error) -> Error {
-    if e.db_error_code() == Some(1) {
-        return Error::Conflict;
-    }
     let msg = e.to_string();
-    if crate::dialect::OracleDialect::is_unique_violation(&msg) {
-        return Error::Conflict;
+    match e.db_error_code() {
+        Some(1) => Error::Conflict,
+        Some(942) => Error::TableMissing(msg),
+        Some(955) => Error::AlreadyExists(msg),
+        Some(54) => Error::LockContention(msg),
+        _ => Error::Backend(msg),
     }
-    Error::Backend(msg)
 }
 
 /// Owned bind values; [`as_bind`] re-exports them as `&dyn ToDbValue`.

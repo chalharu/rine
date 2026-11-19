@@ -131,20 +131,6 @@ pub trait Dialect: Send + Sync + 'static {
 
     fn db_size_sql() -> &'static str;
 
-    /// True when `msg` reports a missing table (fresh database).
-    fn is_missing_table(msg: &str) -> bool;
-    /// True when `msg` reports a name clash from a concurrent creator.
-    fn is_already_exists(msg: &str) -> bool;
-    /// True when `msg` reports a transient lock conflict with a concurrent
-    /// creator or writer (worth a bounded retry, e.g. DDL racing DML).
-    fn is_lock_contention(_msg: &str) -> bool {
-        false
-    }
-    /// True when `msg` reports a unique-constraint violation: another writer
-    /// committed a conflicting row first. Callers treat it as an optimistic
-    /// concurrency conflict, never as corruption.
-    fn is_unique_violation(msg: &str) -> bool;
-
     /// Revision bookkeeping mirrors rine's `compact_rev_key` row.
     fn compacted_rev_key() -> &'static str {
         "compact_rev_key"

@@ -38,12 +38,13 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
     }
 
     /// Create the schema if the `rine` table is missing (server startup path).
-    /// A concurrent creator racing us surfaces an already-exists error,
-    /// which is tolerated.
+    /// A concurrent creator racing us surfaces `AlreadyExists`, which is
+    /// tolerated. Classification happens in the driver (`cvt_error`), so the
+    /// generic code matches typed variants instead of parsing messages.
     pub async fn ensure_schema(&self) -> Result<()> {
         match self.exec.query_row(D::probe_sql(), vec![]).await {
             Ok(_) => Ok(()),
-            Err(Error::Backend(m)) if D::is_missing_table(&m) => self.create_schema().await,
+            Err(Error::TableMissing(_)) => self.create_schema().await,
             Err(e) => Err(e),
         }?;
         for stmt in D::ensure_indexes_sql() {
@@ -71,8 +72,8 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         for _ in 0..10 {
             match self.exec.execute(stmt, vec![]).await {
                 Ok(_) => return Ok(()),
-                Err(Error::Backend(m)) if D::is_already_exists(&m) => return Ok(()),
-                Err(Error::Backend(m)) if D::is_lock_contention(&m) => {
+                Err(Error::AlreadyExists(_)) => return Ok(()),
+                Err(Error::LockContention(_)) => {
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(Duration::from_secs(2));
                 }

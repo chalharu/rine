@@ -13,7 +13,7 @@ use std::{
 
 use async_trait::async_trait;
 use rine_etcd::error::{Error, Result};
-use rine_store_executor::{Dialect, Row, SqlExecutor, SqlValue};
+use rine_store_executor::{Row, SqlExecutor, SqlValue};
 use rusqlite::{ToSql, types::ToSqlOutput};
 use tokio::sync::Mutex;
 
@@ -74,18 +74,28 @@ impl SqliteDb {
     }
 }
 
-/// A unique-constraint violation means another writer committed a conflicting
-/// row first: report it as an optimistic-concurrency conflict, never as a
-/// backend failure.
+/// Classify driver errors at the boundary, where the typed `rusqlite::Error`
+/// is still in scope. Generic code above this layer matches the typed
+/// [`Error`] variants and never parses messages:
+/// - `ConstraintViolation`: another writer committed first → [`Error::Conflict`].
+/// - `DatabaseBusy`/`DatabaseLocked`: transient lock conflict.
+/// - Missing table / already-exists have no distinct SQLite codes, so the
+///   message is inspected here (once, at the boundary) and exposed upwards
+///   only as [`Error::TableMissing`] / [`Error::AlreadyExists`].
 fn cvt_error(e: rusqlite::Error) -> Error {
-    if let rusqlite::Error::SqliteFailure(failure, _) = &e
-        && failure.code == rusqlite::ErrorCode::ConstraintViolation
-    {
-        return Error::Conflict;
+    match e.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::ConstraintViolation) => return Error::Conflict,
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+            return Error::LockContention(e.to_string());
+        }
+        _ => {}
     }
     let msg = e.to_string();
-    if crate::dialect::SqliteDialect::is_unique_violation(&msg) {
-        return Error::Conflict;
+    if msg.contains("no such table") {
+        return Error::TableMissing(msg);
+    }
+    if msg.contains("already exists") {
+        return Error::AlreadyExists(msg);
     }
     Error::Backend(msg)
 }

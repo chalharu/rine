@@ -6,7 +6,6 @@
 //! caught without a database; the live XE test in CI covers Oracle against a
 //! real database.
 
-use rine_etcd::error::Error;
 use rine_store_executor::Dialect;
 
 /// Oracle SQL dialect. Named bind style (`:1`, `:2`, ...).
@@ -129,34 +128,6 @@ impl Dialect for OracleDialect {
     fn db_size_sql() -> &'static str {
         "SELECT NVL(SUM(LENGTH(name) + NVL(DBMS_LOB.GETLENGTH(value), 0)), 0) FROM rine"
     }
-
-    fn is_missing_table(msg: &str) -> bool {
-        msg.contains("ORA-00942")
-    }
-
-    fn is_already_exists(msg: &str) -> bool {
-        msg.contains("ORA-00955")
-    }
-
-    fn is_lock_contention(msg: &str) -> bool {
-        msg.contains("ORA-00054")
-    }
-
-    fn is_unique_violation(msg: &str) -> bool {
-        msg.contains("ORA-00001")
-    }
-}
-
-impl OracleDialect {
-    /// Translate Oracle error codes to backend errors.
-    /// `code` is the numeric ORA code (e.g. 1 for ORA-00001).
-    pub fn translate_error(code: u32, key: Vec<u8>) -> Error {
-        match code {
-            1 => Error::KeyExists(key),
-            1403 => Error::Backend("ORA-01403: no data found".into()),
-            _ => Error::Backend(format!("ORA-{code:05}")),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -184,21 +155,5 @@ mod tests {
             assert!(sql.contains(":1"), "{sql}");
             assert!(!sql.contains('?'), "{sql}");
         }
-    }
-
-    #[test]
-    fn error_mapping() {
-        assert!(matches!(
-            OracleDialect::translate_error(1, b"k".to_vec()),
-            Error::KeyExists(_)
-        ));
-        assert!(matches!(
-            OracleDialect::translate_error(1403, vec![]),
-            Error::Backend(_)
-        ));
-        assert!(matches!(
-            OracleDialect::translate_error(942, vec![]),
-            Error::Backend(_)
-        ));
     }
 }
