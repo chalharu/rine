@@ -5,14 +5,17 @@
 //! requests don't occupy blocking threads waiting for it.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
 use async_trait::async_trait;
-use rine_etcd::error::{Error, Result};
+use rine_etcd::{
+    backend::BackendFactory,
+    error::{Error, Result},
+};
 use rine_store_executor::{Row, SqlExecutor, SqlValue};
 use rusqlite::{ToSql, types::ToSqlOutput};
 use tokio::sync::Mutex;
@@ -259,5 +262,39 @@ impl SqlExecutor for SqliteDb {
         let r = self.run_blocking(move |conn| conn.execute_batch(sql)).await;
         self.in_unit.store(false, Ordering::SeqCst);
         r
+    }
+}
+
+/// CLI configuration for the SQLite backend (`--backend sqlite`).
+#[derive(clap::Args, Clone, Debug)]
+pub struct SqliteConfig {
+    /// SQLite database file path.
+    #[arg(
+        long = "sqlite-path",
+        env = "RINE_SQLITE_PATH",
+        default_value = "rine.db"
+    )]
+    pub path: PathBuf,
+}
+
+/// Factory that opens the configured SQLite file.
+pub struct SqliteFactory {
+    config: SqliteConfig,
+}
+
+impl SqliteFactory {
+    pub fn new(config: SqliteConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl BackendFactory for SqliteFactory {
+    fn name(&self) -> &'static str {
+        "sqlite"
+    }
+
+    fn build(&self) -> anyhow::Result<Arc<dyn rine_etcd::Backend>> {
+        let db = SqliteDb::open(&self.config.path)?;
+        Ok(Arc::new(crate::SqliteBackend::new(Arc::new(db))))
     }
 }

@@ -12,7 +12,7 @@ mod dialect;
 #[cfg(any(feature = "mock", test))]
 mod mock;
 
-pub use db::OracleDb;
+pub use db::{OracleConfig, OracleDb, OracleFactory};
 #[cfg(feature = "mock")]
 pub use mock::MockExec;
 use rine_store_executor::SqlBackend;

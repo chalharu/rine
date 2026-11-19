@@ -10,8 +10,10 @@ name = "rine_store_sqlite"
 path = "src/lib.rs"
 
 [dependencies]
+anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+clap.workspace = true
 rine-etcd.workspace = true
 rine-store-executor.workspace = true
 rusqlite.workspace = true

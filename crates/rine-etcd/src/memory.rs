@@ -17,7 +17,8 @@ use tokio::sync::{RwLock, broadcast};
 
 use crate::{
     backend::{
-        Backend, Event, KeyValue, LeaseId, ListOptions, ObservedRange, ReadSet, Revision, in_range,
+        Backend, BackendFactory, Event, KeyValue, LeaseId, ListOptions, ObservedRange, ReadSet,
+        Revision, in_range,
     },
     error::{Error, Result},
 };
@@ -34,6 +35,19 @@ struct Inner {
 pub struct MemoryBackend {
     inner: Arc<RwLock<Inner>>,
     tx: broadcast::Sender<Vec<Event>>,
+}
+
+/// Factory for the in-process [`MemoryBackend`]; takes no configuration.
+pub struct MemoryFactory;
+
+impl BackendFactory for MemoryFactory {
+    fn name(&self) -> &'static str {
+        "memory"
+    }
+
+    fn build(&self) -> anyhow::Result<Arc<dyn Backend>> {
+        Ok(Arc::new(MemoryBackend::new()))
+    }
 }
 
 impl Default for MemoryBackend {

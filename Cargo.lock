@@ -1605,7 +1605,6 @@ dependencies = [
  "anyhow",
  "clap",
  "mimalloc",
- "oracledb",
  "rine-etcd",
  "rine-store-oracle",
  "rine-store-sqlite",
@@ -1662,8 +1661,10 @@ dependencies = [
 name = "rine-store-oracle"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "bytes",
+ "clap",
  "oracledb",
  "rine-etcd",
  "rine-store-conformance",
@@ -1680,8 +1681,10 @@ dependencies = [
 name = "rine-store-sqlite"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "bytes",
+ "clap",
  "rine-etcd",
  "rine-store-conformance",
  "rine-store-executor",

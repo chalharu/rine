@@ -9,14 +9,20 @@
 //! `Bytes` -> BLOB, `Null` -> typed BLOB NULL (the only NULL bind the backend
 //! emits is the tombstone `value`).
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use async_trait::async_trait;
 use oracledb::ToDbValue;
-use rine_etcd::error::{Error, Result};
+use rine_etcd::{
+    backend::BackendFactory,
+    error::{Error, Result},
+};
 use rine_store_executor::{Row, SqlExecutor, SqlValue};
 
 /// Live Oracle connection. `Clone` shares the same underlying session.
@@ -268,5 +274,56 @@ impl SqlExecutor for OracleDb {
             .await;
         self.in_unit.store(false, Ordering::SeqCst);
         r
+    }
+}
+
+/// CLI configuration for the Oracle backend (`--backend oracle`).
+#[derive(clap::Args, Clone, Debug)]
+pub struct OracleConfig {
+    /// Oracle connect string: Easy Connect (`host/service`), a full connect
+    /// descriptor, or a TNS alias (resolved via TNS_ADMIN or --wallet-dir).
+    #[arg(long = "oracle-connect", env = "RINE_ORACLE_CONNECT")]
+    pub connect: Option<String>,
+    /// Wallet directory (`tnsnames.ora` + `ewallet.pem`): used as the Oracle
+    /// Net configuration directory and wallet location.
+    #[arg(long = "wallet-dir", env = "RINE_WALLET_DIR")]
+    pub wallet_dir: Option<PathBuf>,
+    #[arg(long = "user", default_value = "", env = "RINE_ORACLE_USER")]
+    pub user: String,
+    #[arg(long = "password", default_value = "", env = "RINE_ORACLE_PASSWORD")]
+    pub password: String,
+}
+
+/// Factory that connects with the configured credentials.
+pub struct OracleFactory {
+    config: OracleConfig,
+}
+
+impl OracleFactory {
+    pub fn new(config: OracleConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl BackendFactory for OracleFactory {
+    fn name(&self) -> &'static str {
+        "oracle"
+    }
+
+    fn build(&self) -> anyhow::Result<Arc<dyn rine_etcd::Backend>> {
+        let connect = self.config.connect.clone().ok_or_else(|| {
+            anyhow::anyhow!("oracle backend needs --oracle-connect (or RINE_ORACLE_CONNECT)")
+        })?;
+        let mut config =
+            oracledb::Config::default().set_credentials(&self.config.user, &self.config.password);
+        if let Some(dir) = &self.config.wallet_dir {
+            let dir = dir
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("wallet dir is not UTF-8"))?;
+            config = config.set_config_dir(dir).set_wallet_location(dir);
+        }
+        let config = config.set_connect_string(&connect)?;
+        let db = OracleDb::connect_with_config(config)?;
+        Ok(Arc::new(crate::OracleBackend::new(Arc::new(db))))
     }
 }

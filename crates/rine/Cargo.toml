@@ -12,7 +12,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-oracledb.workspace = true
 rine-etcd.workspace = true
 rine-store-oracle = { optional = true, workspace = true }
 rine-store-sqlite = { optional = true, workspace = true }

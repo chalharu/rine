@@ -1,11 +1,12 @@
 //! Storage contract for the etcd-compatible MVCC layer.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::broadcast;
 
 use crate::error::Result;
-
 pub type Revision = i64;
 pub type LeaseId = i64;
 
@@ -120,4 +121,19 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Committed events, grouped by revision.
     fn subscribe(&self) -> broadcast::Receiver<Vec<Event>>;
+}
+
+/// Construction of one named [`Backend`] implementation.
+///
+/// Each storage crate provides a factory over its own CLI config struct
+/// (a `clap::Args` derive); the server binary registers every compiled-in
+/// factory and selects one via `--backend`. The [`name`](Self::name) is
+/// both the selector and the unknown-backend error text, so flag values
+/// can never drift from the implementations.
+pub trait BackendFactory: Send + Sync {
+    /// Backend identifier used with `--backend`.
+    fn name(&self) -> &'static str;
+    /// Build the backend (open files, connect). Does not provision the
+    /// schema; call [`Backend::initialize`] afterwards.
+    fn build(&self) -> anyhow::Result<Arc<dyn Backend>>;
 }
