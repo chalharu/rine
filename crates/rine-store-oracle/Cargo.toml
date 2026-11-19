@@ -22,5 +22,10 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+rine-store-oracle = { features = ["mock"], workspace = true }
 tokio-stream.workspace = true
 tonic.workspace = true
+
+[features]
+default = []
+mock = []

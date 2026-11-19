@@ -1468,6 +1468,7 @@ dependencies = [
  "oracledb",
  "rine-etcd",
  "rine-store-executor",
+ "rine-store-oracle",
  "serde",
  "serde_json",
  "thiserror",

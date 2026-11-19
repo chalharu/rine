@@ -10,8 +10,12 @@
 mod ddl;
 mod dialect;
 mod live;
+#[cfg(any(feature = "mock", test))]
+mod mock;
 mod store;
 
 pub use dialect::OracleDialect;
 pub use live::OracleDb;
+#[cfg(any(feature = "mock", test))]
+pub use mock::MockExec;
 pub use store::OracleBackend;
