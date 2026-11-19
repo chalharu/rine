@@ -1,0 +1,51 @@
+//! gRPC server wiring.
+
+use std::{net::SocketAddr, sync::Arc};
+
+use crate::{
+    backend::Backend,
+    cluster::{ClusterService, MaintenanceService},
+    etcdserverpb::{
+        cluster_server::ClusterServer, kv_server::KvServer, lease_server::LeaseServer,
+        maintenance_server::MaintenanceServer, watch_server::WatchServer,
+    },
+    kv::KvService,
+    lease::{LeaseManager, LeaseService},
+    watch::WatchService,
+};
+
+pub struct EtcdServer {
+    pub backend: Arc<dyn Backend>,
+}
+
+impl EtcdServer {
+    pub fn new(backend: Arc<dyn Backend>) -> Self {
+        Self { backend }
+    }
+
+    pub async fn serve(self, addr: SocketAddr) -> anyhow::Result<()> {
+        let leases = LeaseManager::new(self.backend.clone());
+        let client_url = format!("http://{addr}");
+        tracing::info!(%addr, "serving etcd-compatible gRPC");
+        tonic::transport::Server::builder()
+            .add_service(KvServer::new(KvService::new(
+                self.backend.clone(),
+                leases.clone(),
+            )))
+            .add_service(WatchServer::new(WatchService::new(self.backend.clone())))
+            .add_service(LeaseServer::new(LeaseService::new(
+                self.backend.clone(),
+                leases,
+            )))
+            .add_service(ClusterServer::new(ClusterService::new(
+                self.backend.clone(),
+                client_url,
+            )))
+            .add_service(MaintenanceServer::new(MaintenanceService::new(
+                self.backend,
+            )))
+            .serve(addr)
+            .await?;
+        Ok(())
+    }
+}

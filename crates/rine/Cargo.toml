@@ -1,0 +1,30 @@
+[package]
+description = "rine server binary"
+edition.workspace = true
+license.workspace = true
+name = "rine"
+version.workspace = true
+
+[[bin]]
+name = "rine"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+oracledb.workspace = true
+rine-etcd.workspace = true
+rine-store-oracle = { optional = true, workspace = true }
+rine-store-sqlite = { optional = true, workspace = true }
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
+mimalloc.workspace = true
+
+[features]
+default = ["oracle", "sqlite"]
+oracle = ["dep:rine-store-oracle"]
+sqlite = ["dep:rine-store-sqlite"]

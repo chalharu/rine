@@ -1,0 +1,29 @@
+[package]
+description = "etcd-compatible API server with pluggable backend (HashTable backend included)"
+edition.workspace = true
+license.workspace = true
+name = "rine-etcd"
+version.workspace = true
+
+[lib]
+name = "rine_etcd"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures-core.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+protoc-bin-vendored.workspace = true
+tonic-prost-build.workspace = true
