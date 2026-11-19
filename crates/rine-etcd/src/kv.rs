@@ -107,14 +107,20 @@ impl KvService {
         let changes: Vec<_> = batch
             .events
             .iter()
-            .map(|event| {
-                (
-                    event.key.clone(),
-                    event.prev_kv.as_ref().map_or(0, |kv| kv.lease),
-                    event.kv.as_ref().map_or(0, |kv| kv.lease),
-                )
+            .filter_map(|event| {
+                let old = event.prev_kv.as_ref().map_or(0, |kv| kv.lease);
+                let new = event.kv.as_ref().map_or(0, |kv| kv.lease);
+                (old != new).then(|| (event.key.clone(), old, new))
             })
             .collect();
+        if changes.is_empty() && self.backend.commit_is_cancel_safe() {
+            let _guard = guard;
+            return self
+                .backend
+                .commit(batch.base, batch.events)
+                .await
+                .map_err(status_err);
+        }
         // Once the database commit starts, a dropped RPC must not interrupt
         // watch publication or lease bookkeeping.
         let backend = self.backend.clone();
@@ -126,13 +132,11 @@ impl KvService {
                 .await
                 .map_err(status_err)?;
             for (key, old, new) in changes {
-                if old != new {
-                    if old != 0 {
-                        leases.detach(old, &key).await;
-                    }
-                    if new != 0 {
-                        leases.attach(new, key.to_vec()).await;
-                    }
+                if old != 0 {
+                    leases.detach(old, &key).await;
+                }
+                if new != 0 {
+                    leases.attach(new, key.to_vec()).await;
                 }
             }
             Ok(())
@@ -195,6 +199,36 @@ impl KvService {
             return Err(tonic::Status::invalid_argument(
                 "etcdserver: invalid sort target",
             ));
+        }
+        let overlay = batch.is_some_and(|b| req.revision <= 0 && !b.events.is_empty());
+        let filtered = req.min_mod_revision != 0
+            || req.max_mod_revision != 0
+            || req.min_create_revision != 0
+            || req.max_create_revision != 0;
+        let key_order = req.sort_order == SortOrder::None as i32
+            || (req.sort_order == SortOrder::Ascend as i32
+                && req.sort_target == SortTarget::Key as i32);
+        if !overlay && !filtered && (key_order || req.count_only) {
+            let (rev, kvs, count) = self
+                .backend
+                .list(
+                    &req.key,
+                    (!req.range_end.is_empty()).then_some(req.range_end.as_slice()),
+                    ListOptions {
+                        revision: req.revision,
+                        limit: req.limit,
+                        keys_only: req.keys_only,
+                        count_only: req.count_only,
+                    },
+                )
+                .await
+                .map_err(status_err)?;
+            return Ok(RangeResponse {
+                header: Some(self.header(rev)),
+                kvs: kvs.into_iter().map(to_proto_kv).collect(),
+                more: req.limit > 0 && count > req.limit,
+                count,
+            });
         }
         let (rev, mut kvs) = self
             .list(&req.key, &req.range_end, req.revision, batch)

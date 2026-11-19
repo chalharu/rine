@@ -139,3 +139,55 @@ async fn sqlite_legacy_row_revisions_remain_readable() {
     assert_eq!(event.prev_kv.unwrap().mod_revision, 1);
     assert_eq!(event.kv.unwrap().mod_revision, r);
 }
+
+#[tokio::test]
+async fn sqlite_live_range_counts_only_visible_rows_before_limiting() {
+    let b = backend().await;
+    for key in ["a", "b", "c"] {
+        b.create(
+            Bytes::from_static(key.as_bytes()),
+            Bytes::from_static(b"value"),
+            0,
+        )
+        .await
+        .unwrap();
+    }
+    let (old_revision, _) = b.delete(b"b").await.unwrap();
+    let current = b
+        .update(Bytes::from_static(b"a"), Bytes::from_static(b"new"), 0, 0)
+        .await
+        .unwrap();
+    b.compact(old_revision).await.unwrap();
+
+    for revision in [0, old_revision] {
+        let opts = ListOptions {
+            revision,
+            limit: 1,
+            keys_only: true,
+            ..Default::default()
+        };
+        let (header, rows, count) = b.list(b"a", Some(&[0]), opts.clone()).await.unwrap();
+        assert_eq!((header, rows.len(), count), (current, 1, 2));
+        assert_eq!(rows[0].key, b"a".as_slice());
+        assert!(rows[0].value.is_empty());
+
+        let (header, rows, count) = b
+            .list(
+                b"a",
+                Some(&[0]),
+                ListOptions {
+                    count_only: true,
+                    ..opts
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!((header, rows.len(), count), (current, 0, 2));
+    }
+    let (_, rows, count) = b
+        .list(b"b", Some(b"c"), ListOptions::default())
+        .await
+        .unwrap();
+    assert!(rows.is_empty());
+    assert_eq!(count, 0);
+}

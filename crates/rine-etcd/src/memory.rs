@@ -55,7 +55,7 @@ impl MemoryBackend {
         }
     }
 
-    async fn next_rev(inner: &mut Inner) -> Revision {
+    fn next_rev(inner: &mut Inner) -> Revision {
         inner.rev += 1;
         let r = inner.rev;
         if inner.history.len() <= r as usize {
@@ -120,7 +120,7 @@ impl Backend for MemoryBackend {
         if g.kvs.contains_key(key.as_ref()) {
             return Err(Error::KeyExists(key.to_vec()));
         }
-        let r = Self::next_rev(&mut g).await;
+        let r = Self::next_rev(&mut g);
         let kv = KeyValue {
             key: key.clone(),
             value,
@@ -159,7 +159,7 @@ impl Backend for MemoryBackend {
                 if expected_mod_revision != 0 && p.mod_revision != expected_mod_revision {
                     return Err(Error::Backend("mod revision mismatch".into()));
                 }
-                let r = Self::next_rev(&mut g).await;
+                let r = Self::next_rev(&mut g);
                 let kv = KeyValue {
                     key: key.clone(),
                     value,
@@ -191,7 +191,7 @@ impl Backend for MemoryBackend {
         if prev.is_none() {
             return Ok((g.rev, None));
         }
-        let r = Self::next_rev(&mut g).await;
+        let r = Self::next_rev(&mut g);
         Self::publish(
             &mut g,
             &self.tx,
@@ -212,7 +212,7 @@ impl Backend for MemoryBackend {
             return Err(Error::Conflict);
         }
         if !events.is_empty() {
-            Self::next_rev(&mut g).await;
+            Self::next_rev(&mut g);
             for event in &events {
                 if let Some(kv) = &event.kv {
                     g.kvs.insert(event.key.clone(), kv.clone());
@@ -223,6 +223,10 @@ impl Backend for MemoryBackend {
             Self::publish(&mut g, &self.tx, events);
         }
         Ok(())
+    }
+
+    fn commit_is_cancel_safe(&self) -> bool {
+        true
     }
 
     async fn list(
@@ -275,18 +279,40 @@ impl Backend for MemoryBackend {
             }
             &snapshot
         };
-        let mut count = 0;
-        let mut out = Vec::new();
-        for (_, kv) in values.range::<[u8], _>(bounds) {
-            count += 1;
-            if !opts.count_only && (opts.limit <= 0 || count <= opts.limit) {
-                let mut kv = kv.clone();
-                if opts.keys_only {
-                    kv.value = Bytes::new();
+        let project = |kv: &KeyValue| {
+            if opts.keys_only {
+                KeyValue {
+                    value: Bytes::new(),
+                    ..kv.clone()
                 }
-                out.push(kv);
+            } else {
+                kv.clone()
             }
+        };
+        if matches!(range_end, None | Some([])) {
+            let kv = values.get(prefix);
+            let out = if opts.count_only {
+                Vec::new()
+            } else {
+                kv.into_iter().map(project).collect()
+            };
+            return Ok((rev, out, i64::from(kv.is_some())));
         }
+        let mut rows = values.range::<[u8], _>(bounds);
+        if opts.count_only {
+            return Ok((rev, Vec::new(), rows.count() as i64));
+        }
+        let limit = if opts.limit > 0 {
+            usize::try_from(opts.limit).unwrap_or(usize::MAX)
+        } else {
+            usize::MAX
+        };
+        let out: Vec<_> = rows
+            .by_ref()
+            .take(limit)
+            .map(|(_, kv)| project(kv))
+            .collect();
+        let count = (out.len() + rows.count()) as i64;
         Ok((rev, out, count))
     }
 

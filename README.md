@@ -34,6 +34,15 @@ RINE_ORACLE_PASSWORD=secret \
 cargo run -p rine
 ```
 
+File-backed SQLite uses WAL with `synchronous=FULL`: acknowledged writes
+remain durable, and the database directory must support SQLite's `-wal`
+and `-shm` sidecar files. Use SQLite's backup API (or stop the server
+before copying the database) rather than copying the main file alone
+while the server is running.
+
+On Linux/musl, the `rine` binary uses mimalloc to reduce allocation overhead
+under concurrent gRPC traffic. Other targets keep their system allocator.
+
 With an Oracle wallet (`tnsnames.ora` + `ewallet.pem`) and a TNS alias:
 
 ```sh

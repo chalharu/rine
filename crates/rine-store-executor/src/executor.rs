@@ -63,6 +63,14 @@ pub trait SqlExecutor: Send + Sync {
     async fn query_row(&self, sql: &str, params: Vec<SqlValue>) -> Result<Option<Row>>;
     /// Run SELECT returning all rows.
     async fn query_all(&self, sql: &str, params: Vec<SqlValue>) -> Result<Vec<Row>>;
+    /// Run related reads together. Executors can use one connection and snapshot.
+    async fn query_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<Vec<Vec<Row>>> {
+        let mut results = Vec::with_capacity(statements.len());
+        for (sql, params) in statements {
+            results.push(self.query_all(&sql, params).await?);
+        }
+        Ok(results)
+    }
 }
 
 #[cfg(test)]

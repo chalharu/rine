@@ -4,6 +4,11 @@ use anyhow::Result;
 use clap::Parser;
 use rine_etcd::Backend;
 
+// On Linux/musl the system allocator limited concurrent gRPC throughput.
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser, Debug)]
 #[command(name = "rine", version)]
 struct Args {

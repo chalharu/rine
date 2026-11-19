@@ -46,7 +46,11 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
                 r => r,
             },
             Err(e) => Err(e),
+        }?;
+        for stmt in D::ensure_indexes_sql() {
+            self.exec.execute(stmt, vec![]).await?;
         }
+        Ok(())
     }
 
     /// Run the DDL. Idempotent only when the table does not exist yet;
@@ -103,6 +107,61 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         self.exec
             .query_row(&D::live_by_name_sql(), vec![SqlValue::Str(key_str(key))])
             .await
+    }
+
+    async fn list_live(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        opts: &ListOptions,
+        rows_sql: Option<String>,
+        count_sql: Option<String>,
+    ) -> Result<(Revision, Vec<KeyValue>, i64)> {
+        let mut params = vec![SqlValue::Str(key_str(start))];
+        if let Some(end) = end.filter(|end| !end.is_empty() && *end != [0]) {
+            params.push(SqlValue::Str(key_str(end)));
+        }
+        let has_rows = rows_sql.is_some();
+        let has_count = count_sql.is_some();
+        let mut queries = vec![(D::current_revision_sql(), vec![])];
+        if let Some(sql) = rows_sql {
+            let mut binds = params.clone();
+            if opts.limit > 0 {
+                binds.push(SqlValue::Int(opts.limit));
+            }
+            queries.push((sql, binds));
+        }
+        if let Some(sql) = count_sql {
+            queries.push((sql, params));
+        }
+        let mut results = self.exec.query_batch(queries).await?.into_iter();
+        let cur = results
+            .next()
+            .and_then(|rows| rows.into_iter().next())
+            .map(|r| r.get_int(0))
+            .transpose()?
+            .unwrap_or(1)
+            .max(1);
+        let mut kvs = Vec::new();
+        if has_rows {
+            let rows = results
+                .next()
+                .ok_or_else(|| Error::Backend("missing range result".into()))?;
+            kvs.reserve(rows.len());
+            for r in &rows {
+                kvs.push(row_to_kv(r)?);
+            }
+        }
+        let count = if has_count {
+            results
+                .next()
+                .and_then(|rows| rows.into_iter().next())
+                .ok_or_else(|| Error::Backend("missing range count".into()))?
+                .get_int(0)?
+        } else {
+            kvs.len() as i64
+        };
+        Ok((cur, kvs, count))
     }
 
     async fn commit_inner(&self, base: Revision, events: Vec<Event>) -> Result<()> {
@@ -337,6 +396,13 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
         range_end: Option<&[u8]>,
         opts: ListOptions,
     ) -> Result<(Revision, Vec<KeyValue>, i64)> {
+        if opts.revision <= 0
+            && let Some((rows_sql, count_sql)) = D::live_range_queries(range_end, &opts)
+        {
+            return self
+                .list_live(prefix, range_end, &opts, rows_sql, count_sql)
+                .await;
+        }
         let _guard = self.writes.lock().await;
         let cur = self.check_rev(opts.revision).await?;
         let (mut sql, mut params) = match range_end {

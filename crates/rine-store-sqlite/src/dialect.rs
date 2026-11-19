@@ -4,6 +4,7 @@
 //! `LIMIT 1` instead of `ROWNUM = 1`. The compact-revision bookkeeping is an
 //! update-then-insert pair (SQLite has no `MERGE`).
 
+use rine_etcd::backend::ListOptions;
 use rine_store_executor::Dialect;
 
 /// SQLite SQL dialect.
@@ -31,6 +32,13 @@ impl Dialect for SqliteDialect {
             "CREATE INDEX rine_id_deleted_index ON rine(id, deleted)",
             "CREATE INDEX rine_prev_revision_index ON rine(prev_revision)",
             "CREATE UNIQUE INDEX rine_name_prev_revision_uindex ON rine(name, prev_revision)",
+        ]
+    }
+
+    fn ensure_indexes_sql() -> &'static [&'static str] {
+        &[
+            "CREATE INDEX IF NOT EXISTS rine_live_name_index ON rine(name) \
+           WHERE deleted = 0 AND name <> 'compact_rev_key'",
         ]
     }
 
@@ -106,6 +114,30 @@ impl Dialect for SqliteDialect {
             "SELECT {COLS} FROM rine WHERE name >= ? AND name < ? AND deleted = 0 ORDER BY name, id",
             COLS = Self::cols()
         )
+    }
+
+    fn live_range_queries(
+        end: Option<&[u8]>,
+        opts: &ListOptions,
+    ) -> Option<(Option<String>, Option<String>)> {
+        let predicate = match end {
+            None | Some([]) => "name = ?",
+            Some([0]) => "name >= ?",
+            Some(_) => "name >= ? AND name < ?",
+        };
+        let filter = format!("{predicate} AND deleted = 0 AND name <> 'compact_rev_key'");
+        let rows = (!opts.count_only).then(|| {
+            let cols = if opts.keys_only {
+                "id, name, created, deleted, create_revision, prev_revision, lease, version, NULL"
+            } else {
+                Self::cols()
+            };
+            let limit = if opts.limit > 0 { " LIMIT ?" } else { "" };
+            format!("SELECT {cols} FROM rine WHERE {filter} ORDER BY name, id{limit}")
+        });
+        let count = (opts.count_only || (opts.limit > 0 && !matches!(end, None | Some([]))))
+            .then(|| format!("SELECT COUNT(*) FROM rine WHERE {filter}"));
+        Some((rows, count))
     }
 
     fn insert_sql() -> &'static str {

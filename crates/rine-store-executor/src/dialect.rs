@@ -6,10 +6,17 @@
 //! caught without a database; the live XE test in CI covers Oracle against a
 //! real database.
 
+use rine_etcd::backend::ListOptions;
+
 /// SQL dialect for one database.
 pub trait Dialect: Send + Sync + 'static {
     fn create_table_sql() -> &'static str;
     fn create_indexes_sql() -> &'static [&'static str];
+
+    /// Idempotent index DDL to apply to new and existing tables.
+    fn ensure_indexes_sql() -> &'static [&'static str] {
+        &[]
+    }
 
     /// Schema probe for `ensure_schema`.
     fn probe_sql() -> &'static str;
@@ -95,6 +102,15 @@ pub trait Dialect: Send + Sync + 'static {
     fn list_exact_sql() -> String;
     fn list_ge_sql() -> String;
     fn list_range_sql() -> String;
+
+    /// Optional latest-range pushdown. When both queries are supplied the
+    /// count must describe the full range, not just the limited result.
+    fn live_range_queries(
+        _end: Option<&[u8]>,
+        _opts: &ListOptions,
+    ) -> Option<(Option<String>, Option<String>)> {
+        None
+    }
 
     /// Optimistic insert: the new revision row, keyed by
     /// `(name, prev_revision = parent id)`.

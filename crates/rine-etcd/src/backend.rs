@@ -67,6 +67,12 @@ pub trait Backend: Send + Sync + 'static {
     /// Atomically store and publish a batch of events at `base + 1`.
     /// Reject the batch if the current revision is no longer `base`.
     async fn commit(&self, base: Revision, events: Vec<Event>) -> Result<()>;
+    /// Dropping `commit` can never leave storage or watch publication incomplete.
+    fn commit_is_cancel_safe(&self) -> bool {
+        false
+    }
+
+    /// Return keys in ascending key order and the full count before limiting.
     async fn list(
         &self,
         prefix: &[u8],

@@ -1,19 +1,16 @@
 //! Live [`SqlExecutor`] over rusqlite.
 //!
 //! The driver API is blocking, so every call runs on Tokio's blocking pool
-//! via `spawn_blocking`. One connection is shared behind a mutex: the backend
-//! assumes a single writer, and serializing access keeps concurrent `&self`
-//! use sound.
+//! via `spawn_blocking`. The connection is acquired asynchronously so queued
+//! requests don't occupy blocking threads waiting for it.
 
-use std::{
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use rine_etcd::error::{Error, Result};
 use rine_store_executor::{Row, SqlExecutor, SqlValue};
-use rusqlite::ToSql;
+use rusqlite::{ToSql, types::ToSqlOutput};
+use tokio::sync::Mutex;
 
 /// Live SQLite connection. `Clone` shares the same underlying connection.
 #[derive(Clone, Debug)]
@@ -25,6 +22,16 @@ impl SqliteDb {
     /// Open (or create) a SQLite database file.
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let conn = rusqlite::Connection::open(path)?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        // Use a single WAL sync per commit without sacrificing crash durability.
+        let journal: String =
+            conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
+        if journal != "wal" && journal != "memory" {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some(format!("failed to enable WAL: journal_mode is {journal}")),
+            ));
+        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -43,44 +50,37 @@ impl SqliteDb {
         T: Send + 'static,
         F: FnOnce(&rusqlite::Connection) -> Result<T, rusqlite::Error> + Send + 'static,
     {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let guard = conn
-                .lock()
-                .map_err(|_| Error::Backend("db mutex poisoned".into()))?;
-            op(&guard).map_err(|e| Error::Backend(e.to_string()))
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("db task failed: {e}")))?
+        let guard = self.conn.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || op(&guard).map_err(|e| Error::Backend(e.to_string())))
+            .await
+            .map_err(|e| Error::Backend(format!("db task failed: {e}")))?
     }
 }
 
-/// Owned bind values; [`as_bind`] re-exports them as `&dyn ToSql`.
-enum OwnedParam {
-    Int(i64),
-    Str(String),
-    Bytes(Vec<u8>),
-    Null(Option<Vec<u8>>),
-}
+struct Bind<'a>(&'a SqlValue);
 
-impl From<&SqlValue> for OwnedParam {
-    fn from(v: &SqlValue) -> Self {
-        match v {
-            SqlValue::Int(i) => Self::Int(*i),
-            SqlValue::Str(s) => Self::Str(s.clone()),
-            SqlValue::Bytes(b) => Self::Bytes(b.clone()),
-            SqlValue::Null => Self::Null(None),
+impl ToSql for Bind<'_> {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        match self.0 {
+            SqlValue::Int(v) => v.to_sql(),
+            SqlValue::Str(v) => v.to_sql(),
+            SqlValue::Bytes(v) => v.to_sql(),
+            SqlValue::Null => Ok(ToSqlOutput::Borrowed(rusqlite::types::ValueRef::Null)),
         }
     }
 }
 
-fn as_bind(p: &OwnedParam) -> &dyn ToSql {
-    match p {
-        OwnedParam::Int(v) => v,
-        OwnedParam::Str(s) => s,
-        OwnedParam::Bytes(b) => b,
-        OwnedParam::Null(v) => v,
-    }
+fn query(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: &[SqlValue],
+) -> rusqlite::Result<Vec<Row>> {
+    let mut stmt = conn.prepare_cached(sql)?;
+    let ncols = stmt.column_count();
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter().map(Bind)), |row| {
+        read_row(row, ncols)
+    })?;
+    rows.collect()
 }
 
 fn read_row(row: &rusqlite::Row, ncols: usize) -> Result<Row, rusqlite::Error> {
@@ -124,8 +124,8 @@ impl SqlExecutor for SqliteDb {
         self.run_blocking(move |conn| {
             let tx = conn.unchecked_transaction()?;
             for (sql, params) in statements {
-                let owned: Vec<_> = params.iter().map(OwnedParam::from).collect();
-                tx.execute(&sql, rusqlite::params_from_iter(owned.iter().map(as_bind)))?;
+                tx.prepare_cached(&sql)?
+                    .execute(rusqlite::params_from_iter(params.iter().map(Bind)))?;
             }
             tx.commit()
         })
@@ -135,9 +135,9 @@ impl SqlExecutor for SqliteDb {
     async fn execute(&self, sql: &str, params: Vec<SqlValue>) -> Result<u64> {
         let sql = sql.to_string();
         self.run_blocking(move |conn| {
-            let owned: Vec<OwnedParam> = params.iter().map(OwnedParam::from).collect();
-            let refs: Vec<&dyn ToSql> = owned.iter().map(as_bind).collect();
-            let n = conn.execute(&sql, rusqlite::params_from_iter(refs))?;
+            let n = conn
+                .prepare_cached(&sql)?
+                .execute(rusqlite::params_from_iter(params.iter().map(Bind)))?;
             Ok(n as u64)
         })
         .await
@@ -146,11 +146,9 @@ impl SqlExecutor for SqliteDb {
     async fn query_row(&self, sql: &str, params: Vec<SqlValue>) -> Result<Option<Row>> {
         let sql = sql.to_string();
         self.run_blocking(move |conn| {
-            let owned: Vec<OwnedParam> = params.iter().map(OwnedParam::from).collect();
-            let refs: Vec<&dyn ToSql> = owned.iter().map(as_bind).collect();
-            let mut stmt = conn.prepare(&sql)?;
+            let mut stmt = conn.prepare_cached(&sql)?;
             let ncols = stmt.column_count();
-            let mut rows = stmt.query(rusqlite::params_from_iter(refs))?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(params.iter().map(Bind)))?;
             match rows.next()? {
                 Some(row) => Ok(Some(read_row(row, ncols)?)),
                 None => Ok(None),
@@ -161,16 +159,18 @@ impl SqlExecutor for SqliteDb {
 
     async fn query_all(&self, sql: &str, params: Vec<SqlValue>) -> Result<Vec<Row>> {
         let sql = sql.to_string();
+        self.run_blocking(move |conn| query(conn, &sql, &params))
+            .await
+    }
+
+    async fn query_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<Vec<Vec<Row>>> {
         self.run_blocking(move |conn| {
-            let owned: Vec<OwnedParam> = params.iter().map(OwnedParam::from).collect();
-            let refs: Vec<&dyn ToSql> = owned.iter().map(as_bind).collect();
-            let mut stmt = conn.prepare(&sql)?;
-            let ncols = stmt.column_count();
-            let mut rows = stmt.query(rusqlite::params_from_iter(refs))?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next()? {
-                out.push(read_row(row, ncols)?);
-            }
+            let tx = conn.unchecked_transaction()?;
+            let out = statements
+                .iter()
+                .map(|(sql, params)| query(&tx, sql, params))
+                .collect::<rusqlite::Result<_>>()?;
+            tx.commit()?;
             Ok(out)
         })
         .await
