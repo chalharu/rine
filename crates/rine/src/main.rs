@@ -36,6 +36,18 @@ struct Args {
     #[cfg(feature = "oracle")]
     #[arg(long, default_value = "", env = "RINE_ORACLE_PASSWORD")]
     password: String,
+    /// PEM-encoded server certificate chain (enables TLS).
+    #[arg(long, env = "RINE_CERT_FILE")]
+    cert_file: Option<PathBuf>,
+    /// PEM-encoded server private key (enables TLS).
+    #[arg(long, env = "RINE_KEY_FILE")]
+    key_file: Option<PathBuf>,
+    /// Require clients to present a certificate signed by --trusted-ca-file.
+    #[arg(long, env = "RINE_CLIENT_CERT_AUTH", default_value_t = false)]
+    client_cert_auth: bool,
+    /// PEM-encoded CA certificate used to verify client certificates.
+    #[arg(long, env = "RINE_TRUSTED_CA_FILE")]
+    trusted_ca_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -72,8 +84,29 @@ async fn main() -> Result<()> {
         other => anyhow::bail!("unknown backend: {other} (expected memory|sqlite|oracle)"),
     };
     backend.initialize().await?;
-    rine_etcd::server::EtcdServer::new(backend)
-        .serve(args.listen)
-        .await?;
+    let tls = match (&args.cert_file, &args.key_file) {
+        (None, None) => None,
+        (Some(cert), Some(key)) => {
+            let identity =
+                tonic::transport::Identity::from_pem(std::fs::read(cert)?, std::fs::read(key)?);
+            let mut config = tonic::transport::ServerTlsConfig::new().identity(identity);
+            if args.client_cert_auth {
+                let ca = args.trusted_ca_file.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--client-cert-auth needs --trusted-ca-file (or RINE_TRUSTED_CA_FILE)"
+                    )
+                })?;
+                config = config
+                    .client_ca_root(tonic::transport::Certificate::from_pem(std::fs::read(ca)?));
+            }
+            Some(config)
+        }
+        _ => anyhow::bail!("--cert-file and --key-file must be given together"),
+    };
+    let server = rine_etcd::server::EtcdServer::new(backend);
+    match tls {
+        Some(tls) => server.serve_tls(args.listen, tls).await?,
+        None => server.serve(args.listen).await?,
+    }
     Ok(())
 }

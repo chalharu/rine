@@ -54,6 +54,25 @@ RINE_ORACLE_PASSWORD=secret \
 cargo run -p rine
 ```
 
+## TLS / mTLS
+
+Give `--cert-file` and `--key-file` (PEM) to serve gRPC over TLS.
+Add `--client-cert-auth` with `--trusted-ca-file` (PEM) to require
+clients to present a certificate signed by that CA (mTLS, etcd's
+`--client-cert-auth` + `--trusted-ca-file` equivalent):
+
+```sh
+cargo run -p rine -- \
+  --cert-file server.pem --key-file server-key.pem \
+  --client-cert-auth --trusted-ca-file ca.pem
+```
+
+The official client then needs the CA and (for mTLS) a client
+certificate, e.g. `etcdctl --cacert=ca.pem --cert=client.pem
+--key=client-key.pem --endpoints=https://127.0.0.1:2379 ...`, or set
+`TLS_CA`/`TLS_CERT`/`TLS_KEY` when running `e2e/etcdctl.sh` with an
+`https://` `ENDPOINT`.
+
 ## Test
 
 ```sh
