@@ -5,8 +5,7 @@ import "mvccpb/kv.proto";
 
 // Wire-compatible subset of etcd's etcdserverpb (release-3.5).
 // Field numbers match upstream; gogoproto / grpc-gateway options omitted.
-// Only services required by k8s apiserver (+explicit unimplemented stubs)
-// are exposed: KV, Watch, Lease, Cluster, Maintenance.
+// The exposed services are KV, Watch, Lease, Cluster and Maintenance.
 
 service KV {
   rpc Range(RangeRequest) returns (RangeResponse);

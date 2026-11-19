@@ -1,4 +1,4 @@
-//! SQL dialects for kine-style `rine` backends.
+//! SQL dialects for `rine` backends.
 //!
 //! [`Dialect`] abstracts the per-database SQL (`:1` vs `?` placeholders,
 //! DDL, a few functions); the MVCC logic in `SqlBackend` is shared. The
@@ -6,7 +6,7 @@
 //! caught without a database; the live XE test in CI covers Oracle against a
 //! real database.
 
-/// SQL dialect for one kine-style database.
+/// SQL dialect for one database.
 pub trait Dialect: Send + Sync + 'static {
     fn create_table_sql() -> &'static str;
     fn create_indexes_sql() -> &'static [&'static str];
@@ -14,7 +14,63 @@ pub trait Dialect: Send + Sync + 'static {
     /// Schema probe for `ensure_schema`.
     fn probe_sql() -> &'static str;
 
-    fn current_revision_sql() -> &'static str;
+    fn current_revision_sql() -> String {
+        format!(
+            "SELECT {} FROM rine ORDER BY id DESC {}",
+            Self::logical_revision(),
+            Self::first_row()
+        )
+    }
+    fn last_row_id_sql() -> &'static str {
+        "SELECT MAX(id) FROM rine"
+    }
+    fn bind(index: usize) -> String;
+    fn first_row() -> &'static str;
+
+    // Older rows used the physical ID as their revision and left `created` zero.
+    fn logical_revision() -> &'static str {
+        "CASE WHEN created > 0 THEN created ELSE id END"
+    }
+
+    fn insert_event_sql() -> String {
+        let binds = (1..=9).map(Self::bind).collect::<Vec<_>>().join(", ");
+        format!("INSERT INTO rine ({}) VALUES ({binds})", Self::cols())
+    }
+
+    fn predecessor_sql() -> String {
+        format!(
+            "SELECT {} FROM rine WHERE id = {}",
+            Self::cols(),
+            Self::bind(1)
+        )
+    }
+
+    fn latest_by_name_sql() -> String {
+        format!(
+            "SELECT id FROM rine WHERE name = {} ORDER BY id DESC {}",
+            Self::bind(1),
+            Self::first_row()
+        )
+    }
+
+    fn snapshot_sql(end: Option<&[u8]>) -> String {
+        let key = Self::bind(1);
+        let (predicate, revision) = match end {
+            None | Some([]) => (format!("name = {key}"), Self::bind(2)),
+            Some([0]) => (format!("name >= {key}"), Self::bind(2)),
+            Some(_) => (
+                format!("name >= {key} AND name < {}", Self::bind(2)),
+                Self::bind(3),
+            ),
+        };
+        let cols = Self::cols();
+        let logical = Self::logical_revision();
+        format!(
+            "SELECT {cols} FROM (SELECT {cols}, ROW_NUMBER() OVER (PARTITION BY name ORDER BY id DESC) AS snapshot_rank \
+             FROM rine WHERE {predicate} AND {logical} <= {revision} AND name <> 'compact_rev_key') \
+             WHERE snapshot_rank = 1 AND deleted <> 1 ORDER BY name"
+        )
+    }
     fn compact_revision_sql() -> &'static str;
     fn compacted_rev_sql() -> &'static str;
 

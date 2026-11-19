@@ -6,23 +6,21 @@ use rine_etcd::{
     backend::{Backend, Event, KeyValue, LeaseId, ListOptions, Revision},
     error::{Error, Result},
 };
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
 
 use crate::{
     dialect::Dialect,
     executor::{Row, SqlExecutor, SqlValue},
 };
 
-/// kine-style append-only `rine` table over any SQL database.
+/// MVCC event log over the `rine` table.
 ///
-/// Assumes a single writer (like kine on SQLite): ids come from an
-/// auto-increment column, so the newest row for a key resolves via the
-/// `(name, prev_revision)` unique index. Multi-writer leader election is
-/// future work; concurrent writers surface as `Backend` errors, never as
-/// silent corruption.
+/// Assumes a single writer process. Physical row IDs link per-key history;
+/// a batch can give several rows the same logical revision.
 pub struct SqlBackend<E: SqlExecutor, D: Dialect> {
     exec: Arc<E>,
-    tx: broadcast::Sender<Event>,
+    tx: broadcast::Sender<Vec<Event>>,
+    writes: Mutex<()>,
     _dialect: PhantomData<D>,
 }
 
@@ -32,6 +30,7 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         Self {
             exec,
             tx,
+            writes: Mutex::new(()),
             _dialect: PhantomData,
         }
     }
@@ -64,9 +63,12 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
     async fn current_rev_inner(&self) -> Result<Revision> {
         let row = self
             .exec
-            .query_row(D::current_revision_sql(), vec![])
+            .query_row(&D::current_revision_sql(), vec![])
             .await?;
-        Ok(row.map(|r| r.get_int(0).unwrap_or(1)).unwrap_or(1))
+        match row {
+            Some(r) if !r.is_null(0) => Ok(r.get_int(0)?.max(1)),
+            _ => Ok(1),
+        }
     }
 
     async fn compacted_inner(&self) -> Result<Revision> {
@@ -79,7 +81,7 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
 
     async fn check_rev(&self, rev: Revision) -> Result<Revision> {
         let cur = self.current_rev_inner().await?;
-        if rev != 0 {
+        if rev > 0 {
             let c = self.compacted_inner().await?;
             if rev < c {
                 return Err(Error::Compacted {
@@ -103,23 +105,65 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
             .await
     }
 
-    async fn resolve_id(&self, key: &[u8], prev_revision: Revision) -> Result<Revision> {
-        let row = self
-            .exec
-            .query_row(
-                D::resolve_id_sql(),
-                vec![SqlValue::Str(key_str(key)), SqlValue::Int(prev_revision)],
-            )
-            .await?;
-        row.map(|r| r.get_int(0)).transpose()?.ok_or_else(|| {
-            Error::Backend(format!(
-                "inserted row for {key:?} not found via (name, prev_revision)"
-            ))
-        })
-    }
-
-    fn emit(&self, ev: Event) {
-        let _ = self.tx.send(ev);
+    async fn commit_inner(&self, base: Revision, events: Vec<Event>) -> Result<()> {
+        if self.current_rev_inner().await? != base {
+            return Err(Error::Conflict);
+        }
+        if events.is_empty() {
+            return Ok(());
+        }
+        let last = self.exec.query_row(D::last_row_id_sql(), vec![]).await?;
+        let mut id = match last {
+            Some(row) if !row.is_null(0) => row.get_int(0)?.max(1),
+            _ => 1,
+        };
+        let mut statements = Vec::new();
+        for event in &events {
+            let name = key_str(&event.key);
+            if name == D::compacted_rev_key() {
+                return Err(Error::Backend(
+                    "key is reserved for compaction metadata".into(),
+                ));
+            }
+            let row = self
+                .exec
+                .query_row(&D::latest_by_name_sql(), vec![SqlValue::Str(name.clone())])
+                .await?;
+            let previous = row.map(|row| row.get_int(0)).transpose()?.unwrap_or(0);
+            id += 1;
+            if event.prev_kv.is_some() {
+                statements.push((
+                    D::set_deleted_by_id_sql().into(),
+                    vec![SqlValue::Int(id), SqlValue::Int(previous)],
+                ));
+            }
+            let (create, lease, version, value) = match &event.kv {
+                Some(kv) => (
+                    kv.create_revision,
+                    kv.lease,
+                    kv.version,
+                    SqlValue::Bytes(kv.value.to_vec()),
+                ),
+                None => (0, 0, 0, SqlValue::Null),
+            };
+            statements.push((
+                D::insert_event_sql(),
+                vec![
+                    SqlValue::Int(id),
+                    SqlValue::Str(name),
+                    SqlValue::Int(event.revision),
+                    SqlValue::Int(i64::from(event.deleted)),
+                    SqlValue::Int(create),
+                    SqlValue::Int(previous),
+                    SqlValue::Int(lease),
+                    SqlValue::Int(version),
+                    value,
+                ],
+            ));
+        }
+        self.exec.execute_batch(statements).await?;
+        let _ = self.tx.send(events);
+        Ok(())
     }
 }
 
@@ -132,17 +176,27 @@ fn row_to_kv(row: &Row) -> Result<KeyValue> {
         key: Bytes::from(row.get_str(1)?.into_bytes()),
         value: Bytes::from(row.get_bytes(8)?),
         create_revision: row.get_int(4)?,
-        mod_revision: row.get_int(0)?,
+        mod_revision: logical_revision(row)?,
         version: row.get_int(7)?,
         lease: row.get_int(6)?,
     })
 }
 
+fn logical_revision(row: &Row) -> Result<Revision> {
+    let revision = row.get_int(2)?;
+    if revision > 0 {
+        Ok(revision)
+    } else {
+        row.get_int(0)
+    }
+}
+
 fn row_to_event(row: &Row) -> Result<Event> {
-    let deleted = row.get_int(3)? != 0;
+    // Only 1 is a tombstone; larger values link to the superseding row.
+    let deleted = row.get_int(3)? == 1;
     let key = Bytes::from(row.get_str(1)?.into_bytes());
     Ok(Event {
-        revision: row.get_int(0)?,
+        revision: logical_revision(row)?,
         key,
         deleted,
         kv: if deleted { None } else { Some(row_to_kv(row)?) },
@@ -165,77 +219,46 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
     }
 
     async fn get(&self, key: &[u8], revision: Revision) -> Result<(Revision, Option<KeyValue>)> {
-        let cur = self.check_rev(revision).await?;
-        if revision == 0 || revision == cur {
-            let kv = match self.live_row(key).await? {
-                Some(r) => Some(row_to_kv(&r)?),
-                None => None,
-            };
-            return Ok((cur, kv));
-        }
-        let rows = self
-            .exec
-            .query_all(
-                &D::history_by_name_sql(),
-                vec![SqlValue::Str(key_str(key)), SqlValue::Int(revision)],
+        let (cur, rows, _) = self
+            .list(
+                key,
+                None,
+                ListOptions {
+                    revision,
+                    ..Default::default()
+                },
             )
             .await?;
-        let kv = match rows.first() {
-            Some(r) => {
-                let deleted = r.get_int(3)?;
-                if deleted == 0 || deleted > revision {
-                    Some(row_to_kv(r)?)
-                } else {
-                    None
-                }
-            }
-            None => None,
-        };
-        Ok((cur, kv))
+        Ok((cur, rows.into_iter().next()))
     }
 
     async fn create(&self, key: Bytes, value: Bytes, lease: LeaseId) -> Result<Revision> {
+        let _guard = self.writes.lock().await;
         if self.live_row(&key).await?.is_some() {
             return Err(Error::KeyExists(key.to_vec()));
         }
-        self.exec
-            .execute(
-                D::insert_sql(),
-                vec![
-                    SqlValue::Str(key_str(&key)),
-                    SqlValue::Int(0),
-                    SqlValue::Int(0),
-                    SqlValue::Int(0),
-                    SqlValue::Int(0),
-                    SqlValue::Int(lease),
-                    SqlValue::Int(1),
-                    SqlValue::Bytes(value.to_vec()),
-                ],
-            )
-            .await?;
-        let id = self.resolve_id(&key, 0).await?;
-        self.exec
-            .execute(
-                D::set_create_rev_sql(),
-                vec![SqlValue::Int(id), SqlValue::Int(id)],
-            )
-            .await?;
+        let base = self.current_rev_inner().await?;
+        let revision = base + 1;
         let kv = KeyValue {
             key: key.clone(),
             value,
-            create_revision: id,
-            mod_revision: id,
+            create_revision: revision,
+            mod_revision: revision,
             version: 1,
             lease,
         };
-        self.emit(Event {
-            revision: id,
-            key,
-            deleted: false,
-            kv: Some(kv),
-            prev_kv: None,
-        });
-        Ok(id)
+        self.commit_inner(
+            base,
+            vec![Event {
+                revision,
+                key,
+                deleted: false,
+                kv: Some(kv),
+                prev_kv: None,
+            }],
+        )
+        .await?;
+        Ok(revision)
     }
 
     async fn update(
@@ -245,6 +268,7 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
         expected_mod_revision: Revision,
         lease: LeaseId,
     ) -> Result<Revision> {
+        let _guard = self.writes.lock().await;
         let live = self.live_row(&key).await?;
         let Some(prev_row) = live else {
             return Err(Error::KeyExists(key.to_vec()));
@@ -253,91 +277,58 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
         if expected_mod_revision != 0 && prev.mod_revision != expected_mod_revision {
             return Err(Error::Backend("mod revision mismatch".into()));
         }
-        self.exec
-            .execute(
-                D::insert_sql(),
-                vec![
-                    SqlValue::Str(key_str(&key)),
-                    SqlValue::Int(0),
-                    SqlValue::Int(0),
-                    SqlValue::Int(prev.create_revision),
-                    SqlValue::Int(prev.mod_revision),
-                    SqlValue::Int(lease),
-                    SqlValue::Int(prev.version + 1),
-                    SqlValue::Bytes(value.to_vec()),
-                ],
-            )
-            .await?;
-        let id = self.resolve_id(&key, prev.mod_revision).await?;
-        let n = self
-            .exec
-            .execute(
-                D::set_deleted_by_id_sql(),
-                vec![SqlValue::Int(id), SqlValue::Int(prev.mod_revision)],
-            )
-            .await?;
-        if n == 0 {
-            return Err(Error::Backend("concurrent modification".into()));
-        }
+        let base = self.current_rev_inner().await?;
+        let revision = base + 1;
         let kv = KeyValue {
             key: key.clone(),
             value,
             create_revision: prev.create_revision,
-            mod_revision: id,
+            mod_revision: revision,
             version: prev.version + 1,
             lease,
         };
-        self.emit(Event {
-            revision: id,
-            key,
-            deleted: false,
-            kv: Some(kv),
-            prev_kv: Some(prev),
-        });
-        Ok(id)
+        self.commit_inner(
+            base,
+            vec![Event {
+                revision,
+                key,
+                deleted: false,
+                kv: Some(kv),
+                prev_kv: Some(prev),
+            }],
+        )
+        .await?;
+        Ok(revision)
     }
 
     async fn delete(&self, key: &[u8]) -> Result<(Revision, Option<KeyValue>)> {
+        let _guard = self.writes.lock().await;
+        let base = self.current_rev_inner().await?;
         let prev = match self.live_row(key).await? {
             Some(r) => Some(row_to_kv(&r)?),
             None => None,
         };
-        let (parent, create, version) = match &prev {
-            Some(p) => (p.mod_revision, p.create_revision, p.version + 1),
-            None => (-1, 0, 1),
-        };
-        self.exec
-            .execute(
-                D::insert_sql(),
-                vec![
-                    SqlValue::Str(key_str(key)),
-                    SqlValue::Int(0),
-                    SqlValue::Int(1),
-                    SqlValue::Int(create),
-                    SqlValue::Int(parent),
-                    SqlValue::Int(0),
-                    SqlValue::Int(version),
-                    SqlValue::Null,
-                ],
-            )
-            .await?;
-        let tomb_id = self.resolve_id(key, parent).await?;
-        if let Some(p) = &prev {
-            self.exec
-                .execute(
-                    D::set_deleted_by_id_sql(),
-                    vec![SqlValue::Int(tomb_id), SqlValue::Int(p.mod_revision)],
-                )
-                .await?;
+        if prev.is_none() {
+            return Ok((base, None));
         }
-        self.emit(Event {
-            revision: tomb_id,
-            key: Bytes::copy_from_slice(key),
-            deleted: true,
-            kv: None,
-            prev_kv: prev.clone(),
-        });
-        Ok((tomb_id, prev))
+        let revision = base + 1;
+        self.commit_inner(
+            base,
+            vec![Event {
+                revision,
+                key: Bytes::copy_from_slice(key),
+                deleted: true,
+                kv: None,
+                prev_kv: prev.clone(),
+            }],
+        )
+        .await?;
+        Ok((revision, prev))
+    }
+
+    async fn commit(&self, base: Revision, events: Vec<Event>) -> Result<()> {
+        let _guard = self.writes.lock().await;
+        self.commit_inner(base, events).await
     }
 
     async fn list(
@@ -346,8 +337,9 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
         range_end: Option<&[u8]>,
         opts: ListOptions,
     ) -> Result<(Revision, Vec<KeyValue>, i64)> {
+        let _guard = self.writes.lock().await;
         let cur = self.check_rev(opts.revision).await?;
-        let (sql, params) = match range_end {
+        let (mut sql, mut params) = match range_end {
             None | Some([]) => (D::list_exact_sql(), vec![SqlValue::Str(key_str(prefix))]),
             Some([0]) => (D::list_ge_sql(), vec![SqlValue::Str(key_str(prefix))]),
             Some(end) => (
@@ -355,10 +347,16 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
                 vec![SqlValue::Str(key_str(prefix)), SqlValue::Str(key_str(end))],
             ),
         };
+        if opts.revision > 0 && opts.revision < cur {
+            sql = D::snapshot_sql(range_end);
+            params.push(SqlValue::Int(opts.revision));
+        }
         let rows = self.exec.query_all(&sql, params).await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
-            out.push(row_to_kv(r)?);
+            if r.get_str(1)? != D::compacted_rev_key() {
+                out.push(row_to_kv(r)?);
+            }
         }
         let count = out.len() as i64;
         if opts.count_only {
@@ -376,6 +374,7 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
     }
 
     async fn compact(&self, revision: Revision) -> Result<Revision> {
+        let _guard = self.writes.lock().await;
         let cur = self.current_rev_inner().await?;
         if revision > cur {
             return Err(Error::FutureRev {
@@ -383,25 +382,28 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
                 current: cur,
             });
         }
-        let n = self
-            .exec
-            .execute(D::set_compact_rev_sql(), vec![SqlValue::Int(revision)])
-            .await?;
-        if n == 0 {
-            self.exec
-                .execute(
-                    D::set_compact_rev_insert_sql(),
-                    vec![SqlValue::Int(revision)],
-                )
-                .await?;
+        let compacted = self.compacted_inner().await?;
+        if revision <= compacted {
+            return Err(Error::Compacted {
+                requested: revision,
+                compacted,
+            });
         }
+        let watermark = if compacted == 0 {
+            D::set_compact_rev_insert_sql()
+        } else {
+            D::set_compact_rev_sql()
+        };
         self.exec
-            .execute(
-                D::compact_delete_sql(),
-                vec![SqlValue::Int(revision), SqlValue::Int(revision)],
-            )
+            .execute_batch(vec![
+                (watermark.into(), vec![SqlValue::Int(revision)]),
+                (
+                    D::compact_delete_sql().into(),
+                    vec![SqlValue::Int(revision), SqlValue::Int(revision)],
+                ),
+            ])
             .await?;
-        Ok(revision)
+        Ok(cur)
     }
 
     async fn db_size(&self) -> i64 {
@@ -415,6 +417,7 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
     }
 
     async fn events(&self, from: Revision, to: Revision) -> Result<Vec<Event>> {
+        let _guard = self.writes.lock().await;
         let c = self.compacted_inner().await?;
         if from <= c {
             return Err(Error::Compacted {
@@ -431,36 +434,23 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
             .await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
-            if r.get_str(1)
-                .map(|s| s.as_str() == D::compacted_rev_key())
-                .unwrap_or(false)
-            {
-                continue;
-            }
             let mut ev = row_to_event(r)?;
-            if ev.deleted {
-                // Attach predecessor snapshot for prev_kv fidelity.
-                if r.get_int(0).unwrap_or(0) > 1 {
-                    let pred = self
-                        .exec
-                        .query_all(
-                            &D::history_by_name_sql(),
-                            vec![SqlValue::Str(r.get_str(1)?), SqlValue::Int(ev.revision - 1)],
-                        )
-                        .await?;
-                    if let Some(p) = pred.first()
-                        && p.get_int(3).unwrap_or(1) == 0
-                    {
-                        ev.prev_kv = Some(row_to_kv(p)?);
-                    }
-                }
+            let parent = r.get_int(5)?;
+            if parent > 0
+                && let Some(prev) = self
+                    .exec
+                    .query_row(&D::predecessor_sql(), vec![SqlValue::Int(parent)])
+                    .await?
+                && prev.get_int(3)? != 1
+            {
+                ev.prev_kv = Some(row_to_kv(&prev)?);
             }
             out.push(ev);
         }
         Ok(out)
     }
 
-    fn subscribe(&self) -> broadcast::Receiver<Event> {
+    fn subscribe(&self) -> broadcast::Receiver<Vec<Event>> {
         self.tx.subscribe()
     }
 }

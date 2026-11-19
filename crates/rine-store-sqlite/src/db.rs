@@ -3,8 +3,7 @@
 //! The driver API is blocking, so every call runs on Tokio's blocking pool
 //! via `spawn_blocking`. One connection is shared behind a mutex: the backend
 //! assumes a single writer, and serializing access keeps concurrent `&self`
-//! use sound. Statements autocommit (no explicit transaction handling,
-//! matching the Oracle executor's commit-per-`execute`).
+//! use sound.
 
 use std::{
     path::Path,
@@ -121,6 +120,18 @@ impl std::error::Error for SqliteRealUnexpected {}
 
 #[async_trait]
 impl SqlExecutor for SqliteDb {
+    async fn execute_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
+        self.run_blocking(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            for (sql, params) in statements {
+                let owned: Vec<_> = params.iter().map(OwnedParam::from).collect();
+                tx.execute(&sql, rusqlite::params_from_iter(owned.iter().map(as_bind)))?;
+            }
+            tx.commit()
+        })
+        .await
+    }
+
     async fn execute(&self, sql: &str, params: Vec<SqlValue>) -> Result<u64> {
         let sql = sql.to_string();
         self.run_blocking(move |conn| {

@@ -27,6 +27,7 @@ use crate::{
 };
 
 struct Watcher {
+    live_from: i64,
     key: Vec<u8>,
     range_end: Vec<u8>,
     no_put: bool,
@@ -136,7 +137,7 @@ impl Watch for WatchService {
                         use crate::etcdserverpb::watch_request::RequestUnion;
                         match req.request_union {
                             Some(RequestUnion::CreateRequest(c)) => {
-                                handle_create(&backend, &next_id, &header, &tx, &mut watchers, &mut live, c).await;
+                                handle_create(&backend, &next_id, &header, &tx, &mut watchers, c).await;
                             }
                             Some(RequestUnion::CancelRequest(WatchCancelRequest { watch_id })) => {
                                 watchers.remove(&watch_id);
@@ -162,7 +163,7 @@ impl Watch for WatchService {
                         }
                     }
                     ev = live.recv() => {
-                        let ev = match ev {
+                        let batch = match ev {
                             Ok(e) => e,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                                 // Missed events: cancel watchers that can no longer catch up.
@@ -181,14 +182,15 @@ impl Watch for WatchService {
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         };
+                        let Some(first) = batch.first() else { continue };
                         for (id, w) in &watchers {
-                            if !matches(w, &ev.key) { continue; }
-                            if ev.deleted && w.no_delete { continue; }
-                            if !ev.deleted && w.no_put { continue; }
+                            if first.revision < w.live_from { continue; }
+                            let events = watch_events(w, &batch);
+                            if events.is_empty() { continue; }
                             let _ = tx.send(Ok(WatchResponse {
-                                header: Some(header(ev.revision)),
+                                header: Some(header(first.revision)),
                                 watch_id: *id,
-                                events: vec![to_proto_event(&ev, w.prev_kv)],
+                                events,
                                 ..Default::default()
                             })).await;
                         }
@@ -212,14 +214,20 @@ impl Watch for WatchService {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+fn watch_events(w: &Watcher, events: &[Event]) -> Vec<mvccpb::Event> {
+    events
+        .iter()
+        .filter(|e| matches(w, &e.key) && if e.deleted { !w.no_delete } else { !w.no_put })
+        .map(|e| to_proto_event(e, w.prev_kv))
+        .collect()
+}
+
 async fn handle_create(
     backend: &Arc<dyn Backend>,
     next_id: &AtomicI64,
     header: &impl Fn(i64) -> ResponseHeader,
     tx: &mpsc::Sender<Result<WatchResponse, tonic::Status>>,
     watchers: &mut HashMap<i64, Watcher>,
-    _live: &mut tokio::sync::broadcast::Receiver<Event>,
     c: WatchCreateRequest,
 ) {
     let id = if c.watch_id > 0 && !watchers.contains_key(&c.watch_id) {
@@ -227,7 +235,14 @@ async fn handle_create(
     } else {
         next_id.fetch_add(1, Ordering::Relaxed)
     };
+    let cur = backend.current_revision().await;
+    let start = if c.start_revision == 0 {
+        cur + 1
+    } else {
+        c.start_revision
+    };
     let watcher = Watcher {
+        live_from: start.max(cur + 1),
         key: c.key.clone(),
         range_end: c.range_end.clone(),
         no_put: c.filters.contains(&(0i32)),
@@ -235,57 +250,52 @@ async fn handle_create(
         prev_kv: c.prev_kv,
         progress_notify: c.progress_notify,
     };
-    let cur = backend.current_revision().await;
-    let start = if c.start_revision == 0 {
-        cur + 1 // live only
-    } else {
-        c.start_revision
-    };
-    // Pre-check compaction before registering (avoids leaking dead watchers).
-    if start <= cur && backend.events(start, cur).await.is_err() {
-        let compacted = backend.compacted_revision().await;
-        let _ = tx
-            .send(Ok(WatchResponse {
-                header: Some(header(compacted)),
-                watch_id: id,
-                canceled: true,
-                compact_revision: compacted,
-                cancel_reason: "etcdserver: mvcc: required revision has been compacted".into(),
-                ..Default::default()
-            }))
-            .await;
-        return;
-    }
-    watchers.insert(id, watcher);
-    let _ = tx
+    // clientv3 binds the pending watch to its ID on the Created response.
+    if tx
         .send(Ok(WatchResponse {
             header: Some(header(cur)),
             watch_id: id,
             created: true,
             ..Default::default()
         }))
-        .await;
+        .await
+        .is_err()
+    {
+        return;
+    }
     if start <= cur {
-        // Replay (re-fetch; cheap and race-free enough behind the live feed
-        // since live events with rev > cur are still queued in broadcast).
-        if let Ok(hist) = backend.events(start, cur).await {
-            let w = &watchers[&id];
-            let evs: Vec<mvccpb::Event> = hist
-                .iter()
-                .filter(|e| matches(w, &e.key))
-                .filter(|e| !(e.deleted && w.no_delete) && !(!e.deleted && w.no_put))
-                .map(|e| to_proto_event(e, w.prev_kv))
-                .collect();
-            if !evs.is_empty() {
+        match backend.events(start, cur).await {
+            Ok(hist) => {
+                let events = watch_events(&watcher, &hist);
+                if !events.is_empty() {
+                    let _ = tx
+                        .send(Ok(WatchResponse {
+                            header: Some(header(cur)),
+                            watch_id: id,
+                            events,
+                            ..Default::default()
+                        }))
+                        .await;
+                }
+            }
+            Err(error) => {
+                let compact_revision = match &error {
+                    crate::error::Error::Compacted { compacted, .. } => *compacted,
+                    _ => 0,
+                };
                 let _ = tx
                     .send(Ok(WatchResponse {
                         header: Some(header(cur)),
                         watch_id: id,
-                        events: evs,
+                        canceled: true,
+                        compact_revision,
+                        cancel_reason: crate::kv::status_err(error).message().to_owned(),
                         ..Default::default()
                     }))
                     .await;
+                return;
             }
         }
     }
+    watchers.insert(id, watcher);
 }

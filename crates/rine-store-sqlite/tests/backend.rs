@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use rine_etcd::backend::{Backend, ListOptions};
+use rine_etcd::backend::{Backend, Event, KeyValue, ListOptions};
+use rine_store_executor::{SqlExecutor, SqlValue};
 use rine_store_sqlite::{SqliteBackend, SqliteDb};
 
 async fn backend() -> SqliteBackend {
@@ -74,4 +75,67 @@ async fn sqlite_ensure_schema_is_idempotent() {
         .unwrap();
     let (_, kv) = b.get(b"a", 0).await.unwrap();
     assert_eq!(kv.unwrap().value, Bytes::from("1"));
+}
+
+#[tokio::test]
+async fn sqlite_commit_rolls_back_after_database_error() {
+    let b = backend().await;
+    let base = b.current_revision().await;
+    let a = Bytes::from_static(b"a");
+    let event = Event {
+        revision: base + 1,
+        key: a.clone(),
+        deleted: false,
+        kv: Some(KeyValue {
+            key: a,
+            value: Bytes::from_static(b"value"),
+            create_revision: base + 1,
+            mod_revision: base + 1,
+            version: 1,
+            lease: 0,
+        }),
+        prev_kv: None,
+    };
+    // Both rows use the same (name, predecessor) unique key.
+    let mut watch = b.subscribe();
+    assert!(b.commit(base, vec![event.clone(), event]).await.is_err());
+    assert_eq!(b.current_revision().await, base);
+    assert!(b.get(b"a", 0).await.unwrap().1.is_none());
+    assert!(matches!(
+        watch.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn sqlite_legacy_row_revisions_remain_readable() {
+    let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+    let b = SqliteBackend::new(db.clone());
+    b.ensure_schema().await.unwrap();
+    db.execute(
+        "INSERT INTO rine (name, created, deleted, create_revision, prev_revision, lease, version, value) \
+         VALUES (?, 0, 0, 1, 0, 0, 1, ?)",
+        vec![
+            SqlValue::Str("legacy".into()),
+            SqlValue::Bytes(b"before".to_vec()),
+        ],
+    )
+    .await
+    .unwrap();
+    let r = b
+        .update(
+            Bytes::from_static(b"legacy"),
+            Bytes::from_static(b"after"),
+            1,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r, 2);
+    let old = b.get(b"legacy", 1).await.unwrap().1.unwrap();
+    assert_eq!(old.value, b"before".as_slice());
+    assert_eq!(old.mod_revision, 1);
+    let event = b.events(r, r).await.unwrap().pop().unwrap();
+    assert_eq!(event.prev_kv.unwrap().mod_revision, 1);
+    assert_eq!(event.kv.unwrap().mod_revision, r);
 }

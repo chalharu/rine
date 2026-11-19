@@ -98,6 +98,6 @@ async fn oracle_backend_serves_kv_and_txn() {
         .into_inner();
     assert_eq!(got.kvs[0].value, b"v2".to_vec());
     assert_eq!(got.kvs[0].version, 2);
-    assert_eq!(got.kvs[0].create_revision, 1);
-    assert_eq!(got.kvs[0].mod_revision, 2);
+    assert_eq!(got.kvs[0].mod_revision, got.kvs[0].create_revision + 1);
+    assert_eq!(got.kvs[0].mod_revision, got.header.unwrap().revision);
 }

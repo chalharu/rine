@@ -72,7 +72,7 @@ jobs:
         run: cargo test --workspace
 
   sqlite-e2e:
-    name: official client e2e (etcdctl vs SQLite backend)
+    name: official client e2e (SQLite and upstream etcd)
     runs-on: ubuntu-latest
     env:
       RINE_BACKEND: sqlite
@@ -112,12 +112,36 @@ jobs:
           /tmp/etcd-v3.5.35-linux-amd64/etcdctl version
       - name: official-client conformance
         run: ENDPOINT=127.0.0.1:2379 ETCDCTL=/tmp/etcd-v3.5.35-linux-amd64/etcdctl bash e2e/etcdctl.sh
+      - name: clientv3 conformance and load smoke test
+        working-directory: e2e
+        env:
+          GOTOOLCHAIN: auto
+          ETCD_ENDPOINT: 127.0.0.1:2379
+          ETCD_REFERENCE_ENDPOINT: 127.0.0.1:12379
+          ETCD_PERF: "1"
+          ETCD_EXTENDED: "1"
+        run: |
+          reference_dir="$(mktemp -d)"
+          /tmp/etcd-v3.5.35-linux-amd64/etcd \
+            --data-dir "$reference_dir/data" \
+            --listen-client-urls http://127.0.0.1:12379 \
+            --advertise-client-urls http://127.0.0.1:12379 \
+            --listen-peer-urls http://127.0.0.1:12380 \
+            --initial-advertise-peer-urls http://127.0.0.1:12380 \
+            --initial-cluster default=http://127.0.0.1:12380 \
+            > "$reference_dir/etcd.log" 2>&1 &
+          reference_pid=$!
+          trap 'kill "$reference_pid" 2>/dev/null || true; wait "$reference_pid" || true' EXIT
+          if ! go test -mod=readonly -v -count=1 -timeout=5m -run '^(TestConformance|TestExtendedConformance|TestPerformance)$' .; then
+            cat "$reference_dir/etcd.log"
+            exit 1
+          fi
       - name: rine server log
         if: failure()
         run: cat /tmp/rine.log
 
   etcdctl-e2e:
-    name: official client e2e (etcdctl vs Oracle backend)
+    name: official client e2e (Oracle backend)
     runs-on: ubuntu-latest
     services:
       oracle:
@@ -184,6 +208,13 @@ jobs:
           /tmp/etcd-v3.5.35-linux-amd64/etcdctl version
       - name: official-client conformance
         run: ENDPOINT=127.0.0.1:2379 ETCDCTL=/tmp/etcd-v3.5.35-linux-amd64/etcdctl bash e2e/etcdctl.sh
+      - name: clientv3 conformance
+        working-directory: e2e
+        env:
+          GOTOOLCHAIN: auto
+          ETCD_ENDPOINT: 127.0.0.1:2379
+          ETCD_EXTENDED: "1"
+        run: go test -mod=readonly -v -count=1 -timeout=3m -run '^(TestConformance|TestExtendedConformance)$' .
       - name: rine server log
         if: failure()
         run: cat /tmp/rine.log

@@ -38,8 +38,12 @@ impl Dialect for SqliteDialect {
         "SELECT 1 FROM rine LIMIT 1"
     }
 
-    fn current_revision_sql() -> &'static str {
-        "SELECT MAX(id) FROM rine"
+    fn bind(_: usize) -> String {
+        "?".into()
+    }
+
+    fn first_row() -> &'static str {
+        "LIMIT 1"
     }
 
     fn compact_revision_sql() -> &'static str {
@@ -70,8 +74,9 @@ impl Dialect for SqliteDialect {
 
     fn events_sql() -> String {
         format!(
-            "SELECT {COLS} FROM rine WHERE id >= ? AND id <= ? ORDER BY id",
-            COLS = Self::cols()
+            "SELECT {COLS} FROM rine WHERE {rev} >= ? AND {rev} <= ? AND name <> 'compact_rev_key' ORDER BY id",
+            COLS = Self::cols(),
+            rev = Self::logical_revision()
         )
     }
 
@@ -121,8 +126,8 @@ impl Dialect for SqliteDialect {
     }
 
     fn compact_delete_sql() -> &'static str {
-        "DELETE FROM rine WHERE id < ? AND name <> 'compact_rev_key' \
-         AND id NOT IN (SELECT MAX(id) FROM rine WHERE id <= ? GROUP BY name)"
+        "DELETE FROM rine WHERE (CASE WHEN created > 0 THEN created ELSE id END) < ? AND name <> 'compact_rev_key' \
+         AND id NOT IN (SELECT MAX(id) FROM rine WHERE (CASE WHEN created > 0 THEN created ELSE id END) <= ? GROUP BY name)"
     }
 
     fn set_compact_rev_sql() -> &'static str {
@@ -130,8 +135,8 @@ impl Dialect for SqliteDialect {
     }
 
     fn set_compact_rev_insert_sql() -> &'static str {
-        "INSERT INTO rine (name, created, deleted, create_revision, prev_revision, lease) \
-         VALUES ('compact_rev_key', 0, 0, 0, ?, 0)"
+        "INSERT INTO rine (id, name, created, deleted, create_revision, prev_revision, lease) \
+         VALUES (0, 'compact_rev_key', 0, 0, 0, ?, 0)"
     }
 
     fn db_size_sql() -> &'static str {

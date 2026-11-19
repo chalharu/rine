@@ -1,4 +1,4 @@
-//! Storage contract. `server.Backend` + `logstructured` MVCC rules.
+//! Storage contract for the etcd-compatible MVCC layer.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -8,6 +8,14 @@ use crate::error::Result;
 
 pub type Revision = i64;
 pub type LeaseId = i64;
+
+pub(crate) fn in_range(key: &[u8], start: &[u8], end: Option<&[u8]>) -> bool {
+    match end {
+        None | Some([]) => key == start,
+        Some([0]) => key >= start,
+        Some(end) => key >= start && key < end,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct KeyValue {
@@ -56,6 +64,9 @@ pub trait Backend: Send + Sync + 'static {
         lease: LeaseId,
     ) -> Result<Revision>;
     async fn delete(&self, key: &[u8]) -> Result<(Revision, Option<KeyValue>)>;
+    /// Atomically store and publish a batch of events at `base + 1`.
+    /// Reject the batch if the current revision is no longer `base`.
+    async fn commit(&self, base: Revision, events: Vec<Event>) -> Result<()>;
     async fn list(
         &self,
         prefix: &[u8],
@@ -65,9 +76,10 @@ pub trait Backend: Send + Sync + 'static {
     async fn compact(&self, revision: Revision) -> Result<Revision>;
     async fn db_size(&self) -> i64;
 
-    /// Events in (from, to] — actually [from, to] inclusive — for watch replay.
-    /// Returns `Error::Compacted` when `from` is below the compacted revision.
+    /// Events in [from, to] for watch replay.
+    /// Returns `Error::Compacted` when `from` is at or below the compaction watermark.
     async fn events(&self, from: Revision, to: Revision) -> Result<Vec<Event>>;
 
-    fn subscribe(&self) -> broadcast::Receiver<Event>;
+    /// Committed events, grouped by revision.
+    fn subscribe(&self) -> broadcast::Receiver<Vec<Event>>;
 }

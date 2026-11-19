@@ -57,6 +57,8 @@ impl Row {
 pub trait SqlExecutor: Send + Sync {
     /// Run INSERT/UPDATE/DELETE/MERGE. Returns affected rows.
     async fn execute(&self, sql: &str, params: Vec<SqlValue>) -> Result<u64>;
+    /// Execute all statements in one database transaction.
+    async fn execute_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<()>;
     /// Run SELECT expecting zero or one row.
     async fn query_row(&self, sql: &str, params: Vec<SqlValue>) -> Result<Option<Row>>;
     /// Run SELECT returning all rows.

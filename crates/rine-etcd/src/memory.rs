@@ -1,7 +1,6 @@
-//! In-memory HashTable backend (step 2 target).
+//! In-memory backend.
 //!
-//! Single-revision-per-key map + append-only event history for watch replay,
-//! mirroring kine `logstructured` MVCC semantics on top of a HashMap.
+//! Latest values and an event history support historical reads and watch replay.
 //! Events carry full before/after snapshots so Watch responses include the
 //! metadata (create/mod revision, version, lease) etcd clients expect.
 
@@ -12,7 +11,7 @@ use bytes::Bytes;
 use tokio::sync::{RwLock, broadcast};
 
 use crate::{
-    backend::{Backend, Event, KeyValue, LeaseId, ListOptions, Revision},
+    backend::{Backend, Event, KeyValue, LeaseId, ListOptions, Revision, in_range},
     error::{Error, Result},
 };
 
@@ -20,13 +19,14 @@ struct Inner {
     rev: Revision,
     compact_rev: Revision,
     kvs: HashMap<Vec<u8>, KeyValue>,
+    compacted: HashMap<Vec<u8>, KeyValue>,
     /// revision -> events at that revision (Txn may emit several)
     history: Vec<Vec<Event>>,
 }
 
 pub struct MemoryBackend {
     inner: Arc<RwLock<Inner>>,
-    tx: broadcast::Sender<Event>,
+    tx: broadcast::Sender<Vec<Event>>,
 }
 
 impl Default for MemoryBackend {
@@ -43,6 +43,7 @@ impl MemoryBackend {
                 rev: 1,
                 compact_rev: 0,
                 kvs: HashMap::new(),
+                compacted: HashMap::new(),
                 history: vec![Vec::new()],
             })),
             tx,
@@ -58,9 +59,9 @@ impl MemoryBackend {
         r
     }
 
-    fn push(g: &mut Inner, tx: &broadcast::Sender<Event>, ev: Event) {
-        g.history[ev.revision as usize].push(ev.clone());
-        let _ = tx.send(ev);
+    fn publish(g: &mut Inner, tx: &broadcast::Sender<Vec<Event>>, events: Vec<Event>) {
+        g.history[g.rev as usize].extend(events.iter().cloned());
+        let _ = tx.send(events);
     }
 }
 
@@ -80,7 +81,7 @@ impl Backend for MemoryBackend {
 
     async fn get(&self, key: &[u8], revision: Revision) -> Result<(Revision, Option<KeyValue>)> {
         let g = self.inner.read().await;
-        if revision != 0 && revision < g.compact_rev {
+        if revision > 0 && revision < g.compact_rev {
             return Err(Error::Compacted {
                 requested: revision,
                 compacted: g.compact_rev,
@@ -92,12 +93,12 @@ impl Backend for MemoryBackend {
                 current: g.rev,
             });
         }
-        if revision == 0 || revision == g.rev {
+        if revision <= 0 || revision == g.rev {
             return Ok((g.rev, g.kvs.get(key).cloned()));
         }
         // Historical read: last snapshot at or below the requested revision.
-        let mut cur: Option<KeyValue> = None;
-        for r in 1..=revision {
+        let mut cur = g.compacted.get(key).cloned();
+        for r in (g.compact_rev + 1)..=revision {
             if let Some(evs) = g.history.get(r as usize) {
                 for e in evs {
                     if e.key.as_ref() == key {
@@ -124,16 +125,16 @@ impl Backend for MemoryBackend {
             lease,
         };
         g.kvs.insert(key.to_vec(), kv.clone());
-        Self::push(
+        Self::publish(
             &mut g,
             &self.tx,
-            Event {
+            vec![Event {
                 revision: r,
                 key,
                 deleted: false,
                 kv: Some(kv),
                 prev_kv: None,
-            },
+            }],
         );
         Ok(r)
     }
@@ -163,16 +164,16 @@ impl Backend for MemoryBackend {
                     lease,
                 };
                 g.kvs.insert(key.to_vec(), kv.clone());
-                Self::push(
+                Self::publish(
                     &mut g,
                     &self.tx,
-                    Event {
+                    vec![Event {
                         revision: r,
                         key,
                         deleted: false,
                         kv: Some(kv),
                         prev_kv: Some(p),
-                    },
+                    }],
                 );
                 Ok(r)
             }
@@ -182,19 +183,41 @@ impl Backend for MemoryBackend {
     async fn delete(&self, key: &[u8]) -> Result<(Revision, Option<KeyValue>)> {
         let mut g = self.inner.write().await;
         let prev = g.kvs.remove(key);
+        if prev.is_none() {
+            return Ok((g.rev, None));
+        }
         let r = Self::next_rev(&mut g).await;
-        Self::push(
+        Self::publish(
             &mut g,
             &self.tx,
-            Event {
+            vec![Event {
                 revision: r,
                 key: Bytes::copy_from_slice(key),
                 deleted: true,
                 kv: None,
                 prev_kv: prev.clone(),
-            },
+            }],
         );
         Ok((r, prev))
+    }
+
+    async fn commit(&self, base: Revision, events: Vec<Event>) -> Result<()> {
+        let mut g = self.inner.write().await;
+        if g.rev != base {
+            return Err(Error::Conflict);
+        }
+        if !events.is_empty() {
+            Self::next_rev(&mut g).await;
+            for event in &events {
+                if let Some(kv) = &event.kv {
+                    g.kvs.insert(event.key.to_vec(), kv.clone());
+                } else {
+                    g.kvs.remove(event.key.as_ref());
+                }
+            }
+            Self::publish(&mut g, &self.tx, events);
+        }
+        Ok(())
     }
 
     async fn list(
@@ -204,15 +227,44 @@ impl Backend for MemoryBackend {
         opts: ListOptions,
     ) -> Result<(Revision, Vec<KeyValue>, i64)> {
         let g = self.inner.read().await;
-        if opts.revision != 0 && opts.revision < g.compact_rev {
+        if opts.revision > 0 && opts.revision < g.compact_rev {
             return Err(Error::Compacted {
                 requested: opts.revision,
                 compacted: g.compact_rev,
             });
         }
         let rev = g.rev;
-        let mut out: Vec<KeyValue> = g
-            .kvs
+        if opts.revision > rev {
+            return Err(Error::FutureRev {
+                requested: opts.revision,
+                current: rev,
+            });
+        }
+        let mut snapshot = HashMap::new();
+        let values = if opts.revision <= 0 || opts.revision == rev {
+            &g.kvs
+        } else {
+            snapshot.extend(
+                g.compacted
+                    .iter()
+                    .filter(|(k, _)| in_range(k, prefix, range_end))
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+            for events in &g.history[(g.compact_rev + 1) as usize..=opts.revision as usize] {
+                for event in events
+                    .iter()
+                    .filter(|e| in_range(&e.key, prefix, range_end))
+                {
+                    if let Some(kv) = &event.kv {
+                        snapshot.insert(event.key.to_vec(), kv.clone());
+                    } else {
+                        snapshot.remove(event.key.as_ref());
+                    }
+                }
+            }
+            &snapshot
+        };
+        let mut out: Vec<KeyValue> = values
             .values()
             .filter(|kv| in_range(&kv.key, prefix, range_end))
             .cloned()
@@ -241,13 +293,25 @@ impl Backend for MemoryBackend {
                 current: g.rev,
             });
         }
-        if revision > g.compact_rev {
-            g.compact_rev = revision;
-            for r in 1..=revision.min(g.history.len() as i64 - 1) {
-                g.history[r as usize].clear();
+        if revision <= g.compact_rev {
+            return Err(Error::Compacted {
+                requested: revision,
+                compacted: g.compact_rev,
+            });
+        }
+        for r in (g.compact_rev + 1)..=revision {
+            if (r as usize) < g.history.len() {
+                for event in std::mem::take(&mut g.history[r as usize]) {
+                    if let Some(kv) = event.kv {
+                        g.compacted.insert(event.key.to_vec(), kv);
+                    } else {
+                        g.compacted.remove(event.key.as_ref());
+                    }
+                }
             }
         }
-        Ok(revision)
+        g.compact_rev = revision;
+        Ok(g.rev)
     }
 
     async fn db_size(&self) -> i64 {
@@ -276,18 +340,8 @@ impl Backend for MemoryBackend {
         Ok(out)
     }
 
-    fn subscribe(&self) -> broadcast::Receiver<Event> {
+    fn subscribe(&self) -> broadcast::Receiver<Vec<Event>> {
         self.tx.subscribe()
-    }
-}
-
-fn in_range(key: &[u8], prefix: &[u8], range_end: Option<&[u8]>) -> bool {
-    match range_end {
-        // proto3 cannot distinguish absent from empty: single key.
-        None | Some([]) => key == prefix,
-        // "\0" means all keys >= key (etcd convention).
-        Some([0]) => key >= prefix,
-        Some(end) => key >= prefix && key < end,
     }
 }
 

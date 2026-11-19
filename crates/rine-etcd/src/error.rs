@@ -8,6 +8,8 @@ pub enum Error {
     Compacted { requested: i64, compacted: i64 },
     #[error("future revision: requested {requested}, current {current}")]
     FutureRev { requested: i64, current: i64 },
+    #[error("storage revision changed during transaction")]
+    Conflict,
     #[error("not supported: {0}")]
     NotSupported(String),
     #[error("backend: {0}")]

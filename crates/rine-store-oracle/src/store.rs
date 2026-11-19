@@ -76,7 +76,7 @@ mod tests {
         b.create(Bytes::from("w"), Bytes::from("1"), 0)
             .await
             .unwrap();
-        let ev = rx.recv().await.unwrap();
+        let ev = rx.recv().await.unwrap().pop().unwrap();
         assert!(!ev.deleted);
         assert_eq!(ev.kv.unwrap().version, 1);
     }

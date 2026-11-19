@@ -4,12 +4,13 @@
 //! so the k8s apiserver patterns (create/cas/delete/compact-on-key) work
 //! alongside generic clients.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use bytes::Bytes;
+use tokio::sync::OwnedMutexGuard;
 
 use crate::{
-    backend::{Backend, KeyValue, ListOptions},
+    backend::{Backend, Event, KeyValue, ListOptions, in_range},
     error::Error,
     etcdserverpb::{
         CompactionRequest, CompactionResponse, Compare, DeleteRangeRequest, DeleteRangeResponse,
@@ -33,8 +34,30 @@ pub(crate) fn status_err(e: Error) -> tonic::Status {
             tonic::Status::out_of_range("etcdserver: mvcc: required revision is a future revision")
         }
         Error::NotSupported(s) => tonic::Status::unimplemented(s),
+        Error::Conflict => tonic::Status::aborted("storage revision changed during transaction"),
         Error::KeyExists(_) => tonic::Status::already_exists("key already exists"),
         Error::Backend(s) => tonic::Status::internal(s),
+    }
+}
+
+struct WriteBatch {
+    base: i64,
+    events: Vec<Event>,
+}
+
+impl WriteBatch {
+    fn revision(&self) -> i64 {
+        self.base + i64::from(!self.events.is_empty())
+    }
+
+    fn push(&mut self, event: Event) -> Result<(), tonic::Status> {
+        if self.events.iter().any(|e| e.key == event.key) {
+            return Err(tonic::Status::invalid_argument(
+                "etcdserver: duplicate key given in txn request",
+            ));
+        }
+        self.events.push(event);
+        Ok(())
     }
 }
 
@@ -66,7 +89,98 @@ impl KvService {
 
     // ---- core handlers (shared by unary RPCs and Txn branches) ----
 
-    async fn do_range(&self, req: &RangeRequest) -> Result<RangeResponse, tonic::Status> {
+    async fn batch(&self) -> WriteBatch {
+        WriteBatch {
+            base: self.backend.current_revision().await,
+            events: Vec::new(),
+        }
+    }
+
+    async fn commit(
+        &self,
+        batch: WriteBatch,
+        guard: OwnedMutexGuard<()>,
+    ) -> Result<(), tonic::Status> {
+        if batch.events.is_empty() {
+            return Ok(());
+        }
+        let changes: Vec<_> = batch
+            .events
+            .iter()
+            .map(|event| {
+                (
+                    event.key.clone(),
+                    event.prev_kv.as_ref().map_or(0, |kv| kv.lease),
+                    event.kv.as_ref().map_or(0, |kv| kv.lease),
+                )
+            })
+            .collect();
+        // Once the database commit starts, a dropped RPC must not interrupt
+        // watch publication or lease bookkeeping.
+        let backend = self.backend.clone();
+        let leases = self.leases.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            backend
+                .commit(batch.base, batch.events)
+                .await
+                .map_err(status_err)?;
+            for (key, old, new) in changes {
+                if old != new {
+                    if old != 0 {
+                        leases.detach(old, &key).await;
+                    }
+                    if new != 0 {
+                        leases.attach(new, key.to_vec()).await;
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| tonic::Status::internal(format!("commit task failed: {error}")))?
+    }
+
+    async fn list(
+        &self,
+        key: &[u8],
+        end: &[u8],
+        revision: i64,
+        batch: Option<&WriteBatch>,
+    ) -> Result<(i64, Vec<KeyValue>), tonic::Status> {
+        let end = (!end.is_empty()).then_some(end);
+        let (rev, kvs, _) = self
+            .backend
+            .list(
+                key,
+                end,
+                ListOptions {
+                    revision,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(status_err)?;
+        if let Some(batch) = batch.filter(|batch| revision <= 0 && !batch.events.is_empty()) {
+            let mut kvs: BTreeMap<_, _> = kvs.into_iter().map(|kv| (kv.key.clone(), kv)).collect();
+            for event in batch.events.iter().filter(|e| in_range(&e.key, key, end)) {
+                if let Some(kv) = &event.kv {
+                    kvs.insert(event.key.clone(), kv.clone());
+                } else {
+                    kvs.remove(&event.key);
+                }
+            }
+            Ok((batch.revision(), kvs.into_values().collect()))
+        } else {
+            Ok((rev, kvs))
+        }
+    }
+
+    async fn do_range(
+        &self,
+        req: &RangeRequest,
+        batch: Option<&WriteBatch>,
+    ) -> Result<RangeResponse, tonic::Status> {
         if req.key.is_empty() {
             return Err(tonic::Status::invalid_argument(
                 "etcdserver: key is not provided",
@@ -82,25 +196,9 @@ impl KvService {
                 "etcdserver: invalid sort target",
             ));
         }
-        let range_end = if req.range_end.is_empty() {
-            None
-        } else {
-            Some(req.range_end.as_slice())
-        };
-        let (rev, mut kvs, count) = self
-            .backend
-            .list(
-                &req.key,
-                range_end,
-                ListOptions {
-                    revision: req.revision,
-                    limit: 0,
-                    keys_only: req.keys_only,
-                    count_only: req.count_only,
-                },
-            )
-            .await
-            .map_err(status_err)?;
+        let (rev, mut kvs) = self
+            .list(&req.key, &req.range_end, req.revision, batch)
+            .await?;
 
         // min/max revision filters (0 = unset).
         kvs.retain(|kv| {
@@ -109,18 +207,14 @@ impl KvService {
                 && (req.min_create_revision == 0 || kv.create_revision >= req.min_create_revision)
                 && (req.max_create_revision == 0 || kv.create_revision <= req.max_create_revision)
         });
-        let filtered = kvs.len() as i64;
-        let count = if req.min_mod_revision != 0
-            || req.max_mod_revision != 0
-            || req.min_create_revision != 0
-            || req.max_create_revision != 0
-        {
-            filtered
-        } else {
-            count
-        };
+        let count = kvs.len() as i64;
 
         sort_kvs(&mut kvs, req.sort_order, req.sort_target);
+        if req.keys_only {
+            for kv in &mut kvs {
+                kv.value = Bytes::new();
+            }
+        }
 
         let (out, more) = if req.limit > 0 && (kvs.len() as i64) > req.limit {
             kvs.truncate(req.limit as usize);
@@ -141,7 +235,11 @@ impl KvService {
         })
     }
 
-    async fn do_put(&self, req: &PutRequest) -> Result<PutResponse, tonic::Status> {
+    async fn do_put(
+        &self,
+        req: &PutRequest,
+        batch: &mut WriteBatch,
+    ) -> Result<PutResponse, tonic::Status> {
         if req.key.is_empty() {
             return Err(tonic::Status::invalid_argument(
                 "etcdserver: key is not provided",
@@ -173,21 +271,22 @@ impl KvService {
             ));
         }
 
-        let rev = match &prev {
-            Some(_) => self
-                .backend
-                .update(Bytes::copy_from_slice(&req.key), value, 0, lease)
-                .await
-                .map_err(status_err)?,
-            None => self
-                .backend
-                .create(Bytes::copy_from_slice(&req.key), value, lease)
-                .await
-                .map_err(status_err)?,
-        };
-        if lease != 0 {
-            self.leases.attach(lease, req.key.clone()).await;
-        }
+        let rev = batch.base + 1;
+        let key = Bytes::copy_from_slice(&req.key);
+        batch.push(Event {
+            revision: rev,
+            key: key.clone(),
+            deleted: false,
+            kv: Some(KeyValue {
+                key,
+                value,
+                lease,
+                mod_revision: rev,
+                create_revision: prev.as_ref().map_or(rev, |kv| kv.create_revision),
+                version: prev.as_ref().map_or(1, |kv| kv.version + 1),
+            }),
+            prev_kv: prev.clone(),
+        })?;
         Ok(PutResponse {
             header: Some(self.header(rev)),
             prev_kv: if req.prev_kv {
@@ -201,49 +300,35 @@ impl KvService {
     async fn do_delete(
         &self,
         req: &DeleteRangeRequest,
+        batch: &mut WriteBatch,
     ) -> Result<DeleteRangeResponse, tonic::Status> {
         if req.key.is_empty() {
             return Err(tonic::Status::invalid_argument(
                 "etcdserver: key is not provided",
             ));
         }
-        let range_end = if req.range_end.is_empty() {
-            None
-        } else {
-            Some(req.range_end.as_slice())
-        };
-        let (_, kvs, _) = self
-            .backend
-            .list(
-                &req.key,
-                range_end,
-                ListOptions {
-                    revision: 0,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(status_err)?;
+        let (_, kvs) = self.list(&req.key, &req.range_end, 0, None).await?;
         let mut prev_kvs = Vec::new();
-        let mut rev = self.backend.current_revision().await;
         for kv in &kvs {
-            let (r, prev) = self.backend.delete(&kv.key).await.map_err(status_err)?;
-            rev = r;
-            if req.prev_kv
-                && let Some(p) = prev
-            {
-                prev_kvs.push(to_proto_kv(p));
+            batch.push(Event {
+                revision: batch.base + 1,
+                key: kv.key.clone(),
+                deleted: true,
+                kv: None,
+                prev_kv: Some(kv.clone()),
+            })?;
+            if req.prev_kv {
+                prev_kvs.push(to_proto_kv(kv.clone()));
             }
         }
-        // NOTE: revision is not bumped when nothing matched; etcd bumps it.
         Ok(DeleteRangeResponse {
-            header: Some(self.header(rev)),
+            header: Some(self.header(batch.revision())),
             deleted: kvs.len() as i64,
             prev_kvs,
         })
     }
 
-    async fn eval_compare(&self, c: &Compare) -> Result<bool, tonic::Status> {
+    async fn eval_compare(&self, c: &Compare, batch: &WriteBatch) -> Result<bool, tonic::Status> {
         use crate::etcdserverpb::compare::{CompareResult, CompareTarget, TargetUnion};
         let result = CompareResult::try_from(c.result)
             .map_err(|_| tonic::Status::invalid_argument("etcdserver: bad compare result"))?;
@@ -255,21 +340,16 @@ impl KvService {
 
         // Gather (version, create, mod, value, lease) for each subject key.
         let mut subjects: Vec<(i64, i64, i64, Vec<u8>, i64)> = Vec::new();
-        if c.range_end.is_empty() {
-            let (_, kv) = self.backend.get(&c.key, 0).await.map_err(status_err)?;
-            subjects.push(unpack(kv));
-        } else {
-            let (_, kvs, _) = self
-                .backend
-                .list(&c.key, Some(c.range_end.as_slice()), ListOptions::default())
-                .await
-                .map_err(status_err)?;
-            for kv in kvs {
-                subjects.push(unpack(Some(kv)));
+        let (_, kvs) = self.list(&c.key, &c.range_end, 0, Some(batch)).await?;
+        if kvs.is_empty() {
+            if target == CompareTarget::Value {
+                return Ok(false);
             }
+            subjects.push(unpack(None));
         }
+        subjects.extend(kvs.into_iter().map(|kv| unpack(Some(kv))));
 
-        // All subjects must satisfy (vacuously true for empty ranges).
+        // All subjects must satisfy the comparison.
         for (version, create, mod_rev, value, lease) in subjects {
             let ord = match (&target, union) {
                 (CompareTarget::Version, TargetUnion::Version(v)) => version.cmp(v),
@@ -300,6 +380,7 @@ impl KvService {
         &'a self,
         op: &'a RequestOp,
         depth: usize,
+        batch: &'a mut WriteBatch,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<ResponseOp, tonic::Status>> + Send + 'a>,
     > {
@@ -307,16 +388,22 @@ impl KvService {
             use crate::etcdserverpb::{request_op::Request, response_op::Response};
             match op.request.as_ref() {
                 Some(Request::RequestRange(r)) => Ok(ResponseOp {
-                    response: Some(Response::ResponseRange(self.do_range(r).await?)),
+                    response: Some(Response::ResponseRange(
+                        self.do_range(r, Some(batch)).await?,
+                    )),
                 }),
                 Some(Request::RequestPut(p)) => Ok(ResponseOp {
-                    response: Some(Response::ResponsePut(self.do_put(p).await?)),
+                    response: Some(Response::ResponsePut(self.do_put(p, batch).await?)),
                 }),
                 Some(Request::RequestDeleteRange(d)) => Ok(ResponseOp {
-                    response: Some(Response::ResponseDeleteRange(self.do_delete(d).await?)),
+                    response: Some(Response::ResponseDeleteRange(
+                        self.do_delete(d, batch).await?,
+                    )),
                 }),
                 Some(Request::RequestTxn(t)) => Ok(ResponseOp {
-                    response: Some(Response::ResponseTxn(self.do_txn(t, depth + 1).await?)),
+                    response: Some(Response::ResponseTxn(
+                        self.do_txn(t, depth + 1, batch).await?,
+                    )),
                 }),
                 None => Err(tonic::Status::invalid_argument(
                     "etcdserver: empty request op",
@@ -329,6 +416,7 @@ impl KvService {
         &'a self,
         req: &'a TxnRequest,
         depth: usize,
+        batch: &'a mut WriteBatch,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<TxnResponse, tonic::Status>> + Send + 'a>,
     > {
@@ -340,7 +428,7 @@ impl KvService {
             }
             let mut ok = true;
             for c in &req.compare {
-                if !self.eval_compare(c).await? {
+                if !self.eval_compare(c, batch).await? {
                     ok = false;
                     break;
                 }
@@ -348,11 +436,10 @@ impl KvService {
             let ops = if ok { &req.success } else { &req.failure };
             let mut responses = Vec::with_capacity(ops.len());
             for op in ops {
-                responses.push(self.apply_op(op, depth).await?);
+                responses.push(self.apply_op(op, depth, batch).await?);
             }
-            let rev = self.backend.current_revision().await;
             Ok(TxnResponse {
-                header: Some(self.header(rev)),
+                header: Some(self.header(batch.revision())),
                 succeeded: ok,
                 responses,
             })
@@ -409,7 +496,7 @@ impl Kv for KvService {
         request: tonic::Request<RangeRequest>,
     ) -> Result<tonic::Response<RangeResponse>, tonic::Status> {
         Ok(tonic::Response::new(
-            self.do_range(&request.into_inner()).await?,
+            self.do_range(&request.into_inner(), None).await?,
         ))
     }
 
@@ -417,27 +504,33 @@ impl Kv for KvService {
         &self,
         request: tonic::Request<PutRequest>,
     ) -> Result<tonic::Response<PutResponse>, tonic::Status> {
-        Ok(tonic::Response::new(
-            self.do_put(&request.into_inner()).await?,
-        ))
+        let guard = self.leases.writes.clone().lock_owned().await;
+        let mut batch = self.batch().await;
+        let response = self.do_put(&request.into_inner(), &mut batch).await?;
+        self.commit(batch, guard).await?;
+        Ok(tonic::Response::new(response))
     }
 
     async fn delete_range(
         &self,
         request: tonic::Request<DeleteRangeRequest>,
     ) -> Result<tonic::Response<DeleteRangeResponse>, tonic::Status> {
-        Ok(tonic::Response::new(
-            self.do_delete(&request.into_inner()).await?,
-        ))
+        let guard = self.leases.writes.clone().lock_owned().await;
+        let mut batch = self.batch().await;
+        let response = self.do_delete(&request.into_inner(), &mut batch).await?;
+        self.commit(batch, guard).await?;
+        Ok(tonic::Response::new(response))
     }
 
     async fn txn(
         &self,
         request: tonic::Request<TxnRequest>,
     ) -> Result<tonic::Response<TxnResponse>, tonic::Status> {
-        Ok(tonic::Response::new(
-            self.do_txn(&request.into_inner(), 0).await?,
-        ))
+        let guard = self.leases.writes.clone().lock_owned().await;
+        let mut batch = self.batch().await;
+        let response = self.do_txn(&request.into_inner(), 0, &mut batch).await?;
+        self.commit(batch, guard).await?;
+        Ok(tonic::Response::new(response))
     }
 
     async fn compact(
@@ -445,6 +538,7 @@ impl Kv for KvService {
         request: tonic::Request<CompactionRequest>,
     ) -> Result<tonic::Response<CompactionResponse>, tonic::Status> {
         let req = request.into_inner();
+        let _guard = self.leases.writes.lock().await;
         let cur = self.backend.current_revision().await;
         if req.revision <= 0 || req.revision > cur {
             return Err(tonic::Status::out_of_range(

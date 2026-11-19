@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use rine_etcd::error::Result;
+use rine_etcd::error::{Error, Result};
 use rine_store_executor::{Dialect as _, Row, SqlExecutor, SqlValue};
 use tokio::sync::Mutex;
 
@@ -26,6 +26,14 @@ struct MockRow {
 }
 
 impl MockRow {
+    fn revision(&self) -> i64 {
+        if self.created > 0 {
+            self.created
+        } else {
+            self.id
+        }
+    }
+
     fn to_row(&self) -> Row {
         Row {
             values: vec![
@@ -73,20 +81,40 @@ impl MockExec {
             _ => panic!("param {i} not an int"),
         }
     }
-}
-
-impl Default for MockExec {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl SqlExecutor for MockExec {
-    async fn execute(&self, sql: &str, params: Vec<SqlValue>) -> Result<u64> {
-        let mut rows = self.rows.lock().await;
+    fn apply(
+        rows: &mut Vec<MockRow>,
+        next: &mut i64,
+        sql: &str,
+        params: Vec<SqlValue>,
+    ) -> Result<u64> {
+        if sql == OracleDialect::insert_event_sql() {
+            let id = Self::int_param(&params, 0);
+            let name = Self::str_param(&params, 1);
+            let prev_revision = Self::int_param(&params, 5);
+            if rows
+                .iter()
+                .any(|r| r.id == id || (r.name == name && r.prev_revision == prev_revision))
+            {
+                return Err(Error::Backend("duplicate event row".into()));
+            }
+            rows.push(MockRow {
+                id,
+                name,
+                created: Self::int_param(&params, 2),
+                deleted: Self::int_param(&params, 3),
+                create_revision: Self::int_param(&params, 4),
+                prev_revision,
+                lease: Self::int_param(&params, 6),
+                version: Self::int_param(&params, 7),
+                value: match &params[8] {
+                    SqlValue::Bytes(b) => Some(b.clone()),
+                    SqlValue::Null => None,
+                    _ => panic!("value param"),
+                },
+            });
+            return Ok(1);
+        }
         if sql == OracleDialect::insert_sql() {
-            let mut next = self.next_id.lock().await;
             rows.push(MockRow {
                 id: *next,
                 name: Self::str_param(&params, 0),
@@ -149,9 +177,8 @@ impl SqlExecutor for MockExec {
         }
         if sql == OracleDialect::set_compact_rev_insert_sql() {
             let rev = Self::int_param(&params, 0);
-            let mut next = self.next_id.lock().await;
             rows.push(MockRow {
-                id: *next,
+                id: 0,
                 name: OracleDialect::compacted_rev_key().into(),
                 created: 0,
                 deleted: 0,
@@ -161,7 +188,6 @@ impl SqlExecutor for MockExec {
                 version: 1,
                 value: None,
             });
-            *next += 1;
             return Ok(1);
         }
         if sql == OracleDialect::compact_delete_sql() {
@@ -169,7 +195,7 @@ impl SqlExecutor for MockExec {
             // newest row at or below rev per name survives
             let mut keep: HashMap<String, i64> = HashMap::new();
             for r in rows.iter() {
-                if r.id <= rev {
+                if r.revision() <= rev {
                     keep.entry(r.name.clone())
                         .and_modify(|m| *m = (*m).max(r.id))
                         .or_insert(r.id);
@@ -177,7 +203,7 @@ impl SqlExecutor for MockExec {
             }
             let before = rows.len();
             rows.retain(|r| {
-                !(r.id < rev
+                !(r.revision() < rev
                     && r.name != OracleDialect::compacted_rev_key()
                     && keep.get(&r.name) != Some(&r.id))
             });
@@ -187,6 +213,34 @@ impl SqlExecutor for MockExec {
             return Ok(0);
         }
         panic!("mock execute: unknown sql {sql}");
+    }
+}
+
+impl Default for MockExec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl SqlExecutor for MockExec {
+    async fn execute(&self, sql: &str, params: Vec<SqlValue>) -> Result<u64> {
+        let mut rows = self.rows.lock().await;
+        let mut next = self.next_id.lock().await;
+        Self::apply(&mut rows, &mut next, sql, params)
+    }
+
+    async fn execute_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
+        let mut rows = self.rows.lock().await;
+        let mut next = self.next_id.lock().await;
+        let mut pending = rows.clone();
+        let mut pending_next = *next;
+        for (sql, params) in statements {
+            Self::apply(&mut pending, &mut pending_next, &sql, params)?;
+        }
+        *rows = pending;
+        *next = pending_next;
+        Ok(())
     }
 
     async fn query_row(&self, sql: &str, params: Vec<SqlValue>) -> Result<Option<Row>> {
@@ -198,10 +252,30 @@ impl SqlExecutor for MockExec {
             }));
         }
         if sql == OracleDialect::current_revision_sql() {
-            let max = rows.iter().map(|r| r.id).max();
+            let max = rows.iter().max_by_key(|r| r.id).map(MockRow::revision);
             return Ok(max.map(|m| Row {
                 values: vec![SqlValue::Int(m)],
             }));
+        }
+        if sql == OracleDialect::last_row_id_sql() {
+            return Ok(rows.iter().map(|r| r.id).max().map(|id| Row {
+                values: vec![SqlValue::Int(id)],
+            }));
+        }
+        if sql == OracleDialect::latest_by_name_sql() {
+            let name = Self::str_param(&params, 0);
+            return Ok(rows
+                .iter()
+                .filter(|r| r.name == name)
+                .map(|r| r.id)
+                .max()
+                .map(|id| Row {
+                    values: vec![SqlValue::Int(id)],
+                }));
+        }
+        if sql == OracleDialect::predecessor_sql() {
+            let id = Self::int_param(&params, 0);
+            return Ok(rows.iter().find(|r| r.id == id).map(MockRow::to_row));
         }
         if sql == OracleDialect::compact_revision_sql() {
             let max = rows
@@ -264,14 +338,26 @@ impl SqlExecutor for MockExec {
         }
         if sql == OracleDialect::events_sql() {
             let (from, to) = (Self::int_param(&params, 0), Self::int_param(&params, 1));
-            let mut out: Vec<&MockRow> =
-                rows.iter().filter(|r| r.id >= from && r.id <= to).collect();
+            let mut out: Vec<&MockRow> = rows
+                .iter()
+                .filter(|r| {
+                    r.name != OracleDialect::compacted_rev_key()
+                        && r.revision() >= from
+                        && r.revision() <= to
+                })
+                .collect();
             out.sort_by_key(|r| r.id);
             return Ok(out.into_iter().map(MockRow::to_row).collect());
         }
-        let is_exact = sql == OracleDialect::list_exact_sql();
-        let is_ge = sql == OracleDialect::list_ge_sql();
-        let is_range = sql == OracleDialect::list_range_sql();
+        let historical = sql == OracleDialect::snapshot_sql(None)
+            || sql == OracleDialect::snapshot_sql(Some(&[0]))
+            || sql == OracleDialect::snapshot_sql(Some(b"end"));
+        let is_exact =
+            sql == OracleDialect::list_exact_sql() || sql == OracleDialect::snapshot_sql(None);
+        let is_ge =
+            sql == OracleDialect::list_ge_sql() || sql == OracleDialect::snapshot_sql(Some(&[0]));
+        let is_range = sql == OracleDialect::list_range_sql()
+            || sql == OracleDialect::snapshot_sql(Some(b"end"));
         assert!(
             is_exact || is_ge || is_range,
             "mock query_all: unknown sql {sql}"
@@ -280,18 +366,28 @@ impl SqlExecutor for MockExec {
         let mut out: Vec<&MockRow> = rows
             .iter()
             .filter(|r| {
-                r.deleted == 0
-                    && if is_exact {
-                        r.name == prefix
-                    } else if is_ge {
-                        r.name.as_str() >= prefix.as_str()
-                    } else {
-                        let end = Self::str_param(&params, 1);
-                        r.name.as_str() >= prefix.as_str() && r.name.as_str() < end.as_str()
-                    }
+                (if historical {
+                    r.name != OracleDialect::compacted_rev_key()
+                        && r.revision() <= Self::int_param(&params, if is_range { 2 } else { 1 })
+                } else {
+                    r.deleted == 0
+                }) && if is_exact {
+                    r.name == prefix
+                } else if is_ge {
+                    r.name.as_str() >= prefix.as_str()
+                } else {
+                    let end = Self::str_param(&params, 1);
+                    r.name.as_str() >= prefix.as_str() && r.name.as_str() < end.as_str()
+                }
             })
             .collect();
         out.sort_by(|a, b| (&a.name, a.id).cmp(&(&b.name, b.id)));
+        if historical {
+            out.reverse();
+            out.dedup_by(|a, b| a.name == b.name);
+            out.retain(|r| r.deleted != 1);
+            out.reverse();
+        }
         Ok(out.into_iter().map(MockRow::to_row).collect())
     }
 }

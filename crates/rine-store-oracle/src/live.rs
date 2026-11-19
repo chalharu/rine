@@ -2,7 +2,7 @@
 //!
 //! The driver API is blocking, so every call runs on Tokio's blocking pool
 //! via `spawn_blocking`. One connection is shared behind a mutex: the backend
-//! assumes a single writer (like kine on SQLite), and serializing access also
+//! assumes a single writer, and serializing access also
 //! keeps concurrent `&self` use sound.
 //!
 //! [`SqlValue`] mapping: `Int` -> NUMBER, `Str` -> VARCHAR2,
@@ -127,6 +127,24 @@ fn is_no_data(e: &oracledb::Error) -> bool {
 
 #[async_trait]
 impl SqlExecutor for OracleDb {
+    async fn execute_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
+        self.run_blocking(move |conn| {
+            let result = (|| {
+                for (sql, params) in statements {
+                    let owned: Vec<_> = params.iter().map(OwnedParam::from).collect();
+                    let refs: Vec<_> = owned.iter().map(as_bind).collect();
+                    conn.execute(&sql, &refs)?;
+                }
+                conn.commit()
+            })();
+            if result.is_err() {
+                conn.rollback()?;
+            }
+            result
+        })
+        .await
+    }
+
     async fn execute(&self, sql: &str, params: Vec<SqlValue>) -> Result<u64> {
         let sql = sql.to_string();
         self.run_blocking(move |conn| {

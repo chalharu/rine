@@ -1,6 +1,6 @@
 //! etcd-compatible API server with pluggable backend.
 //!
-//! kine-inspired scope: KV (Range/Put/DeleteRange/Txn/Compact), Watch,
+//! Supported services: KV (Range/Put/DeleteRange/Txn/Compact), Watch,
 //! Lease, Maintenance::Status, Cluster::MemberList.
 
 pub mod backend;

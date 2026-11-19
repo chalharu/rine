@@ -33,6 +33,7 @@ struct LeaseEntry {
 }
 
 pub struct LeaseManager {
+    pub(crate) writes: Arc<tokio::sync::Mutex<()>>,
     inner: Arc<RwLock<HashMap<i64, LeaseEntry>>>,
     backend: Arc<dyn Backend>,
     next_id: Arc<AtomicI64>,
@@ -41,6 +42,7 @@ pub struct LeaseManager {
 impl Clone for LeaseManager {
     fn clone(&self) -> Self {
         Self {
+            writes: self.writes.clone(),
             inner: self.inner.clone(),
             backend: self.backend.clone(),
             next_id: self.next_id.clone(),
@@ -51,6 +53,7 @@ impl Clone for LeaseManager {
 impl LeaseManager {
     pub fn new(backend: Arc<dyn Backend>) -> Self {
         let mgr = Self {
+            writes: Arc::new(tokio::sync::Mutex::new(())),
             inner: Arc::new(RwLock::new(HashMap::new())),
             backend,
             next_id: Arc::new(AtomicI64::new(1)),
@@ -58,10 +61,12 @@ impl LeaseManager {
         // Expiry loop: delete keys whose lease deadline passed.
         let inner = mgr.inner.clone();
         let backend = mgr.backend.clone();
+        let writes = mgr.writes.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             loop {
                 tick.tick().await;
+                let _guard = writes.lock().await;
                 let expired: Vec<(i64, Vec<Vec<u8>>)> = {
                     let now = Instant::now();
                     let mut g = inner.write().await;
@@ -122,7 +127,14 @@ impl LeaseManager {
         }
     }
 
+    pub(crate) async fn detach(&self, id: i64, key: &[u8]) {
+        if let Some(e) = self.inner.write().await.get_mut(&id) {
+            e.keys.retain(|k| k != key);
+        }
+    }
+
     pub async fn revoke(&self, id: i64) {
+        let _guard = self.writes.lock().await;
         let keys = self
             .inner
             .write()
