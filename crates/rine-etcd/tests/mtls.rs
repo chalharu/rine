@@ -152,3 +152,95 @@ async fn tls_without_client_auth_accepts_ca_only_client() {
     let value = put_get(addr, client_tls(&pki, false)).await.unwrap();
     assert_eq!(value, b"v".to_vec());
 }
+
+async fn free_port() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    addr
+}
+
+#[tokio::test]
+async fn mixed_plaintext_and_mtls_share_one_backend() {
+    use rine_etcd::server::ListenAddr;
+
+    let pki = test_pki();
+    let plain = free_port().await;
+    let tls_addr = free_port().await;
+    let tls_cfg = server_tls(&pki, true);
+    let backend = Arc::new(rine_etcd::MemoryBackend::new());
+    tokio::spawn(async move {
+        EtcdServer::new(backend)
+            .serve_many(vec![
+                ListenAddr {
+                    addr: plain,
+                    tls: None,
+                },
+                ListenAddr {
+                    addr: tls_addr,
+                    tls: Some(tls_cfg),
+                },
+            ])
+            .await
+            .unwrap();
+    });
+    for addr in [plain, tls_addr] {
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    // Write over plaintext, read back over mTLS: one shared backend.
+    let channel = Channel::from_shared(format!("http://{plain}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut kv = KvClient::new(channel);
+    kv.put(PutRequest {
+        key: b"k".to_vec(),
+        value: b"v".to_vec(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let value = put_get(tls_addr, client_tls(&pki, true)).await.unwrap();
+    assert_eq!(value, b"v".to_vec());
+    // And the reverse direction: write over mTLS, read over plaintext.
+    let channel = Channel::from_shared(format!("https://{tls_addr}"))
+        .unwrap()
+        .tls_config(client_tls(&pki, true))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut kv = KvClient::new(channel);
+    kv.put(PutRequest {
+        key: b"k2".to_vec(),
+        value: b"v2".to_vec(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let channel = Channel::from_shared(format!("http://{plain}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut kv = KvClient::new(channel);
+    let got = kv
+        .range(RangeRequest {
+            key: b"k2".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        got.kvs.first().map(|k| k.value.clone()).unwrap_or_default(),
+        b"v2".to_vec()
+    );
+}

@@ -73,6 +73,20 @@ certificate, e.g. `etcdctl --cacert=ca.pem --cert=client.pem
 `TLS_CA`/`TLS_CERT`/`TLS_KEY` when running `e2e/etcdctl.sh` with an
 `https://` `ENDPOINT`.
 
+Mixed plaintext + TLS on one server via `--listen-client-urls`
+(etcd `--listen-client-urls` style, `RINE_LISTEN_CLIENT_URLS`).
+`https://` entries serve TLS, `http://` entries stay plaintext, all
+sharing one backend:
+
+```sh
+cargo run -p rine -- \
+  --listen-client-urls "http://127.0.0.1:2379,https://127.0.0.1:2380" \
+  --cert-file server.pem --key-file server-key.pem
+```
+
+When `--listen-client-urls` is absent, `--listen` is used as a single
+plaintext listener as before.
+
 ## Test
 
 ```sh

@@ -14,6 +14,11 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 struct Args {
     #[arg(long, default_value = "127.0.0.1:2379", env = "RINE_LISTEN")]
     listen: SocketAddr,
+    /// Client listen URLs, comma-separated (etcd --listen-client-urls style).
+    /// Each entry is http(s)://host:port; https:// entries serve TLS while
+    /// http:// entries stay plaintext. Takes precedence over --listen.
+    #[arg(long, env = "RINE_LISTEN_CLIENT_URLS")]
+    listen_client_urls: Option<String>,
     #[arg(long, default_value = "memory", env = "RINE_BACKEND")]
     backend: String,
     /// Oracle connect string: Easy Connect (`host/service`), a full connect
@@ -84,29 +89,85 @@ async fn main() -> Result<()> {
         other => anyhow::bail!("unknown backend: {other} (expected memory|sqlite|oracle)"),
     };
     backend.initialize().await?;
-    let tls = match (&args.cert_file, &args.key_file) {
+
+    // Identity is loaded once and applied to every https:// listener.
+    let identity: Option<(Vec<u8>, Vec<u8>)> = match (&args.cert_file, &args.key_file) {
         (None, None) => None,
-        (Some(cert), Some(key)) => {
-            let identity =
-                tonic::transport::Identity::from_pem(std::fs::read(cert)?, std::fs::read(key)?);
-            let mut config = tonic::transport::ServerTlsConfig::new().identity(identity);
-            if args.client_cert_auth {
-                let ca = args.trusted_ca_file.clone().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--client-cert-auth needs --trusted-ca-file (or RINE_TRUSTED_CA_FILE)"
-                    )
-                })?;
-                config = config
-                    .client_ca_root(tonic::transport::Certificate::from_pem(std::fs::read(ca)?));
-            }
-            Some(config)
-        }
+        (Some(cert), Some(key)) => Some((std::fs::read(cert)?, std::fs::read(key)?)),
         _ => anyhow::bail!("--cert-file and --key-file must be given together"),
     };
-    let server = rine_etcd::server::EtcdServer::new(backend);
-    match tls {
-        Some(tls) => server.serve_tls(args.listen, tls).await?,
-        None => server.serve(args.listen).await?,
+    if identity.is_none() && args.client_cert_auth {
+        anyhow::bail!("--client-cert-auth needs TLS (--cert-file/--key-file)");
     }
+    let client_ca: Option<Vec<u8>> = if args.client_cert_auth {
+        let ca = args.trusted_ca_file.clone().ok_or_else(|| {
+            anyhow::anyhow!("--client-cert-auth needs --trusted-ca-file (or RINE_TRUSTED_CA_FILE)")
+        })?;
+        Some(std::fs::read(ca)?)
+    } else {
+        None
+    };
+
+    let urls = match &args.listen_client_urls {
+        Some(urls) => {
+            let mut parsed = Vec::new();
+            for s in urls.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                parsed.push(parse_listen_url(s).await?);
+            }
+            parsed
+        }
+        None => vec![(args.listen, false)],
+    };
+    if urls.is_empty() {
+        anyhow::bail!("no listen URLs");
+    }
+    let mut listeners = Vec::with_capacity(urls.len());
+    for (addr, https) in urls {
+        let tls = if https {
+            let (cert, key) = identity.clone().ok_or_else(|| {
+                anyhow::anyhow!("https:// listener {addr} needs --cert-file/--key-file")
+            })?;
+            let mut config = tonic::transport::ServerTlsConfig::new()
+                .identity(tonic::transport::Identity::from_pem(cert, key));
+            if let Some(ca) = &client_ca {
+                config = config.client_ca_root(tonic::transport::Certificate::from_pem(ca.clone()));
+            }
+            Some(config)
+        } else {
+            None
+        };
+        listeners.push(rine_etcd::server::ListenAddr { addr, tls });
+    }
+    if identity.is_some() && listeners.iter().all(|l| l.tls.is_none()) {
+        tracing::warn!("--cert-file/--key-file given but no https:// listener; TLS unused");
+    }
+    rine_etcd::server::EtcdServer::new(backend)
+        .serve_many(listeners)
+        .await?;
     Ok(())
+}
+
+/// Split `http(s)://host:port` (bare `host:port` means http) into an address
+/// plus whether it serves TLS.
+async fn parse_listen_url(s: &str) -> Result<(SocketAddr, bool)> {
+    let s = s.trim_end_matches('/');
+    let (scheme, rest) = match s.split_once("://") {
+        Some((scheme, rest)) => (scheme, rest),
+        None => ("http", s),
+    };
+    let https = match scheme {
+        "http" => false,
+        "https" => true,
+        other => anyhow::bail!(
+            "unsupported scheme in listen URL: {other} (expected http:// or https://)"
+        ),
+    };
+    if let Ok(addr) = rest.parse::<SocketAddr>() {
+        return Ok((addr, https));
+    }
+    let mut addrs = tokio::net::lookup_host(rest).await?;
+    addrs
+        .next()
+        .map(|addr| (addr, https))
+        .ok_or_else(|| anyhow::anyhow!("could not resolve listen address: {rest}"))
 }

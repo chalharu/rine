@@ -20,6 +20,13 @@ pub struct EtcdServer {
     pub backend: Arc<dyn Backend>,
 }
 
+/// One client listener: address plus optional TLS. `https://` listeners
+/// require a TLS config; `http://` listeners stay plaintext.
+pub struct ListenAddr {
+    pub addr: SocketAddr,
+    pub tls: Option<ServerTlsConfig>,
+}
+
 impl EtcdServer {
     pub fn new(backend: Arc<dyn Backend>) -> Self {
         Self { backend }
@@ -40,10 +47,41 @@ impl EtcdServer {
         addr: SocketAddr,
         tls: Option<ServerTlsConfig>,
     ) -> anyhow::Result<()> {
+        let leases = LeaseManager::new(self.backend.clone());
+        Self::serve_on(addr, tls, self.backend, leases).await
+    }
+
+    /// Serve several listeners (mixed `http://` plaintext and `https://` TLS)
+    /// on one shared backend and one shared lease manager.
+    pub async fn serve_many(self, listeners: Vec<ListenAddr>) -> anyhow::Result<()> {
+        if listeners.is_empty() {
+            anyhow::bail!("no listen addresses");
+        }
+        let leases = LeaseManager::new(self.backend.clone());
+        let mut set = tokio::task::JoinSet::new();
+        for l in listeners {
+            set.spawn(Self::serve_on(
+                l.addr,
+                l.tls,
+                self.backend.clone(),
+                leases.clone(),
+            ));
+        }
+        while let Some(res) = set.join_next().await {
+            res??;
+        }
+        Ok(())
+    }
+
+    async fn serve_on(
+        addr: SocketAddr,
+        tls: Option<ServerTlsConfig>,
+        backend: Arc<dyn Backend>,
+        leases: LeaseManager,
+    ) -> anyhow::Result<()> {
         // rustls 0.23 leaves process-wide provider selection to the
         // application; without this every TLS handshake panics.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let leases = LeaseManager::new(self.backend.clone());
         let scheme = if tls.is_some() { "https" } else { "http" };
         let client_url = format!("{scheme}://{addr}");
         tracing::info!(%addr, tls = tls.is_some(), "serving etcd-compatible gRPC");
@@ -53,21 +91,16 @@ impl EtcdServer {
         }
         builder
             .add_service(KvServer::new(KvService::new(
-                self.backend.clone(),
+                backend.clone(),
                 leases.clone(),
             )))
-            .add_service(WatchServer::new(WatchService::new(self.backend.clone())))
-            .add_service(LeaseServer::new(LeaseService::new(
-                self.backend.clone(),
-                leases,
-            )))
+            .add_service(WatchServer::new(WatchService::new(backend.clone())))
+            .add_service(LeaseServer::new(LeaseService::new(backend.clone(), leases)))
             .add_service(ClusterServer::new(ClusterService::new(
-                self.backend.clone(),
+                backend.clone(),
                 client_url,
             )))
-            .add_service(MaintenanceServer::new(MaintenanceService::new(
-                self.backend,
-            )))
+            .add_service(MaintenanceServer::new(MaintenanceService::new(backend)))
             .serve(addr)
             .await?;
         Ok(())
