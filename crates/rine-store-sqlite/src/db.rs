@@ -4,7 +4,12 @@
 //! via `spawn_blocking`. The connection is acquired asynchronously so queued
 //! requests don't occupy blocking threads waiting for it.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use rine_etcd::error::{Error, Result};
@@ -16,12 +21,33 @@ use tokio::sync::Mutex;
 #[derive(Clone, Debug)]
 pub struct SqliteDb {
     conn: Arc<Mutex<rusqlite::Connection>>,
+    in_unit: Arc<AtomicBool>,
 }
 
 impl SqliteDb {
     /// Open (or create) a SQLite database file.
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let conn = rusqlite::Connection::open(path)?;
+        Self::tune(&conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            in_unit: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Open a private in-memory database (tests).
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        Self::tune(&conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            in_unit: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// WAL for multi-process visibility, `FULL` sync per commit, and a busy
+    /// timeout so a commit unit waits for a rival writer instead of failing.
+    fn tune(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         conn.pragma_update(None, "synchronous", "FULL")?;
         // Use a single WAL sync per commit without sacrificing crash durability.
         let journal: String =
@@ -32,17 +58,8 @@ impl SqliteDb {
                 Some(format!("failed to enable WAL: journal_mode is {journal}")),
             ));
         }
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
-    }
-
-    /// Open a private in-memory database (tests).
-    pub fn open_in_memory() -> rusqlite::Result<Self> {
-        let conn = rusqlite::Connection::open_in_memory()?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
+        conn.busy_timeout(Duration::from_secs(30))?;
+        Ok(())
     }
 
     async fn run_blocking<T, F>(&self, op: F) -> Result<T>
@@ -137,6 +154,20 @@ impl std::error::Error for SqliteRealUnexpected {}
 #[async_trait]
 impl SqlExecutor for SqliteDb {
     async fn execute_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
+        if self.in_unit.load(Ordering::SeqCst) {
+            // Inside a commit unit the connection already holds BEGIN
+            // IMMEDIATE; run the statements directly instead of nesting a
+            // second transaction.
+            return self
+                .run_blocking(move |conn| {
+                    for (sql, params) in statements {
+                        conn.prepare_cached(&sql)?
+                            .execute(rusqlite::params_from_iter(params.iter().map(Bind)))?;
+                    }
+                    Ok(())
+                })
+                .await;
+        }
         self.run_blocking(move |conn| {
             let tx = conn.unchecked_transaction()?;
             for (sql, params) in statements {
@@ -180,6 +211,16 @@ impl SqlExecutor for SqliteDb {
     }
 
     async fn query_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<Vec<Vec<Row>>> {
+        if self.in_unit.load(Ordering::SeqCst) {
+            return self
+                .run_blocking(move |conn| {
+                    statements
+                        .iter()
+                        .map(|(sql, params)| query(conn, sql, params))
+                        .collect()
+                })
+                .await;
+        }
         self.run_blocking(move |conn| {
             let tx = conn.unchecked_transaction()?;
             let out = statements
@@ -190,5 +231,22 @@ impl SqlExecutor for SqliteDb {
             Ok(out)
         })
         .await
+    }
+
+    /// Serialize writers across processes: `BEGIN IMMEDIATE` takes the
+    /// RESERVED lock up front (waiting up to the busy timeout), so validation
+    /// reads and the following writes run atomically. Readers keep working.
+    async fn begin_unit(&self) -> Result<()> {
+        self.run_blocking(|conn| conn.execute_batch("BEGIN IMMEDIATE"))
+            .await?;
+        self.in_unit.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn end_unit(&self, commit: bool) -> Result<()> {
+        let sql = if commit { "COMMIT" } else { "ROLLBACK" };
+        let r = self.run_blocking(move |conn| conn.execute_batch(sql)).await;
+        self.in_unit.store(false, Ordering::SeqCst);
+        r
     }
 }

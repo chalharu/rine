@@ -16,13 +16,12 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use rine_etcd::{
-    backend::{Backend, Event, KeyValue, LeaseId, ListOptions, Revision},
+    backend::{Backend, Event, KeyValue, LeaseId, ListOptions, ReadSet, Revision},
     error::{Error, Result},
     etcdserverpb::{
         Compare, PutRequest, RangeRequest, RequestOp, TxnRequest,
         compare::{CompareResult, CompareTarget, TargetUnion},
         kv_client::KvClient,
-        request_op,
         request_op::Request,
         response_op::Response,
     },
@@ -81,11 +80,11 @@ impl Backend for FlakyBackend {
         self.inner.delete(key).await
     }
 
-    async fn commit(&self, base: Revision, events: Vec<Event>) -> Result<()> {
+    async fn commit(&self, reads: ReadSet, events: Vec<Event>) -> Result<Revision> {
         if self.fail_once.swap(false, Ordering::SeqCst) {
             return Err(Error::Conflict);
         }
-        self.inner.commit(base, events).await
+        self.inner.commit(reads, events).await
     }
 
     async fn list(

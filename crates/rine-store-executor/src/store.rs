@@ -1,9 +1,9 @@
-use std::{marker::PhantomData, sync::Arc};
+use std::{collections::HashSet, marker::PhantomData, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use rine_etcd::{
-    backend::{Backend, Event, KeyValue, LeaseId, ListOptions, Revision},
+    backend::{Backend, Event, KeyValue, LeaseId, ListOptions, ObservedRange, ReadSet, Revision},
     error::{Error, Result},
 };
 use tokio::sync::{Mutex, broadcast};
@@ -15,8 +15,10 @@ use crate::{
 
 /// MVCC event log over the `rine` table.
 ///
-/// Assumes a single writer process. Physical row IDs link per-key history;
-/// a batch can give several rows the same logical revision.
+/// Physical row IDs link per-key history; a batch can give several rows the
+/// same logical revision. Commits validate the transaction's read set under a
+/// database commit lock, then assign `MAX(revision) + 1`, so writers on any
+/// node serialize without false conflicts on untouched keys.
 pub struct SqlBackend<E: SqlExecutor, D: Dialect> {
     exec: Arc<E>,
     tx: broadcast::Sender<Vec<Event>>,
@@ -164,12 +166,108 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         Ok((cur, kvs, count))
     }
 
-    async fn commit_inner(&self, base: Revision, events: Vec<Event>) -> Result<()> {
-        if self.current_rev_inner().await? != base {
+    /// Backend-level range/list read without taking the write mutex. Reads the
+    /// committed state; inside a commit unit it observes the unit's snapshot.
+    async fn list_inner(
+        &self,
+        prefix: &[u8],
+        range_end: Option<&[u8]>,
+        opts: &ListOptions,
+    ) -> Result<(Revision, Vec<KeyValue>, i64)> {
+        if opts.revision <= 0
+            && let Some((rows_sql, count_sql)) = D::live_range_queries(range_end, opts)
+        {
+            return self
+                .list_live(prefix, range_end, opts, rows_sql, count_sql)
+                .await;
+        }
+        let cur = self.check_rev(opts.revision).await?;
+        let (mut sql, mut params) = match range_end {
+            None | Some([]) => (D::list_exact_sql(), vec![SqlValue::Str(key_str(prefix))]),
+            Some([0]) => (D::list_ge_sql(), vec![SqlValue::Str(key_str(prefix))]),
+            Some(end) => (
+                D::list_range_sql(),
+                vec![SqlValue::Str(key_str(prefix)), SqlValue::Str(key_str(end))],
+            ),
+        };
+        if opts.revision > 0 && opts.revision < cur {
+            sql = D::snapshot_sql(range_end);
+            params.push(SqlValue::Int(opts.revision));
+        }
+        let rows = self.exec.query_all(&sql, params).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            if r.get_str(1)? != D::compacted_rev_key() {
+                out.push(row_to_kv(r)?);
+            }
+        }
+        let count = out.len() as i64;
+        if opts.count_only {
+            return Ok((cur, Vec::new(), count));
+        }
+        if opts.limit > 0 && (out.len() as i64) > opts.limit {
+            out.truncate(opts.limit as usize);
+        }
+        if opts.keys_only {
+            for kv in &mut out {
+                kv.value = Bytes::new();
+            }
+        }
+        Ok((cur, out, count))
+    }
+
+    /// Revalidate one observed range against the current committed state.
+    async fn check_range(&self, observed: &ObservedRange) -> Result<()> {
+        let (_, kvs, count) = self
+            .list_inner(
+                &observed.prefix,
+                observed.range_end.as_deref(),
+                &observed.opts,
+            )
+            .await?;
+        if count != observed.count
+            || kvs.len() != observed.observed.len()
+            || kvs
+                .iter()
+                .zip(observed.observed.iter())
+                .any(|(kv, (key, rev))| kv.key.as_ref() != key.as_ref() || kv.mod_revision != *rev)
+        {
             return Err(Error::Conflict);
         }
+        Ok(())
+    }
+
+    /// Validate `reads`, assign `MAX(revision) + 1` to `events`, and write
+    /// them. The caller holds the commit unit (cross-node lock) across this.
+    async fn commit_guarded(
+        &self,
+        reads: &ReadSet,
+        events: Vec<Event>,
+        staged: Revision,
+    ) -> Result<(Revision, Vec<Event>)> {
+        let mut seen: HashSet<&[u8]> = HashSet::new();
+        for (key, expected) in &reads.points {
+            if !seen.insert(key.as_ref()) {
+                continue;
+            }
+            let current = match self.live_row(key).await? {
+                Some(row) => Some(row_to_kv(&row)?.mod_revision),
+                None => None,
+            };
+            if current != *expected {
+                return Err(Error::Conflict);
+            }
+        }
+        for range in &reads.ranges {
+            self.check_range(range).await?;
+        }
+        let row = self.exec.query_row(&D::max_revision_sql(), vec![]).await?;
+        let fresh = match row {
+            Some(r) if !r.is_null(0) => r.get_int(0)?.max(1),
+            _ => 1,
+        } + 1;
         if events.is_empty() {
-            return Ok(());
+            return Ok((fresh - 1, events));
         }
         let last = self.exec.query_row(D::last_row_id_sql(), vec![]).await?;
         let mut id = match last {
@@ -198,7 +296,11 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
             }
             let (create, lease, version, value) = match &event.kv {
                 Some(kv) => (
-                    kv.create_revision,
+                    if kv.create_revision == staged {
+                        fresh
+                    } else {
+                        kv.create_revision
+                    },
                     kv.lease,
                     kv.version,
                     SqlValue::Bytes(kv.value.to_vec()),
@@ -210,7 +312,7 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
                 vec![
                     SqlValue::Int(id),
                     SqlValue::Str(name),
-                    SqlValue::Int(event.revision),
+                    SqlValue::Int(fresh),
                     SqlValue::Int(i64::from(event.deleted)),
                     SqlValue::Int(create),
                     SqlValue::Int(previous),
@@ -221,8 +323,20 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
             ));
         }
         self.exec.execute_batch(statements).await?;
-        let _ = self.tx.send(events);
-        Ok(())
+        let rebased = events
+            .into_iter()
+            .map(|mut event| {
+                event.revision = fresh;
+                if let Some(kv) = event.kv.as_mut() {
+                    kv.mod_revision = fresh;
+                    if kv.create_revision == staged {
+                        kv.create_revision = fresh;
+                    }
+                }
+                event
+            })
+            .collect();
+        Ok((fresh, rebased))
     }
 }
 
@@ -292,10 +406,9 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
     }
 
     async fn create(&self, key: Bytes, value: Bytes, lease: LeaseId) -> Result<Revision> {
-        let _guard = self.writes.lock().await;
-        if self.live_row(&key).await?.is_some() {
-            return Err(Error::KeyExists(key.to_vec()));
-        }
+        // Unconditional write: no guard reads, so concurrent commits to other
+        // keys never conflict. A rival create of the same key surfaces as a
+        // unique-constraint conflict; report it as already-exists.
         let base = self.current_rev_inner().await?;
         let revision = base + 1;
         let kv = KeyValue {
@@ -306,18 +419,28 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
             version: 1,
             lease,
         };
-        self.commit_inner(
-            base,
-            vec![Event {
-                revision,
-                key,
-                deleted: false,
-                kv: Some(kv),
-                prev_kv: None,
-            }],
-        )
-        .await?;
-        Ok(revision)
+        let dup = key.to_vec();
+        let reads = ReadSet {
+            points: vec![(key.clone(), None)],
+            ranges: Vec::new(),
+        };
+        match self
+            .commit(
+                reads,
+                vec![Event {
+                    revision,
+                    key,
+                    deleted: false,
+                    kv: Some(kv),
+                    prev_kv: None,
+                }],
+            )
+            .await
+        {
+            Ok(fresh) => Ok(fresh),
+            Err(Error::Conflict) => Err(Error::KeyExists(dup)),
+            Err(e) => Err(e),
+        }
     }
 
     async fn update(
@@ -327,7 +450,6 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
         expected_mod_revision: Revision,
         lease: LeaseId,
     ) -> Result<Revision> {
-        let _guard = self.writes.lock().await;
         let live = self.live_row(&key).await?;
         let Some(prev_row) = live else {
             return Err(Error::KeyExists(key.to_vec()));
@@ -346,8 +468,13 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
             version: prev.version + 1,
             lease,
         };
-        self.commit_inner(
-            base,
+        // Guard the observed predecessor: only this key can conflict us.
+        let reads = ReadSet {
+            points: vec![(key.clone(), Some(prev.mod_revision))],
+            ranges: Vec::new(),
+        };
+        self.commit(
+            reads,
             vec![Event {
                 revision,
                 key,
@@ -356,38 +483,55 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
                 prev_kv: Some(prev),
             }],
         )
-        .await?;
-        Ok(revision)
+        .await
     }
 
     async fn delete(&self, key: &[u8]) -> Result<(Revision, Option<KeyValue>)> {
-        let _guard = self.writes.lock().await;
-        let base = self.current_rev_inner().await?;
         let prev = match self.live_row(key).await? {
             Some(r) => Some(row_to_kv(&r)?),
             None => None,
         };
-        if prev.is_none() {
-            return Ok((base, None));
-        }
+        let Some(prev) = prev else {
+            return Ok((self.current_rev_inner().await?, None));
+        };
+        let base = self.current_rev_inner().await?;
         let revision = base + 1;
-        self.commit_inner(
-            base,
-            vec![Event {
-                revision,
-                key: Bytes::copy_from_slice(key),
-                deleted: true,
-                kv: None,
-                prev_kv: prev.clone(),
-            }],
-        )
-        .await?;
-        Ok((revision, prev))
+        let reads = ReadSet {
+            points: vec![(Bytes::copy_from_slice(key), Some(prev.mod_revision))],
+            ranges: Vec::new(),
+        };
+        let fresh = self
+            .commit(
+                reads,
+                vec![Event {
+                    revision,
+                    key: Bytes::copy_from_slice(key),
+                    deleted: true,
+                    kv: None,
+                    prev_kv: Some(prev.clone()),
+                }],
+            )
+            .await?;
+        Ok((fresh, Some(prev)))
     }
 
-    async fn commit(&self, base: Revision, events: Vec<Event>) -> Result<()> {
+    async fn commit(&self, reads: ReadSet, events: Vec<Event>) -> Result<Revision> {
         let _guard = self.writes.lock().await;
-        self.commit_inner(base, events).await
+        self.exec.begin_unit().await?;
+        let staged = events.first().map(|e| e.revision).unwrap_or(0);
+        match self.commit_guarded(&reads, events, staged).await {
+            Ok((fresh, rebased)) => {
+                self.exec.end_unit(true).await?;
+                if !rebased.is_empty() {
+                    let _ = self.tx.send(rebased);
+                }
+                Ok(fresh)
+            }
+            Err(e) => {
+                let _ = self.exec.end_unit(false).await;
+                Err(e)
+            }
+        }
     }
 
     async fn list(
@@ -404,39 +548,7 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
                 .await;
         }
         let _guard = self.writes.lock().await;
-        let cur = self.check_rev(opts.revision).await?;
-        let (mut sql, mut params) = match range_end {
-            None | Some([]) => (D::list_exact_sql(), vec![SqlValue::Str(key_str(prefix))]),
-            Some([0]) => (D::list_ge_sql(), vec![SqlValue::Str(key_str(prefix))]),
-            Some(end) => (
-                D::list_range_sql(),
-                vec![SqlValue::Str(key_str(prefix)), SqlValue::Str(key_str(end))],
-            ),
-        };
-        if opts.revision > 0 && opts.revision < cur {
-            sql = D::snapshot_sql(range_end);
-            params.push(SqlValue::Int(opts.revision));
-        }
-        let rows = self.exec.query_all(&sql, params).await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for r in &rows {
-            if r.get_str(1)? != D::compacted_rev_key() {
-                out.push(row_to_kv(r)?);
-            }
-        }
-        let count = out.len() as i64;
-        if opts.count_only {
-            return Ok((cur, Vec::new(), count));
-        }
-        if opts.limit > 0 && (out.len() as i64) > opts.limit {
-            out.truncate(opts.limit as usize);
-        }
-        if opts.keys_only {
-            for kv in &mut out {
-                kv.value = Bytes::new();
-            }
-        }
-        Ok((cur, out, count))
+        self.list_inner(prefix, range_end, &opts).await
     }
 
     async fn compact(&self, revision: Revision) -> Result<Revision> {

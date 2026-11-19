@@ -71,6 +71,22 @@ pub trait SqlExecutor: Send + Sync {
         }
         Ok(results)
     }
+
+    /// Open a commit unit: serialize writers across nodes until
+    /// [`end_unit`](Self::end_unit). Validation reads and batched writes issued
+    /// between the two run atomically. The default is a no-op (callers already
+    /// hold the process-local write mutex; single-node backends need nothing
+    /// more).
+    async fn begin_unit(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Close the commit unit opened by [`begin_unit`](Self::begin_unit).
+    /// `commit == true` makes the unit's writes durable, `false` rolls back
+    /// everything (including nothing, when validation rejected the batch).
+    async fn end_unit(&self, _commit: bool) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

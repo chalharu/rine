@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use rine_etcd::backend::{Backend, Event, KeyValue, ListOptions};
+use rine_etcd::backend::{Backend, Event, KeyValue, ListOptions, ReadSet};
 use rine_store_executor::{SqlExecutor, SqlValue};
 use rine_store_sqlite::{SqliteBackend, SqliteDb};
 
@@ -98,7 +98,11 @@ async fn sqlite_commit_rolls_back_after_database_error() {
     };
     // Both rows use the same (name, predecessor) unique key.
     let mut watch = b.subscribe();
-    assert!(b.commit(base, vec![event.clone(), event]).await.is_err());
+    assert!(
+        b.commit(ReadSet::default(), vec![event.clone(), event])
+            .await
+            .is_err()
+    );
     assert_eq!(b.current_revision().await, base);
     assert!(b.get(b"a", 0).await.unwrap().1.is_none());
     assert!(matches!(

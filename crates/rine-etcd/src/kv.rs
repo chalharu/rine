@@ -10,7 +10,7 @@ use bytes::Bytes;
 use tokio::sync::OwnedMutexGuard;
 
 use crate::{
-    backend::{Backend, Event, KeyValue, ListOptions, in_range},
+    backend::{Backend, Event, KeyValue, ListOptions, ObservedRange, ReadSet, in_range},
     error::Error,
     etcdserverpb::{
         CompactionRequest, CompactionResponse, Compare, DeleteRangeRequest, DeleteRangeResponse,
@@ -18,6 +18,7 @@ use crate::{
         ResponseOp, TxnRequest, TxnResponse,
         kv_server::Kv,
         range_request::{SortOrder, SortTarget},
+        response_op::Response,
     },
     lease::LeaseManager,
     mvccpb,
@@ -42,6 +43,7 @@ pub(crate) fn status_err(e: Error) -> tonic::Status {
 
 struct WriteBatch {
     base: i64,
+    reads: ReadSet,
     events: Vec<Event>,
 }
 
@@ -58,6 +60,56 @@ impl WriteBatch {
         }
         self.events.push(event);
         Ok(())
+    }
+
+    /// Record a single-key read at the base state. Only the first observation
+    /// of a key counts: later reads see this transaction's own staged writes.
+    fn record_point(&mut self, key: &[u8], observed: Option<i64>) {
+        if !self.reads.points.iter().any(|(k, _)| k.as_ref() == key) {
+            self.reads
+                .points
+                .push((Bytes::copy_from_slice(key), observed));
+        }
+    }
+
+    /// Record a range read at the base state (pre-overlay snapshot).
+    fn record_range(
+        &mut self,
+        key: &[u8],
+        end: Option<&[u8]>,
+        opts: &ListOptions,
+        kvs: &[KeyValue],
+        count: i64,
+    ) {
+        let descriptor = (key, end, opts.limit, opts.keys_only, opts.count_only);
+        let dup = self.reads.ranges.iter().any(|r| {
+            (
+                r.prefix.as_ref(),
+                r.range_end.as_deref(),
+                r.opts.limit,
+                r.opts.keys_only,
+                r.opts.count_only,
+            ) == (
+                descriptor.0,
+                descriptor.1,
+                descriptor.2,
+                descriptor.3,
+                descriptor.4,
+            )
+        });
+        if dup {
+            return;
+        }
+        self.reads.ranges.push(ObservedRange {
+            prefix: Bytes::copy_from_slice(key),
+            range_end: end.map(Bytes::copy_from_slice),
+            opts: opts.clone(),
+            observed: kvs
+                .iter()
+                .map(|kv| (kv.key.clone(), kv.mod_revision))
+                .collect(),
+            count,
+        });
     }
 }
 
@@ -92,13 +144,16 @@ impl KvService {
     async fn batch(&self) -> WriteBatch {
         WriteBatch {
             base: self.backend.current_revision().await,
+            reads: ReadSet::default(),
             events: Vec::new(),
         }
     }
 
-    async fn commit(&self, batch: WriteBatch, guard: OwnedMutexGuard<()>) -> Result<(), Error> {
+    /// Commit the batch and return the freshly assigned revision. Unrelated
+    /// concurrent commits never fail us: only our own read set is revalidated.
+    async fn commit(&self, batch: WriteBatch, guard: OwnedMutexGuard<()>) -> Result<i64, Error> {
         if batch.events.is_empty() {
-            return Ok(());
+            return Ok(self.backend.current_revision().await);
         }
         let changes: Vec<_> = batch
             .events
@@ -111,15 +166,15 @@ impl KvService {
             .collect();
         if changes.is_empty() && self.backend.commit_is_cancel_safe() {
             let _guard = guard;
-            return self.backend.commit(batch.base, batch.events).await;
+            return self.backend.commit(batch.reads, batch.events).await;
         }
         // Once the database commit starts, a dropped RPC must not interrupt
         // watch publication or lease bookkeeping.
         let backend = self.backend.clone();
         let leases = self.leases.clone();
-        let result = tokio::spawn(async move {
+        tokio::spawn(async move {
             let _guard = guard;
-            backend.commit(batch.base, batch.events).await?;
+            let fresh = backend.commit(batch.reads, batch.events).await?;
             for (key, old, new) in changes {
                 if old != 0 {
                     leases.detach(old, &key).await;
@@ -128,11 +183,43 @@ impl KvService {
                     leases.attach(new, key.to_vec()).await;
                 }
             }
-            Ok(())
+            Ok(fresh)
         })
         .await
-        .map_err(|error| Error::Backend(format!("commit task failed: {error}")))?;
-        result
+        .map_err(|error| Error::Backend(format!("commit task failed: {error}")))?
+    }
+
+    /// Rewrite staged (`base + 1`) header revisions with the assigned one.
+    fn retarget(op: &mut ResponseOp, revision: i64) {
+        let response = match op.response.as_mut() {
+            Some(r) => r,
+            None => return,
+        };
+        match response {
+            Response::ResponseRange(r) => {
+                if let Some(h) = r.header.as_mut() {
+                    h.revision = revision;
+                }
+            }
+            Response::ResponsePut(r) => {
+                if let Some(h) = r.header.as_mut() {
+                    h.revision = revision;
+                }
+            }
+            Response::ResponseDeleteRange(r) => {
+                if let Some(h) = r.header.as_mut() {
+                    h.revision = revision;
+                }
+            }
+            Response::ResponseTxn(t) => {
+                if let Some(h) = t.header.as_mut() {
+                    h.revision = revision;
+                }
+                for inner in &mut t.responses {
+                    Self::retarget(inner, revision);
+                }
+            }
+        }
     }
 
     async fn list(
@@ -140,21 +227,26 @@ impl KvService {
         key: &[u8],
         end: &[u8],
         revision: i64,
-        batch: Option<&WriteBatch>,
+        mut batch: Option<&mut WriteBatch>,
     ) -> Result<(i64, Vec<KeyValue>), tonic::Status> {
         let end = (!end.is_empty()).then_some(end);
-        let (rev, kvs, _) = self
+        let opts = ListOptions {
+            revision,
+            ..Default::default()
+        };
+        let (rev, kvs, count) = self
             .backend
-            .list(
-                key,
-                end,
-                ListOptions {
-                    revision,
-                    ..Default::default()
-                },
-            )
+            .list(key, end, opts.clone())
             .await
             .map_err(status_err)?;
+        if revision <= 0
+            && let Some(batch) = batch.as_mut()
+        {
+            match end {
+                None => batch.record_point(key, kvs.first().map(|kv| kv.mod_revision)),
+                Some(end) => batch.record_range(key, Some(end), &opts, &kvs, count),
+            }
+        }
         if let Some(batch) = batch.filter(|batch| revision <= 0 && !batch.events.is_empty()) {
             let mut kvs: BTreeMap<_, _> = kvs.into_iter().map(|kv| (kv.key.clone(), kv)).collect();
             for event in batch.events.iter().filter(|e| in_range(&e.key, key, end)) {
@@ -173,7 +265,7 @@ impl KvService {
     async fn do_range(
         &self,
         req: &RangeRequest,
-        batch: Option<&WriteBatch>,
+        mut batch: Option<&mut WriteBatch>,
     ) -> Result<RangeResponse, tonic::Status> {
         if req.key.is_empty() {
             return Err(tonic::Status::invalid_argument(
@@ -190,7 +282,9 @@ impl KvService {
                 "etcdserver: invalid sort target",
             ));
         }
-        let overlay = batch.is_some_and(|b| req.revision <= 0 && !b.events.is_empty());
+        let overlay = batch
+            .as_ref()
+            .is_some_and(|b| req.revision <= 0 && !b.events.is_empty());
         let filtered = req.min_mod_revision != 0
             || req.max_mod_revision != 0
             || req.min_create_revision != 0
@@ -199,20 +293,26 @@ impl KvService {
             || (req.sort_order == SortOrder::Ascend as i32
                 && req.sort_target == SortTarget::Key as i32);
         if !overlay && !filtered && (key_order || req.count_only) {
+            let end = (!req.range_end.is_empty()).then_some(req.range_end.as_slice());
+            let opts = ListOptions {
+                revision: req.revision,
+                limit: req.limit,
+                keys_only: req.keys_only,
+                count_only: req.count_only,
+            };
             let (rev, kvs, count) = self
                 .backend
-                .list(
-                    &req.key,
-                    (!req.range_end.is_empty()).then_some(req.range_end.as_slice()),
-                    ListOptions {
-                        revision: req.revision,
-                        limit: req.limit,
-                        keys_only: req.keys_only,
-                        count_only: req.count_only,
-                    },
-                )
+                .list(&req.key, end, opts.clone())
                 .await
                 .map_err(status_err)?;
+            if req.revision <= 0
+                && let Some(batch) = batch.as_mut()
+            {
+                match end {
+                    None => batch.record_point(&req.key, kvs.first().map(|kv| kv.mod_revision)),
+                    Some(end) => batch.record_range(&req.key, Some(end), &opts, &kvs, count),
+                }
+            }
             return Ok(RangeResponse {
                 header: Some(self.header(rev)),
                 kvs: kvs.into_iter().map(to_proto_kv).collect(),
@@ -352,7 +452,11 @@ impl KvService {
         })
     }
 
-    async fn eval_compare(&self, c: &Compare, batch: &WriteBatch) -> Result<bool, tonic::Status> {
+    async fn eval_compare(
+        &self,
+        c: &Compare,
+        batch: &mut WriteBatch,
+    ) -> Result<bool, tonic::Status> {
         use crate::etcdserverpb::compare::{CompareResult, CompareTarget, TargetUnion};
         let result = CompareResult::try_from(c.result)
             .map_err(|_| tonic::Status::invalid_argument("etcdserver: bad compare result"))?;
@@ -530,8 +634,11 @@ impl Kv for KvService {
     ) -> Result<tonic::Response<PutResponse>, tonic::Status> {
         let guard = self.leases.writes.clone().lock_owned().await;
         let mut batch = self.batch().await;
-        let response = self.do_put(&request.into_inner(), &mut batch).await?;
-        self.commit(batch, guard).await.map_err(status_err)?;
+        let mut response = self.do_put(&request.into_inner(), &mut batch).await?;
+        let fresh = self.commit(batch, guard).await.map_err(status_err)?;
+        if let Some(h) = response.header.as_mut() {
+            h.revision = fresh;
+        }
         Ok(tonic::Response::new(response))
     }
 
@@ -541,8 +648,11 @@ impl Kv for KvService {
     ) -> Result<tonic::Response<DeleteRangeResponse>, tonic::Status> {
         let guard = self.leases.writes.clone().lock_owned().await;
         let mut batch = self.batch().await;
-        let response = self.do_delete(&request.into_inner(), &mut batch).await?;
-        self.commit(batch, guard).await.map_err(status_err)?;
+        let mut response = self.do_delete(&request.into_inner(), &mut batch).await?;
+        let fresh = self.commit(batch, guard).await.map_err(status_err)?;
+        if let Some(h) = response.header.as_mut() {
+            h.revision = fresh;
+        }
         Ok(tonic::Response::new(response))
     }
 
@@ -553,11 +663,19 @@ impl Kv for KvService {
         let guard = self.leases.writes.clone().lock_owned().await;
         let req = request.into_inner();
         let mut batch = self.batch().await;
-        let response = self.do_txn(&req, 0, &mut batch).await?;
+        let mut response = self.do_txn(&req, 0, &mut batch).await?;
         match self.commit(batch, guard).await {
-            Ok(()) => Ok(tonic::Response::new(response)),
+            Ok(fresh) => {
+                if let Some(h) = response.header.as_mut() {
+                    h.revision = fresh;
+                }
+                for op in &mut response.responses {
+                    Self::retarget(op, fresh);
+                }
+                Ok(tonic::Response::new(response))
+            }
             Err(Error::Conflict) => {
-                // Another writer committed under us. etcd reports this as a
+                // A guarded key moved under us. etcd reports this as a
                 // transaction conflict (succeeded=false), not an error: the
                 // staged success-branch writes were rolled back, so run the
                 // failure branch against the new state instead.
@@ -567,10 +685,12 @@ impl Kv for KvService {
                 for op in &req.failure {
                     responses.push(self.apply_op(op, 0, &mut retry).await?);
                 }
-                let revision = self.backend.current_revision().await;
-                self.commit(retry, guard).await.map_err(status_err)?;
+                let fresh = self.commit(retry, guard).await.map_err(status_err)?;
+                for op in &mut responses {
+                    Self::retarget(op, fresh);
+                }
                 Ok(tonic::Response::new(TxnResponse {
-                    header: Some(self.header(revision)),
+                    header: Some(self.header(fresh)),
                     succeeded: false,
                     responses,
                 }))

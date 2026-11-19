@@ -12,7 +12,7 @@ use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use rine_etcd::{
-    backend::{Backend, ListOptions},
+    backend::{Backend, ListOptions, ReadSet},
     error::Error,
 };
 use rine_store_executor::{SqlExecutor as _, SqlValue};
@@ -196,11 +196,11 @@ async fn live_read_after_recreate() {
     }
 }
 
-/// A commit against a base the storage has moved past is an optimistic
-/// concurrency conflict, even when the batch itself is empty. Zero writes:
-/// safe to run in parallel with the other live tests on the same table.
+/// A commit guarding a key that moved is an optimistic concurrency conflict,
+/// even when the batch itself is empty. Uses an isolated key; safe to run in
+/// parallel with the other live tests on the same table.
 #[tokio::test]
-async fn live_stale_base_commit_is_conflict() {
+async fn live_stale_point_read_is_conflict() {
     if !live_enabled() {
         eprintln!("skipping live OracleBackend test (RINE_LIVE_ORACLE != 1)");
         return;
@@ -208,9 +208,36 @@ async fn live_stale_base_commit_is_conflict() {
     let db = connect_retry().await;
     let backend = OracleBackend::new(Arc::new(db));
     backend.ensure_schema().await.expect("ensure_schema");
-    let cur = backend.current_revision().await;
-    assert!(cur >= 1);
-    let err = backend.commit(0, vec![]).await.unwrap_err();
+    let key = Bytes::from(format!("rine-live-guard-{}", std::process::id()));
+    // Absent-key guard passes, then fails once the key is created elsewhere.
+    let missing = ReadSet {
+        points: vec![(key.clone(), None)],
+        ranges: Vec::new(),
+    };
+    backend
+        .commit(missing.clone(), vec![])
+        .await
+        .expect("absent guard");
+    backend
+        .create(key.clone(), Bytes::from("v"), 0)
+        .await
+        .expect("create");
+    let err = backend.commit(missing, vec![]).await.unwrap_err();
     assert!(matches!(err, Error::Conflict));
-    backend.commit(cur, vec![]).await.expect("fresh base");
+    // The live row's guard passes, then fails after an update.
+    let (_, kv) = backend.get(&key, 0).await.expect("get");
+    let live = ReadSet {
+        points: vec![(key.clone(), kv.map(|kv| kv.mod_revision))],
+        ranges: Vec::new(),
+    };
+    backend
+        .commit(live.clone(), vec![])
+        .await
+        .expect("live guard");
+    backend
+        .update(key.clone(), Bytes::from("v2"), 0, 0)
+        .await
+        .expect("update");
+    let err = backend.commit(live, vec![]).await.unwrap_err();
+    assert!(matches!(err, Error::Conflict));
 }

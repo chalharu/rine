@@ -47,6 +47,34 @@ pub struct ListOptions {
     pub count_only: bool,
 }
 
+/// Point and range reads a transaction observed at its base state.
+///
+/// `commit` revalidates these under the database commit lock and rejects the
+/// batch with [`crate::error::Error::Conflict`] when any of them moved.
+/// Reads performed to fetch a write predecessor (unconditional `Put`/`Delete`)
+/// are deliberately *not* recorded: they are rebased onto the newest state
+/// instead of conflicting.
+#[derive(Debug, Clone, Default)]
+pub struct ReadSet {
+    /// Single-key reads: key plus the observed live `mod_revision`
+    /// (`None` when the key was absent). First observation wins.
+    pub points: Vec<(Bytes, Option<Revision>)>,
+    /// Range reads with the backend-level result snapshot.
+    pub ranges: Vec<ObservedRange>,
+}
+
+/// One backend-level range read inside a transaction.
+#[derive(Debug, Clone)]
+pub struct ObservedRange {
+    pub prefix: Bytes,
+    pub range_end: Option<Bytes>,
+    pub opts: ListOptions,
+    /// Backend-level rows before any overlay, in returned order.
+    pub observed: Vec<(Bytes, Revision)>,
+    /// Full count before limiting.
+    pub count: i64,
+}
+
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
     async fn current_revision(&self) -> Revision;
@@ -64,9 +92,13 @@ pub trait Backend: Send + Sync + 'static {
         lease: LeaseId,
     ) -> Result<Revision>;
     async fn delete(&self, key: &[u8]) -> Result<(Revision, Option<KeyValue>)>;
-    /// Atomically store and publish a batch of events at `base + 1`.
-    /// Reject the batch if the current revision is no longer `base`.
-    async fn commit(&self, base: Revision, events: Vec<Event>) -> Result<()>;
+    /// Validate `reads` under the commit lock, then store and publish `events`
+    /// at a freshly assigned revision (`MAX(revision) + 1`). Returns that new
+    /// revision so callers can rewrite response headers staged at `base + 1`.
+    /// A moved read is an optimistic-concurrency conflict, never a backend
+    /// error. An empty `events` batch still validates `reads` and returns the
+    /// current revision.
+    async fn commit(&self, reads: ReadSet, events: Vec<Event>) -> Result<Revision>;
     /// Dropping `commit` can never leave storage or watch publication incomplete.
     fn commit_is_cancel_safe(&self) -> bool {
         false

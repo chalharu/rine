@@ -82,23 +82,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_rejects_stale_base() {
-        use rine_etcd::error::Error;
+    async fn commit_validates_point_reads_per_key() {
+        use rine_etcd::{backend::ReadSet, error::Error};
 
         let b = backend();
         b.ensure_schema().await.unwrap();
-        let cur = b.current_revision().await;
-        assert!(cur >= 1);
-        // No writes involved: a base the storage has moved past is rejected.
-        let err = b.commit(0, vec![]).await.unwrap_err();
+        // Unrelated writes never conflict: an empty read set commits cleanly
+        // no matter how far the revision moved.
+        let r1 = b.commit(ReadSet::default(), vec![]).await.unwrap();
+        b.create(Bytes::from("other"), Bytes::from("v"), 0)
+            .await
+            .unwrap();
+        b.commit(ReadSet::default(), vec![]).await.unwrap();
+
+        // A guarded key that moved is a conflict.
+        let (_, kv) = b.get(b"other", 0).await.unwrap();
+        let guard = ReadSet {
+            points: vec![(Bytes::from("other"), kv.map(|kv| kv.mod_revision))],
+            ranges: Vec::new(),
+        };
+        b.commit(guard.clone(), vec![]).await.unwrap();
+        b.update(Bytes::from("other"), Bytes::from("v2"), 0, 0)
+            .await
+            .unwrap();
+        let err = b.commit(guard, vec![]).await.unwrap_err();
         assert!(matches!(err, Error::Conflict));
-        b.commit(cur, vec![]).await.unwrap();
+        // Absent-key guards work the same way.
+        let missing = ReadSet {
+            points: vec![(Bytes::from("gone"), None)],
+            ranges: Vec::new(),
+        };
+        b.commit(missing.clone(), vec![]).await.unwrap();
+        b.create(Bytes::from("gone"), Bytes::from("v"), 0)
+            .await
+            .unwrap();
+        let err = b.commit(missing, vec![]).await.unwrap_err();
+        assert!(matches!(err, Error::Conflict));
+        let _ = r1;
     }
 
     #[tokio::test]
     async fn commit_duplicate_events_conflict_atomically() {
         use rine_etcd::{
-            backend::{Event, KeyValue},
+            backend::{Event, KeyValue, ReadSet},
             error::Error,
         };
 
@@ -121,7 +147,10 @@ mod tests {
         };
         // Same key twice in one batch violates the (name, prev_revision)
         // unique index on the second row.
-        let err = b.commit(cur, vec![put(), put()]).await.unwrap_err();
+        let err = b
+            .commit(ReadSet::default(), vec![put(), put()])
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::Conflict));
         // The failed batch left nothing behind.
         assert!(b.get(b"k", 0).await.unwrap().1.is_none());

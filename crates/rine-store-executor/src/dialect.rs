@@ -34,6 +34,12 @@ pub trait Dialect: Send + Sync + 'static {
     fn bind(index: usize) -> String;
     fn first_row() -> &'static str;
 
+    /// Highest assigned logical revision. Revision assignment reads this under
+    /// the commit lock, so concurrent nodes never hand out the same revision.
+    fn max_revision_sql() -> String {
+        format!("SELECT MAX({}) FROM rine", Self::logical_revision())
+    }
+
     // Older rows used the physical ID as their revision and left `created` zero.
     fn logical_revision() -> &'static str {
         "CASE WHEN created > 0 THEN created ELSE id END"

@@ -16,7 +16,9 @@ use bytes::Bytes;
 use tokio::sync::{RwLock, broadcast};
 
 use crate::{
-    backend::{Backend, Event, KeyValue, LeaseId, ListOptions, Revision, in_range},
+    backend::{
+        Backend, Event, KeyValue, LeaseId, ListOptions, ObservedRange, ReadSet, Revision, in_range,
+    },
     error::{Error, Result},
 };
 
@@ -67,6 +69,110 @@ impl MemoryBackend {
     fn publish(g: &mut Inner, tx: &broadcast::Sender<Vec<Event>>, events: Vec<Event>) {
         g.history[g.rev as usize].extend(events.iter().cloned());
         let _ = tx.send(events);
+    }
+
+    fn check_range(g: &Inner, range: &ObservedRange) -> Result<()> {
+        let mut opts = range.opts.clone();
+        opts.revision = 0;
+        let (_, kvs, count) =
+            Self::list_locked(g, &range.prefix, range.range_end.as_deref(), opts)?;
+        if count != range.count
+            || kvs.len() != range.observed.len()
+            || kvs
+                .iter()
+                .zip(range.observed.iter())
+                .any(|(kv, (key, rev))| kv.key.as_ref() != key.as_ref() || kv.mod_revision != *rev)
+        {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn list_locked(
+        g: &Inner,
+        prefix: &[u8],
+        range_end: Option<&[u8]>,
+        opts: ListOptions,
+    ) -> Result<(Revision, Vec<KeyValue>, i64)> {
+        if opts.revision > 0 && opts.revision < g.compact_rev {
+            return Err(Error::Compacted {
+                requested: opts.revision,
+                compacted: g.compact_rev,
+            });
+        }
+        let rev = g.rev;
+        if opts.revision > rev {
+            return Err(Error::FutureRev {
+                requested: opts.revision,
+                current: rev,
+            });
+        }
+        let upper = match range_end {
+            None | Some([]) => Included(prefix),
+            Some([0]) => Unbounded,
+            Some(end) if end > prefix => Excluded(end),
+            Some(_) => return Ok((rev, Vec::new(), 0)),
+        };
+        let bounds = (Included(prefix), upper);
+        let mut snapshot = BTreeMap::new();
+        let values = if opts.revision <= 0 || opts.revision == rev {
+            &g.kvs
+        } else {
+            snapshot.extend(
+                g.compacted
+                    .range::<[u8], _>(bounds)
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+            for events in &g.history[(g.compact_rev + 1) as usize..=opts.revision as usize] {
+                for event in events
+                    .iter()
+                    .filter(|e| in_range(&e.key, prefix, range_end))
+                {
+                    if let Some(kv) = &event.kv {
+                        snapshot.insert(event.key.clone(), kv.clone());
+                    } else {
+                        snapshot.remove(event.key.as_ref());
+                    }
+                }
+            }
+            &snapshot
+        };
+        let project = |kv: &KeyValue| {
+            if opts.keys_only {
+                KeyValue {
+                    value: Bytes::new(),
+                    ..kv.clone()
+                }
+            } else {
+                kv.clone()
+            }
+        };
+        if matches!(range_end, None | Some([])) {
+            let kv = values.get(prefix);
+            let out = if opts.count_only {
+                Vec::new()
+            } else {
+                kv.into_iter().map(project).collect()
+            };
+            return Ok((rev, out, i64::from(kv.is_some())));
+        }
+        let mut rows = values.range::<[u8], _>(bounds);
+        if opts.count_only {
+            return Ok((rev, Vec::new(), rows.count() as i64));
+        }
+        let limit = if opts.limit > 0 {
+            usize::try_from(opts.limit).unwrap_or(usize::MAX)
+        } else {
+            usize::MAX
+        };
+        let out: Vec<_> = rows
+            .by_ref()
+            .take(limit)
+            .map(|(_, kv)| project(kv))
+            .collect();
+        let count = (out.len() + rows.count()) as i64;
+        Ok((rev, out, count))
     }
 }
 
@@ -206,23 +312,42 @@ impl Backend for MemoryBackend {
         Ok((r, prev))
     }
 
-    async fn commit(&self, base: Revision, events: Vec<Event>) -> Result<()> {
+    async fn commit(&self, reads: ReadSet, events: Vec<Event>) -> Result<Revision> {
         let mut g = self.inner.write().await;
-        if g.rev != base {
-            return Err(Error::Conflict);
-        }
-        if !events.is_empty() {
-            Self::next_rev(&mut g);
-            for event in &events {
-                if let Some(kv) = &event.kv {
-                    g.kvs.insert(event.key.clone(), kv.clone());
-                } else {
-                    g.kvs.remove(event.key.as_ref());
-                }
+        for (key, expected) in &reads.points {
+            let current = g.kvs.get(key.as_ref()).map(|kv| kv.mod_revision);
+            if current != *expected {
+                return Err(Error::Conflict);
             }
-            Self::publish(&mut g, &self.tx, events);
         }
-        Ok(())
+        for range in &reads.ranges {
+            Self::check_range(&g, range)?;
+        }
+        if events.is_empty() {
+            return Ok(g.rev);
+        }
+        let fresh = g.rev + 1;
+        let staged = events.first().map(|e| e.revision).unwrap_or(fresh);
+        let mut rebased = Vec::with_capacity(events.len());
+        for mut event in events {
+            event.revision = fresh;
+            if let Some(kv) = event.kv.as_mut() {
+                kv.mod_revision = fresh;
+                if kv.create_revision == staged {
+                    kv.create_revision = fresh;
+                }
+                g.kvs.insert(event.key.clone(), kv.clone());
+            } else {
+                g.kvs.remove(event.key.as_ref());
+            }
+            rebased.push(event);
+        }
+        g.rev = fresh;
+        if g.history.len() <= fresh as usize {
+            g.history.resize(fresh as usize + 1, Vec::new());
+        }
+        Self::publish(&mut g, &self.tx, rebased.clone());
+        Ok(fresh)
     }
 
     fn commit_is_cancel_safe(&self) -> bool {
@@ -236,84 +361,7 @@ impl Backend for MemoryBackend {
         opts: ListOptions,
     ) -> Result<(Revision, Vec<KeyValue>, i64)> {
         let g = self.inner.read().await;
-        if opts.revision > 0 && opts.revision < g.compact_rev {
-            return Err(Error::Compacted {
-                requested: opts.revision,
-                compacted: g.compact_rev,
-            });
-        }
-        let rev = g.rev;
-        if opts.revision > rev {
-            return Err(Error::FutureRev {
-                requested: opts.revision,
-                current: rev,
-            });
-        }
-        let upper = match range_end {
-            None | Some([]) => Included(prefix),
-            Some([0]) => Unbounded,
-            Some(end) if end > prefix => Excluded(end),
-            Some(_) => return Ok((rev, Vec::new(), 0)),
-        };
-        let bounds = (Included(prefix), upper);
-        let mut snapshot = BTreeMap::new();
-        let values = if opts.revision <= 0 || opts.revision == rev {
-            &g.kvs
-        } else {
-            snapshot.extend(
-                g.compacted
-                    .range::<[u8], _>(bounds)
-                    .map(|(k, v)| (k.clone(), v.clone())),
-            );
-            for events in &g.history[(g.compact_rev + 1) as usize..=opts.revision as usize] {
-                for event in events
-                    .iter()
-                    .filter(|e| in_range(&e.key, prefix, range_end))
-                {
-                    if let Some(kv) = &event.kv {
-                        snapshot.insert(event.key.clone(), kv.clone());
-                    } else {
-                        snapshot.remove(event.key.as_ref());
-                    }
-                }
-            }
-            &snapshot
-        };
-        let project = |kv: &KeyValue| {
-            if opts.keys_only {
-                KeyValue {
-                    value: Bytes::new(),
-                    ..kv.clone()
-                }
-            } else {
-                kv.clone()
-            }
-        };
-        if matches!(range_end, None | Some([])) {
-            let kv = values.get(prefix);
-            let out = if opts.count_only {
-                Vec::new()
-            } else {
-                kv.into_iter().map(project).collect()
-            };
-            return Ok((rev, out, i64::from(kv.is_some())));
-        }
-        let mut rows = values.range::<[u8], _>(bounds);
-        if opts.count_only {
-            return Ok((rev, Vec::new(), rows.count() as i64));
-        }
-        let limit = if opts.limit > 0 {
-            usize::try_from(opts.limit).unwrap_or(usize::MAX)
-        } else {
-            usize::MAX
-        };
-        let out: Vec<_> = rows
-            .by_ref()
-            .take(limit)
-            .map(|(_, kv)| project(kv))
-            .collect();
-        let count = (out.len() + rows.count()) as i64;
-        Ok((rev, out, count))
+        Self::list_locked(&g, prefix, range_end, opts)
     }
 
     async fn compact(&self, revision: Revision) -> Result<Revision> {

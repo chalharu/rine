@@ -259,6 +259,12 @@ impl SqlExecutor for MockExec {
                 values: vec![SqlValue::Int(m)],
             }));
         }
+        if sql == OracleDialect::max_revision_sql() {
+            let max = rows.iter().map(MockRow::revision).max();
+            return Ok(max.map(|m| Row {
+                values: vec![SqlValue::Int(m)],
+            }));
+        }
         if sql == OracleDialect::last_row_id_sql() {
             return Ok(rows.iter().map(|r| r.id).max().map(|id| Row {
                 values: vec![SqlValue::Int(id)],

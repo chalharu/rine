@@ -9,7 +9,10 @@
 //! `Bytes` -> BLOB, `Null` -> typed BLOB NULL (the only NULL bind the backend
 //! emits is the tombstone `value`).
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use async_trait::async_trait;
 use oracledb::ToDbValue;
@@ -27,6 +30,7 @@ use rine_store_executor::{Dialect, Row, SqlExecutor, SqlValue};
 #[derive(Clone, Debug)]
 pub struct OracleDb {
     conn: Arc<Mutex<oracledb::Connection>>,
+    in_unit: Arc<AtomicBool>,
 }
 
 impl OracleDb {
@@ -50,6 +54,7 @@ impl OracleDb {
         let conn = oracledb::connect(config)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            in_unit: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -143,6 +148,20 @@ fn is_no_data(e: &oracledb::Error) -> bool {
 #[async_trait]
 impl SqlExecutor for OracleDb {
     async fn execute_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
+        if self.in_unit.load(Ordering::SeqCst) {
+            // Inside a commit unit the table lock serializes writers; the
+            // unit boundary commits, so statements must not commit one by one.
+            return self
+                .run_blocking(move |conn| {
+                    for (sql, params) in statements {
+                        let owned: Vec<_> = params.iter().map(OwnedParam::from).collect();
+                        let refs: Vec<_> = owned.iter().map(as_bind).collect();
+                        conn.execute(&sql, &refs)?;
+                    }
+                    Ok(())
+                })
+                .await;
+        }
         self.run_blocking(move |conn| {
             let result = (|| {
                 for (sql, params) in statements {
@@ -161,6 +180,16 @@ impl SqlExecutor for OracleDb {
     }
 
     async fn execute(&self, sql: &str, params: Vec<SqlValue>) -> Result<u64> {
+        if self.in_unit.load(Ordering::SeqCst) {
+            let sql = sql.to_string();
+            return self
+                .run_blocking(move |conn| {
+                    let owned: Vec<OwnedParam> = params.iter().map(OwnedParam::from).collect();
+                    let refs: Vec<&dyn ToDbValue> = owned.iter().map(as_bind).collect();
+                    Ok(conn.execute(&sql, &refs)?.rows_affected())
+                })
+                .await;
+        }
         let sql = sql.to_string();
         self.run_blocking(move |conn| {
             let owned: Vec<OwnedParam> = params.iter().map(OwnedParam::from).collect();
@@ -201,5 +230,37 @@ impl SqlExecutor for OracleDb {
             Ok(out)
         })
         .await
+    }
+
+    /// Serialize writers across nodes: `LOCK TABLE ... IN EXCLUSIVE MODE`
+    /// blocks rival commits (readers keep working) until the unit commits or
+    /// rolls back. The flag also suspends per-statement auto-commit above.
+    async fn begin_unit(&self) -> Result<()> {
+        self.in_unit.store(true, Ordering::SeqCst);
+        let r = self
+            .run_blocking(|conn| {
+                let refs: Vec<&dyn ToDbValue> = Vec::new();
+                conn.execute("LOCK TABLE rine IN EXCLUSIVE MODE", &refs)?;
+                Ok(())
+            })
+            .await;
+        if r.is_err() {
+            self.in_unit.store(false, Ordering::SeqCst);
+        }
+        r
+    }
+
+    async fn end_unit(&self, commit: bool) -> Result<()> {
+        let r = self
+            .run_blocking(move |conn| {
+                if commit {
+                    conn.commit()
+                } else {
+                    conn.rollback()
+                }
+            })
+            .await;
+        self.in_unit.store(false, Ordering::SeqCst);
+        r
     }
 }
