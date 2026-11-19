@@ -2,6 +2,7 @@
 members = [
   "crates/rine",
   "crates/rine-etcd",
+  "crates/rine-store-conformance",
   "crates/rine-store-executor",
   "crates/rine-store-oracle",
   "crates/rine-store-sqlite",
@@ -26,6 +27,7 @@ protoc-bin-vendored = "=3.3.0"
 rcgen = "=0.14.10"
 rine = { path = "crates/rine" }
 rine-etcd = { path = "crates/rine-etcd" }
+rine-store-conformance = { path = "crates/rine-store-conformance" }
 rine-store-executor = { path = "crates/rine-store-executor" }
 rine-store-oracle = { path = "crates/rine-store-oracle" }
 rine-store-sqlite = { path = "crates/rine-store-sqlite" }

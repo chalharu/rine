@@ -19,5 +19,6 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+rine-store-conformance.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true

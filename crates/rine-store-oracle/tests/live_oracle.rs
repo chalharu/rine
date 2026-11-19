@@ -12,9 +12,10 @@ use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use rine_etcd::{
-    backend::{Backend, ListOptions, ReadSet},
+    backend::{Backend, ReadSet},
     error::Error,
 };
+use rine_store_conformance::{crud, history_compact_events};
 use rine_store_executor::{SqlExecutor as _, SqlValue};
 use rine_store_oracle::{OracleBackend, OracleDb};
 
@@ -70,68 +71,9 @@ async fn live_backend_crud_and_compact() {
     // Creation path: table was just dropped, so this builds the schema.
     backend.ensure_schema().await.expect("ensure_schema");
 
-    // --- CRUD (mirrors the MockExec sql_crud test) ---
-    let r1 = backend
-        .create(Bytes::from("live/a"), Bytes::from("1"), 0)
-        .await
-        .expect("create");
-    assert!(
-        backend
-            .create(Bytes::from("live/a"), Bytes::from("x"), 0)
-            .await
-            .is_err()
-    );
-    let (_, kv) = backend.get(b"live/a", 0).await.expect("get");
-    assert_eq!(kv.expect("kv present").value, Bytes::from("1"));
-
-    backend
-        .update(Bytes::from("live/a"), Bytes::from("2"), 0, 0)
-        .await
-        .expect("update");
-    let (_, kvs, count) = backend
-        .list(b"live/a", None, ListOptions::default())
-        .await
-        .expect("list");
-    assert_eq!(count, 1);
-    assert_eq!(kvs[0].version, 2);
-    assert_eq!(kvs[0].create_revision, r1);
-
-    backend.delete(b"live/a").await.expect("delete");
-    assert!(
-        backend
-            .get(b"live/a", 0)
-            .await
-            .expect("get after delete")
-            .1
-            .is_none()
-    );
-
-    // --- history + compact ---
-    backend
-        .create(Bytes::from("live/k"), Bytes::from("v1"), 0)
-        .await
-        .expect("create k");
-    let r2 = backend
-        .update(Bytes::from("live/k"), Bytes::from("v2"), 0, 0)
-        .await
-        .expect("update k");
-    let (_, kv) = backend
-        .get(b"live/k", r2 - 1)
-        .await
-        .expect("historical get");
-    assert_eq!(kv.expect("old kv").value, Bytes::from("v1"));
-    let evs = backend.events(r2 - 1, r2).await.expect("events");
-    assert_eq!(evs.len(), 2);
-    backend.compact(r2).await.expect("compact");
-    assert!(
-        backend.get(b"live/k", r2 - 1).await.is_err(),
-        "compacted rev must error"
-    );
-    let (_, kv) = backend
-        .get(b"live/k", 0)
-        .await
-        .expect("live get after compact");
-    assert_eq!(kv.expect("live kv").value, Bytes::from("v2"));
+    // --- CRUD + history + compact (shared conformance suite) ---
+    crud(&backend, "live").await;
+    history_compact_events(&backend, "live").await;
 
     assert!(backend.db_size().await >= 0);
 }

@@ -1,12 +1,14 @@
-//! `SqliteBackend` contract tests on an in-memory database.
-//!
-//! Mirrors the MockExec-backed unit tests and the live Oracle test, so the
-//! shared `SqlBackend` logic is validated against a real database locally.
+//! `SqliteBackend` integration tests on a real (in-memory) database:
+//! backend-specific behavior plus the shared conformance suite.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
-use rine_etcd::backend::{Backend, Event, KeyValue, ListOptions, ReadSet};
+use rine_etcd::backend::{Backend, ListOptions};
+use rine_store_conformance::{
+    commit_duplicate_events_conflict_atomically, commit_guards_per_key, crud,
+    history_compact_events, watch_stream,
+};
 use rine_store_executor::{SqlExecutor, SqlValue};
 use rine_store_sqlite::{SqliteBackend, SqliteDb};
 
@@ -18,50 +20,30 @@ async fn backend() -> SqliteBackend {
 }
 
 #[tokio::test]
-async fn sqlite_crud() {
-    let b = backend().await;
-    let r1 = b
-        .create(Bytes::from("a"), Bytes::from("1"), 0)
-        .await
-        .unwrap();
-    assert!(
-        b.create(Bytes::from("a"), Bytes::from("x"), 0)
-            .await
-            .is_err()
-    );
-    let (_, kv) = b.get(b"a", 0).await.unwrap();
-    assert_eq!(kv.unwrap().value, Bytes::from("1"));
-    b.update(Bytes::from("a"), Bytes::from("2"), 0, 0)
-        .await
-        .unwrap();
-    let (_, kvs, count) = b.list(b"a", None, ListOptions::default()).await.unwrap();
-    assert_eq!(count, 1);
-    assert_eq!(kvs[0].version, 2);
-    assert_eq!(kvs[0].create_revision, r1);
-    b.delete(b"a").await.unwrap();
-    assert!(b.get(b"a", 0).await.unwrap().1.is_none());
+async fn conformance_crud() {
+    crud(&backend().await, "t").await;
 }
 
 #[tokio::test]
-async fn sqlite_history_compact_events() {
+async fn conformance_history_compact_events() {
     let b = backend().await;
-    b.create(Bytes::from("k"), Bytes::from("v1"), 0)
-        .await
-        .unwrap();
-    let r2 = b
-        .update(Bytes::from("k"), Bytes::from("v2"), 0, 0)
-        .await
-        .unwrap();
-    let (_, kv) = b.get(b"k", r2 - 1).await.unwrap();
-    assert_eq!(kv.unwrap().value, Bytes::from("v1"));
-    let evs = b.events(r2 - 1, r2).await.unwrap();
-    assert_eq!(evs.len(), 2);
-    b.compact(r2).await.unwrap();
-    assert!(b.get(b"k", r2 - 1).await.is_err());
-    let (_, kv) = b.get(b"k", 0).await.unwrap();
-    assert_eq!(kv.unwrap().value, Bytes::from("v2"));
-    assert!(b.events(r2 - 1, r2).await.is_err());
+    history_compact_events(&b, "t").await;
     assert!(b.db_size().await >= 0);
+}
+
+#[tokio::test]
+async fn conformance_watch_stream() {
+    watch_stream(&backend().await, "t").await;
+}
+
+#[tokio::test]
+async fn conformance_commit_guards_per_key() {
+    commit_guards_per_key(&backend().await, "t").await;
+}
+
+#[tokio::test]
+async fn conformance_commit_duplicate_events_conflict_atomically() {
+    commit_duplicate_events_conflict_atomically(&backend().await, "t").await;
 }
 
 #[tokio::test]
@@ -75,40 +57,6 @@ async fn sqlite_ensure_schema_is_idempotent() {
         .unwrap();
     let (_, kv) = b.get(b"a", 0).await.unwrap();
     assert_eq!(kv.unwrap().value, Bytes::from("1"));
-}
-
-#[tokio::test]
-async fn sqlite_commit_rolls_back_after_database_error() {
-    let b = backend().await;
-    let base = b.current_revision().await;
-    let a = Bytes::from_static(b"a");
-    let event = Event {
-        revision: base + 1,
-        key: a.clone(),
-        deleted: false,
-        kv: Some(KeyValue {
-            key: a,
-            value: Bytes::from_static(b"value"),
-            create_revision: base + 1,
-            mod_revision: base + 1,
-            version: 1,
-            lease: 0,
-        }),
-        prev_kv: None,
-    };
-    // Both rows use the same (name, predecessor) unique key.
-    let mut watch = b.subscribe();
-    assert!(
-        b.commit(ReadSet::default(), vec![event.clone(), event])
-            .await
-            .is_err()
-    );
-    assert_eq!(b.current_revision().await, base);
-    assert!(b.get(b"a", 0).await.unwrap().1.is_none());
-    assert!(matches!(
-        watch.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-    ));
 }
 
 #[tokio::test]

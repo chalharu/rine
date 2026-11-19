@@ -1640,6 +1640,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rine-store-conformance"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "rine-etcd",
+ "tokio",
+]
+
+[[package]]
 name = "rine-store-executor"
 version = "0.1.0"
 dependencies = [
@@ -1660,6 +1669,7 @@ dependencies = [
  "bytes",
  "oracledb",
  "rine-etcd",
+ "rine-store-conformance",
  "rine-store-executor",
  "rine-store-oracle",
  "serde",
@@ -1678,6 +1688,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "rine-etcd",
+ "rine-store-conformance",
  "rine-store-executor",
  "rusqlite",
  "thiserror",

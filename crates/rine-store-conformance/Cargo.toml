@@ -1,0 +1,15 @@
+[package]
+description = "Shared Backend conformance suite for rine storage backends"
+edition.workspace = true
+license.workspace = true
+name = "rine-store-conformance"
+version.workspace = true
+
+[lib]
+name = "rine_store_conformance"
+path = "src/lib.rs"
+
+[dependencies]
+bytes.workspace = true
+rine-etcd.workspace = true
+tokio.workspace = true

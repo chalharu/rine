@@ -10,7 +10,7 @@ use rine_etcd::error::{Error, Result};
 use rine_store_executor::{Dialect as _, Row, SqlExecutor, SqlValue};
 use tokio::sync::Mutex;
 
-use crate::dialect::OracleDialect;
+use crate::dialect::{CREATE_INDEXES, CREATE_TABLE, OracleDialect};
 
 #[derive(Debug, Clone)]
 struct MockRow {
@@ -211,7 +211,7 @@ impl MockExec {
             });
             return Ok((before - rows.len()) as u64);
         }
-        if sql == crate::ddl::CREATE_TABLE || crate::ddl::CREATE_INDEXES.contains(&sql) {
+        if sql == CREATE_TABLE || CREATE_INDEXES.contains(&sql) {
             return Ok(0);
         }
         panic!("mock execute: unknown sql {sql}");

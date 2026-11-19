@@ -7,14 +7,12 @@
 //!
 //! [`OracleDb`] is the live [`SqlExecutor`] over a real database connection.
 
-mod ddl;
+mod db;
 mod dialect;
-mod live;
 #[cfg(any(feature = "mock", test))]
 mod mock;
-mod store;
 
-pub use live::OracleDb;
+pub use db::OracleDb;
 #[cfg(feature = "mock")]
 pub use mock::MockExec;
 use rine_store_executor::SqlBackend;
