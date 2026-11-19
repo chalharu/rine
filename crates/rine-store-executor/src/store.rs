@@ -160,6 +160,10 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
         self.compacted_inner().await.unwrap_or(0)
     }
 
+    async fn initialize(&self) -> Result<()> {
+        self.ensure_schema().await
+    }
+
     async fn get(&self, key: &[u8], revision: Revision) -> Result<(Revision, Option<KeyValue>)> {
         let cur = self.check_rev(revision).await?;
         if revision == 0 || revision == cur {

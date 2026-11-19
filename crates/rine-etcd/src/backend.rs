@@ -44,6 +44,8 @@ pub trait Backend: Send + Sync + 'static {
     async fn current_revision(&self) -> Revision;
     async fn compacted_revision(&self) -> Revision;
 
+    async fn initialize(&self) -> Result<()>;
+
     async fn get(&self, key: &[u8], revision: Revision) -> Result<(Revision, Option<KeyValue>)>;
     async fn create(&self, key: Bytes, value: Bytes, lease: LeaseId) -> Result<Revision>;
     async fn update(

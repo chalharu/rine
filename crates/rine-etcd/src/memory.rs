@@ -74,6 +74,10 @@ impl Backend for MemoryBackend {
         self.inner.read().await.compact_rev
     }
 
+    async fn initialize(&self) -> Result<()> {
+        Ok(())
+    }
+
     async fn get(&self, key: &[u8], revision: Revision) -> Result<(Revision, Option<KeyValue>)> {
         let g = self.inner.read().await;
         if revision != 0 && revision < g.compact_rev {
