@@ -1,10 +1,3 @@
-use rine_store_executor::SqlBackend;
-
-use crate::dialect::OracleDialect;
-
-/// Oracle-flavored [`SqlBackend`].
-pub type OracleBackend<E> = SqlBackend<E, OracleDialect>;
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -12,11 +5,10 @@ mod tests {
     use bytes::Bytes;
     use rine_etcd::{Backend as _, backend::ListOptions};
 
-    use super::*;
-    use crate::mock::MockExec;
+    use crate::{OracleBackendMock, mock::MockExec};
 
-    fn backend() -> OracleBackend<MockExec> {
-        OracleBackend::new(Arc::new(MockExec::new()))
+    fn backend() -> OracleBackendMock {
+        OracleBackendMock::new(Arc::new(MockExec::new()))
     }
 
     #[tokio::test]

@@ -13,9 +13,8 @@ use std::{
 
 use async_trait::async_trait;
 use rine_etcd::error::{Error, Result};
+use rine_store_executor::{Row, SqlExecutor, SqlValue};
 use rusqlite::ToSql;
-
-use crate::{Row, SqlExecutor, SqlValue};
 
 /// Live SQLite connection. `Clone` shares the same underlying connection.
 #[derive(Clone, Debug)]

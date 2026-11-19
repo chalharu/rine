@@ -12,14 +12,14 @@ use rine_etcd::{
     },
     server::EtcdServer,
 };
-use rine_store_oracle::{MockExec, OracleBackend};
+use rine_store_oracle::{MockExec, OracleBackendMock};
 
 async fn spawn() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
     let endpoint = format!("http://{addr}");
-    let backend = Arc::new(OracleBackend::new(Arc::new(MockExec::new())));
+    let backend = Arc::new(OracleBackendMock::new(Arc::new(MockExec::new())));
     tokio::spawn(async move {
         EtcdServer::new(backend).serve(addr).await.unwrap();
     });

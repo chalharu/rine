@@ -14,8 +14,11 @@ mod live;
 mod mock;
 mod store;
 
-pub use dialect::OracleDialect;
 pub use live::OracleDb;
-#[cfg(any(feature = "mock", test))]
+#[cfg(any(feature = "mock"))]
 pub use mock::MockExec;
-pub use store::OracleBackend;
+use rine_store_executor::SqlBackend;
+
+pub type OracleBackend = SqlBackend<OracleDb, dialect::OracleDialect>;
+#[cfg(any(feature = "mock", test))]
+pub type OracleBackendMock = SqlBackend<mock::MockExec, dialect::OracleDialect>;
