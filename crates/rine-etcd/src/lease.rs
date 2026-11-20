@@ -128,12 +128,14 @@ impl LeaseManager {
             backend,
             next_id: Arc::new(AtomicI64::new(1)),
         };
-        // Expiry loop: delete keys whose lease deadline passed.
+        // Expiry loop: delete keys whose lease deadline passed. The 500ms
+        // poll matches upstream etcd's lessor `runLoop`, bounding the extra
+        // lifetime of an expired lease the same way.
         let inner = mgr.inner.clone();
         let backend = mgr.backend.clone();
         let writes = mgr.writes.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            let mut tick = tokio::time::interval(Duration::from_millis(500));
             loop {
                 tick.tick().await;
                 let expired: Vec<(i64, Vec<Vec<u8>>)> = {
