@@ -101,6 +101,93 @@ func TestPerformance(t *testing.T) {
 				return nil
 			})
 		})
+		t.Run("Range", func(t *testing.T) {
+			// Prefix scan over the 1000 keys written by Put, bounded to 100
+			// rows per request. Exercises the list/live-range pushdown path.
+			const scans = 50
+			lat := make([]time.Duration, scans)
+			for i := range scans {
+				rctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+				start := time.Now()
+				r, err := c.Get(rctx, p, clientv3.WithPrefix(), clientv3.WithLimit(100))
+				lat[i] = time.Since(start)
+				cancel()
+				noError(t, err)
+				if len(r.Kvs) != 100 || r.Count != int64(requests) {
+					t.Fatalf("prefix scan: got %d rows count %d, want 100 rows count %d", len(r.Kvs), r.Count, requests)
+				}
+			}
+			slices.Sort(lat)
+			t.Logf("%d prefix scans (limit 100 over %d keys): p50=%v p99=%v", scans, requests, lat[len(lat)/2], lat[len(lat)-1])
+		})
+		t.Run("Watch", func(t *testing.T) {
+			// Live fan-out: one watcher, 200 sequential puts, count events.
+			wctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			wch := c.Watch(wctx, p+"w/", clientv3.WithPrefix(), clientv3.WithCreatedNotify())
+			select {
+			case r := <-wch:
+				if !r.Created {
+					t.Fatalf("expected watch creation response, got %+v", r)
+				}
+			case <-wctx.Done():
+				t.Fatalf("waiting for watch creation: %v", wctx.Err())
+			}
+			const events = 200
+			start := time.Now()
+			for i := range events {
+				if _, err := c.Put(wctx, p+"w/"+strconv.Itoa(i), value); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got := 0
+			for got < events {
+				select {
+				case r, ok := <-wch:
+					if !ok {
+						t.Fatalf("watch closed after %d/%d events", got, events)
+					}
+					if err := r.Err(); err != nil {
+						t.Fatal(err)
+					}
+					got += len(r.Events)
+				case <-wctx.Done():
+					t.Fatalf("waiting for watch events: %v (got %d/%d)", wctx.Err(), got, events)
+				}
+			}
+			elapsed := time.Since(start)
+			t.Logf("%d puts + %d events: %.1f events/s, elapsed %v", events, got, float64(got)/elapsed.Seconds(), elapsed)
+		})
+		t.Run("LeaseExpiry", func(t *testing.T) {
+			// Mass expiry: 300 leased keys, one short TTL. Measures drain
+			// time from deadline to zero keys (tick delay + delete cost).
+			ctx := t.Context()
+			grant, err := c.Grant(ctx, 2)
+			noError(t, err)
+			deadline := time.Now().Add(2 * time.Second)
+			const leased = 300
+			for i := range leased {
+				if _, err := c.Put(ctx, p+"l/"+strconv.Itoa(i), value, clientv3.WithLease(grant.ID)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if d := time.Until(deadline); d > 0 {
+				time.Sleep(d)
+			}
+			start := time.Now()
+			for {
+				r, err := c.Get(ctx, p+"l/", clientv3.WithPrefix(), clientv3.WithCountOnly())
+				noError(t, err)
+				if r.Count == 0 {
+					break
+				}
+				if time.Since(start) > time.Minute {
+					t.Fatalf("lease expiry did not drain 300 keys within a minute (%d remain)", r.Count)
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			t.Logf("300-key expiry drained in %v", time.Since(start))
+		})
 	})
 }
 

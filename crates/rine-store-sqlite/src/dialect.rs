@@ -115,8 +115,8 @@ impl Dialect for SqliteDialect {
     }
 
     fn compact_delete_sql() -> &'static str {
-        "DELETE FROM rine WHERE created < ? AND name <> 'compact_rev_key' \
-         AND id NOT IN (SELECT MAX(id) FROM rine WHERE created <= ? GROUP BY name)"
+        "DELETE FROM rine WHERE id IN (SELECT id FROM rine WHERE created < ? AND name <> 'compact_rev_key' \
+         AND id NOT IN (SELECT MAX(id) FROM rine WHERE created <= ? GROUP BY name) LIMIT ?)"
     }
 
     fn set_compact_rev_sql() -> &'static str {

@@ -661,35 +661,59 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
     }
 
     async fn compact(&self, revision: Revision) -> Result<Revision> {
-        let _guard = self.writes.lock().await;
-        let cur = self.current_rev_inner().await?;
-        if revision > cur {
-            return Err(Error::FutureRev {
-                requested: revision,
-                current: cur,
-            });
-        }
-        let compacted = self.compacted_inner().await?;
-        if revision <= compacted {
-            return Err(Error::Compacted {
-                requested: revision,
-                compacted,
-            });
-        }
-        let watermark = if compacted == 0 {
-            D::set_compact_rev_insert_sql()
-        } else {
-            D::set_compact_rev_sql()
+        // Delete bound per statement so writers and readers interleave
+        // between chunks instead of stalling on one full-table delete.
+        const CHUNK: i64 = 1000;
+        let cur = {
+            let _guard = self.writes.lock().await;
+            let cur = self.current_rev_inner().await?;
+            if revision > cur {
+                return Err(Error::FutureRev {
+                    requested: revision,
+                    current: cur,
+                });
+            }
+            let compacted = self.compacted_inner().await?;
+            if revision <= compacted {
+                return Err(Error::Compacted {
+                    requested: revision,
+                    compacted,
+                });
+            }
+            let watermark = if compacted == 0 {
+                D::set_compact_rev_insert_sql()
+            } else {
+                D::set_compact_rev_sql()
+            };
+            self.exec
+                .execute(watermark, vec![SqlValue::Int(revision)])
+                .await?;
+            cur
         };
-        self.exec
-            .execute_batch(vec![
-                (watermark.into(), vec![SqlValue::Int(revision)]),
-                (
-                    D::compact_delete_sql().into(),
-                    vec![SqlValue::Int(revision), SqlValue::Int(revision)],
-                ),
-            ])
-            .await?;
+        // Chunked deletes are idempotent, so a same-revision double simply
+        // converges; a newer compact subsumes our range, so we stop.
+        loop {
+            {
+                let _guard = self.writes.lock().await;
+                if self.compacted_inner().await? > revision {
+                    break;
+                }
+            }
+            let n = self
+                .exec
+                .execute(
+                    D::compact_delete_sql(),
+                    vec![
+                        SqlValue::Int(revision),
+                        SqlValue::Int(revision),
+                        SqlValue::Int(CHUNK),
+                    ],
+                )
+                .await?;
+            if n == 0 {
+                break;
+            }
+        }
         Ok(cur)
     }
 

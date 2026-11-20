@@ -18,6 +18,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
     backend::{Backend, Event, KeyValue, ListOptions, ReadSet},
+    error::Error,
     etcdserverpb::{
         LeaseGrantRequest, LeaseGrantResponse, LeaseKeepAliveRequest, LeaseKeepAliveResponse,
         LeaseLeasesRequest, LeaseLeasesResponse, LeaseRevokeRequest, LeaseRevokeResponse,
@@ -53,6 +54,7 @@ impl Clone for LeaseManager {
 
 impl LeaseManager {
     /// Delete `key` only while it still belongs to `id`, via a guarded commit.
+    /// Best-effort fallback for a key a batched expiry could not cover.
     async fn expire_key(backend: &Arc<dyn Backend>, id: i64, key: &[u8]) {
         let prev = backend
             .list(key, None, ListOptions::default())
@@ -80,6 +82,55 @@ impl LeaseManager {
             .await;
     }
 
+    /// Delete many expired keys in one guarded commit instead of one commit
+    /// per key: a mass expiry (node loss, TTL sync) must not stall all
+    /// writers for seconds. Keys that moved under us abort the batch with a
+    /// conflict; those fall back to per-key best effort, as before.
+    async fn expire_keys(backend: &Arc<dyn Backend>, pairs: Vec<(i64, Vec<u8>)>) {
+        if pairs.is_empty() {
+            return;
+        }
+        let mut live: Vec<(i64, Vec<u8>, KeyValue)> = Vec::new();
+        for (id, key) in &pairs {
+            if let Ok((_, rows, _)) = backend.list(key, None, ListOptions::default()).await
+                && let Some(kv) = rows.into_iter().next()
+                && kv.lease == *id
+            {
+                live.push((*id, key.clone(), kv));
+            }
+        }
+        if live.is_empty() {
+            return;
+        }
+        let base = backend.current_revision().await;
+        let reads = ReadSet {
+            points: live
+                .iter()
+                .map(|(_, key, kv)| (Bytes::copy_from_slice(key), Some(kv.mod_revision)))
+                .collect(),
+            ranges: Vec::new(),
+        };
+        let events = live
+            .iter()
+            .map(|(_, key, kv)| Event {
+                revision: base + 1,
+                key: Bytes::copy_from_slice(key),
+                deleted: true,
+                kv: None,
+                prev_kv: Some(kv.clone()),
+            })
+            .collect();
+        match backend.commit(reads, events).await {
+            Ok(_) => {}
+            Err(Error::Conflict) => {
+                for (id, key, _) in &live {
+                    Self::expire_key(backend, *id, key).await;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
     pub fn new(backend: Arc<dyn Backend>) -> Self {
         let mgr = Self {
             writes: Arc::new(tokio::sync::Mutex::new(())),
@@ -95,7 +146,6 @@ impl LeaseManager {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             loop {
                 tick.tick().await;
-                let _guard = writes.lock().await;
                 let expired: Vec<(i64, Vec<Vec<u8>>)> = {
                     let now = Instant::now();
                     let mut g = inner.write().await;
@@ -110,11 +160,19 @@ impl LeaseManager {
                     });
                     out
                 };
-                for (id, keys) in expired {
-                    for k in keys {
-                        Self::expire_key(&backend, id, &k).await;
-                    }
+                if expired.is_empty() {
+                    // No global write lock on empty ticks.
+                    continue;
                 }
+                let _guard = writes.lock().await;
+                Self::expire_keys(
+                    &backend,
+                    expired
+                        .into_iter()
+                        .flat_map(|(id, keys)| keys.into_iter().map(move |k| (id, k)))
+                        .collect(),
+                )
+                .await;
             }
         });
         mgr
@@ -158,7 +216,6 @@ impl LeaseManager {
     }
 
     pub async fn revoke(&self, id: i64) {
-        let _guard = self.writes.lock().await;
         let keys = self
             .inner
             .write()
@@ -166,9 +223,11 @@ impl LeaseManager {
             .remove(&id)
             .map(|e| e.keys)
             .unwrap_or_default();
-        for k in keys {
-            Self::expire_key(&self.backend, id, &k).await;
+        if keys.is_empty() {
+            return;
         }
+        let _guard = self.writes.lock().await;
+        Self::expire_keys(&self.backend, keys.into_iter().map(|k| (id, k)).collect()).await;
     }
 
     pub async fn keepalive(&self, id: i64) -> i64 {

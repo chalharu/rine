@@ -153,6 +153,22 @@ fn read_row(row: &oracledb::Row) -> Result<Row, oracledb::Error> {
     Ok(Row { values })
 }
 
+fn query_all_on(
+    conn: &oracledb::Connection,
+    sql: &str,
+    params: &[SqlValue],
+) -> Result<Vec<Row>, oracledb::Error> {
+    let owned: Vec<OwnedParam> = params.iter().map(OwnedParam::from).collect();
+    let refs: Vec<&dyn ToDbValue> = owned.iter().map(as_bind).collect();
+    let stmt = conn.statement(sql)?.exclude_from_cache().build()?;
+    let cursor = stmt.query(&refs)?;
+    let mut out = Vec::new();
+    for row in cursor {
+        out.push(read_row(&row?)?);
+    }
+    Ok(out)
+}
+
 fn is_no_data(e: &oracledb::Error) -> bool {
     e.kind() == &oracledb::ErrorKind::NoDataFound || e.db_error_code() == Some(1403)
 }
@@ -230,16 +246,18 @@ impl SqlExecutor for OracleDb {
 
     async fn query_all(&self, sql: &str, params: Vec<SqlValue>) -> Result<Vec<Row>> {
         let sql = sql.to_string();
+        self.run_blocking(move |conn| query_all_on(conn, &sql, &params))
+            .await
+    }
+
+    /// Run related reads in one blocking call on one connection instead of
+    /// one runtime round trip per statement (the default `query_batch`).
+    async fn query_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<Vec<Vec<Row>>> {
         self.run_blocking(move |conn| {
-            let owned: Vec<OwnedParam> = params.iter().map(OwnedParam::from).collect();
-            let refs: Vec<&dyn ToDbValue> = owned.iter().map(as_bind).collect();
-            let stmt = conn.statement(&sql)?.exclude_from_cache().build()?;
-            let cursor = stmt.query(&refs)?;
-            let mut out = Vec::new();
-            for row in cursor {
-                out.push(read_row(&row?)?);
-            }
-            Ok(out)
+            statements
+                .iter()
+                .map(|(sql, params)| query_all_on(conn, sql, params))
+                .collect()
         })
         .await
     }

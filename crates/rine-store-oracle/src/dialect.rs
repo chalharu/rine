@@ -96,8 +96,8 @@ impl Dialect for OracleDialect {
     }
 
     fn compact_delete_sql() -> &'static str {
-        "DELETE FROM rine WHERE created < :1 AND name <> 'compact_rev_key' \
-         AND id NOT IN (SELECT MAX(id) FROM rine WHERE created <= :2 GROUP BY name)"
+        "DELETE FROM rine WHERE id IN (SELECT id FROM rine WHERE created < :1 AND name <> 'compact_rev_key' \
+         AND id NOT IN (SELECT MAX(id) FROM rine WHERE created <= :2 GROUP BY name) FETCH FIRST :3 ROWS ONLY)"
     }
 
     fn set_compact_rev_sql() -> &'static str {
