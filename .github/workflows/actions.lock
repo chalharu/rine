@@ -11,6 +11,7 @@ workflows:
         - 'actions/upload-artifact@v4'
         - 'actions/download-artifact@v4'
         - 'sonarsource/sonarqube-scan-action@v4'
+        - 'actions/cache@v4'
 dependencies:
     'actions/checkout@v4.4.0':
         ref: 'v4.4.0'
@@ -47,3 +48,8 @@ dependencies:
         commit: 'sha1-689fb39b34b9aa95ebc5f8f119343ddd51542402'
         owner_id: 545988
         repo_id: 366408409
+    'actions/cache@v4':
+        ref: 'v4'
+        commit: 'sha1-0057852bfaa89a56745cba8c7296529d2fc39830'
+        owner_id: 44036562
+        repo_id: 215566462
