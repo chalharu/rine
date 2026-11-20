@@ -139,25 +139,6 @@ impl EtcdServer {
         Self { backend }
     }
 
-    pub async fn serve(self, addr: SocketAddr) -> anyhow::Result<()> {
-        self.serve_inner(addr, None).await
-    }
-
-    /// Serve with TLS. When the config carries a client CA root, clients must
-    /// present a certificate signed by that CA (mTLS).
-    pub async fn serve_tls(self, addr: SocketAddr, tls: ServerTlsConfig) -> anyhow::Result<()> {
-        self.serve_inner(addr, Some(tls)).await
-    }
-
-    async fn serve_inner(
-        self,
-        addr: SocketAddr,
-        tls: Option<ServerTlsConfig>,
-    ) -> anyhow::Result<()> {
-        let leases = LeaseManager::new(self.backend.clone());
-        Self::serve_on(addr, tls, self.backend, leases).await
-    }
-
     /// Serve several listeners (mixed `http://` plaintext and `https://` TLS)
     /// on one shared backend and one shared lease manager.
     pub async fn serve_many(self, listeners: Vec<ListenAddr>) -> anyhow::Result<()> {

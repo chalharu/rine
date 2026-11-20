@@ -18,7 +18,7 @@ use rine_etcd::{
         watch_client::WatchClient,
         watch_request,
     },
-    server::EtcdServer,
+    server::{EtcdServer, ListenAddr},
 };
 
 async fn spawn() -> String {
@@ -28,7 +28,10 @@ async fn spawn() -> String {
     let endpoint = format!("http://{addr}");
     let backend = Arc::new(MemoryBackend::new());
     tokio::spawn(async move {
-        EtcdServer::new(backend).serve(addr).await.unwrap();
+        EtcdServer::new(backend)
+            .serve_many(vec![ListenAddr { addr, tls: None }])
+            .await
+            .unwrap();
     });
     // Wait until servable.
     for _ in 0..50 {

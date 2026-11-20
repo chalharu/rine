@@ -25,7 +25,7 @@ use rine_etcd::{
         request_op::Request,
         response_op::Response,
     },
-    server::EtcdServer,
+    server::{EtcdServer, ListenAddr},
 };
 
 struct FlakyBackend {
@@ -120,7 +120,10 @@ async fn spawn() -> String {
     let endpoint = format!("http://{addr}");
     let backend = Arc::new(FlakyBackend::new());
     tokio::spawn(async move {
-        EtcdServer::new(backend).serve(addr).await.unwrap();
+        EtcdServer::new(backend)
+            .serve_many(vec![ListenAddr { addr, tls: None }])
+            .await
+            .unwrap();
     });
     for _ in 0..50 {
         if let Ok(mut c) = KvClient::connect(endpoint.clone()).await

@@ -54,10 +54,6 @@ impl Dialect for SqliteDialect {
         "LIMIT 1"
     }
 
-    fn compact_revision_sql() -> &'static str {
-        "SELECT MAX(prev_revision) FROM rine WHERE name = 'compact_rev_key'"
-    }
-
     fn compacted_rev_sql() -> &'static str {
         "SELECT prev_revision FROM rine WHERE name = 'compact_rev_key'"
     }
@@ -69,29 +65,11 @@ impl Dialect for SqliteDialect {
         )
     }
 
-    fn resolve_id_sql() -> &'static str {
-        "SELECT id FROM rine WHERE name = ? AND prev_revision = ?"
-    }
-
-    fn history_by_name_sql() -> String {
-        format!(
-            "SELECT {COLS} FROM rine WHERE name = ? AND id <= ? ORDER BY id DESC",
-            COLS = Self::cols()
-        )
-    }
-
     fn events_sql() -> String {
         format!(
             "SELECT {COLS} FROM rine WHERE {rev} >= ? AND {rev} <= ? AND name <> 'compact_rev_key' ORDER BY id",
             COLS = Self::cols(),
             rev = Self::logical_revision()
-        )
-    }
-
-    fn get_sql() -> String {
-        format!(
-            "SELECT {COLS} FROM rine WHERE name = ? AND deleted = 0 ORDER BY id DESC LIMIT 1",
-            COLS = Self::cols()
         )
     }
 
@@ -140,21 +118,8 @@ impl Dialect for SqliteDialect {
         Some((rows, count))
     }
 
-    fn insert_sql() -> &'static str {
-        "INSERT INTO rine (name, created, deleted, create_revision, prev_revision, lease, version, value) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-    }
-
-    fn mark_deleted_sql() -> &'static str {
-        "UPDATE rine SET deleted = ? WHERE name = ? AND deleted = 0"
-    }
-
     fn set_deleted_by_id_sql() -> &'static str {
         "UPDATE rine SET deleted = ? WHERE id = ? AND deleted = 0"
-    }
-
-    fn set_create_rev_sql() -> &'static str {
-        "UPDATE rine SET create_revision = ? WHERE id = ?"
     }
 
     fn compact_delete_sql() -> &'static str {
@@ -196,18 +161,13 @@ mod tests {
         let owned = [
             SqliteDialect::list_range_sql(),
             SqliteDialect::live_by_name_sql(),
-            SqliteDialect::history_by_name_sql(),
             SqliteDialect::events_sql(),
         ];
         for sql in owned.iter().map(String::as_str).chain([
-            SqliteDialect::insert_sql(),
-            SqliteDialect::mark_deleted_sql(),
             SqliteDialect::set_compact_rev_sql(),
             SqliteDialect::set_compact_rev_insert_sql(),
             SqliteDialect::compact_delete_sql(),
             SqliteDialect::set_deleted_by_id_sql(),
-            SqliteDialect::set_create_rev_sql(),
-            SqliteDialect::resolve_id_sql(),
         ]) {
             assert!(sql.contains('?'), "{sql}");
             assert!(!sql.contains(":1"), "{sql}");

@@ -10,7 +10,7 @@ use rine_etcd::{
         kv_client::KvClient,
         request_op,
     },
-    server::EtcdServer,
+    server::{EtcdServer, ListenAddr},
 };
 use rine_store_sqlite::{SqliteBackend, SqliteDb};
 
@@ -23,7 +23,10 @@ async fn spawn() -> String {
     let backend = Arc::new(SqliteBackend::new(Arc::new(db)));
     backend.ensure_schema().await.unwrap();
     tokio::spawn(async move {
-        EtcdServer::new(backend).serve(addr).await.unwrap();
+        EtcdServer::new(backend)
+            .serve_many(vec![ListenAddr { addr, tls: None }])
+            .await
+            .unwrap();
     });
     for _ in 0..50 {
         if let Ok(mut c) = KvClient::connect(endpoint.clone()).await

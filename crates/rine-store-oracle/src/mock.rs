@@ -57,14 +57,12 @@ impl MockRow {
 /// In-memory executor matching `OracleBackend`'s SQL. Not for production.
 pub struct MockExec {
     rows: Mutex<Vec<MockRow>>,
-    next_id: Mutex<i64>,
 }
 
 impl MockExec {
     pub fn new() -> Self {
         Self {
             rows: Mutex::new(Vec::new()),
-            next_id: Mutex::new(1),
         }
     }
 
@@ -81,12 +79,7 @@ impl MockExec {
             _ => panic!("param {i} not an int"),
         }
     }
-    fn apply(
-        rows: &mut Vec<MockRow>,
-        next: &mut i64,
-        sql: &str,
-        params: Vec<SqlValue>,
-    ) -> Result<u64> {
+    fn apply(rows: &mut Vec<MockRow>, sql: &str, params: Vec<SqlValue>) -> Result<u64> {
         if sql == OracleDialect::insert_event_sql() {
             let id = Self::int_param(&params, 0);
             let name = Self::str_param(&params, 1);
@@ -116,25 +109,6 @@ impl MockExec {
             });
             return Ok(1);
         }
-        if sql == OracleDialect::insert_sql() {
-            rows.push(MockRow {
-                id: *next,
-                name: Self::str_param(&params, 0),
-                created: Self::int_param(&params, 1),
-                deleted: Self::int_param(&params, 2),
-                create_revision: Self::int_param(&params, 3),
-                prev_revision: Self::int_param(&params, 4),
-                lease: Self::int_param(&params, 5),
-                version: Self::int_param(&params, 6),
-                value: match &params[7] {
-                    SqlValue::Bytes(b) => Some(b.clone()),
-                    SqlValue::Null => None,
-                    _ => panic!("value param"),
-                },
-            });
-            *next += 1;
-            return Ok(1);
-        }
         if sql == OracleDialect::set_deleted_by_id_sql() {
             let (new_del, id) = (Self::int_param(&params, 0), Self::int_param(&params, 1));
             for r in rows.iter_mut() {
@@ -144,27 +118,6 @@ impl MockExec {
                 }
             }
             return Ok(0);
-        }
-        if sql == OracleDialect::set_create_rev_sql() {
-            let (rev, id) = (Self::int_param(&params, 0), Self::int_param(&params, 1));
-            for r in rows.iter_mut() {
-                if r.id == id {
-                    r.create_revision = rev;
-                    return Ok(1);
-                }
-            }
-            return Ok(0);
-        }
-        if sql == OracleDialect::mark_deleted_sql() {
-            let (new_del, name) = (Self::int_param(&params, 0), Self::str_param(&params, 1));
-            let mut n = 0;
-            for r in rows.iter_mut() {
-                if r.name == name && r.deleted == 0 {
-                    r.deleted = new_del;
-                    n += 1;
-                }
-            }
-            return Ok(n);
         }
         if sql == OracleDialect::set_compact_rev_sql() {
             let rev = Self::int_param(&params, 0);
@@ -228,20 +181,16 @@ impl Default for MockExec {
 impl SqlExecutor for MockExec {
     async fn execute(&self, sql: &str, params: Vec<SqlValue>) -> Result<u64> {
         let mut rows = self.rows.lock().await;
-        let mut next = self.next_id.lock().await;
-        Self::apply(&mut rows, &mut next, sql, params)
+        Self::apply(&mut rows, sql, params)
     }
 
     async fn execute_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
         let mut rows = self.rows.lock().await;
-        let mut next = self.next_id.lock().await;
         let mut pending = rows.clone();
-        let mut pending_next = *next;
         for (sql, params) in statements {
-            Self::apply(&mut pending, &mut pending_next, &sql, params)?;
+            Self::apply(&mut pending, &sql, params)?;
         }
         *rows = pending;
-        *next = pending_next;
         Ok(())
     }
 
@@ -285,16 +234,6 @@ impl SqlExecutor for MockExec {
             let id = Self::int_param(&params, 0);
             return Ok(rows.iter().find(|r| r.id == id).map(MockRow::to_row));
         }
-        if sql == OracleDialect::compact_revision_sql() {
-            let max = rows
-                .iter()
-                .filter(|r| r.name == OracleDialect::compacted_rev_key())
-                .map(|r| r.prev_revision)
-                .max();
-            return Ok(max.map(|m| Row {
-                values: vec![SqlValue::Int(m)],
-            }));
-        }
         if sql == OracleDialect::compacted_rev_sql() {
             return Ok(rows
                 .iter()
@@ -309,15 +248,6 @@ impl SqlExecutor for MockExec {
                 .iter()
                 .find(|r| r.name == name && r.deleted == 0)
                 .map(MockRow::to_row));
-        }
-        if sql == OracleDialect::resolve_id_sql() {
-            let (name, prev) = (Self::str_param(&params, 0), Self::int_param(&params, 1));
-            return Ok(rows
-                .iter()
-                .find(|r| r.name == name && r.prev_revision == prev)
-                .map(|r| Row {
-                    values: vec![SqlValue::Int(r.id)],
-                }));
         }
         if sql == OracleDialect::db_size_sql() {
             let sum: i64 = rows
@@ -350,15 +280,6 @@ impl SqlExecutor for MockExec {
 
     async fn query_all(&self, sql: &str, params: Vec<SqlValue>) -> Result<Vec<Row>> {
         let rows = self.rows.lock().await;
-        if sql == OracleDialect::history_by_name_sql() {
-            let (name, max_id) = (Self::str_param(&params, 0), Self::int_param(&params, 1));
-            let mut out: Vec<&MockRow> = rows
-                .iter()
-                .filter(|r| r.name == name && r.id <= max_id)
-                .collect();
-            out.sort_by_key(|r| -r.id);
-            return Ok(out.into_iter().map(MockRow::to_row).collect());
-        }
         if sql == OracleDialect::events_sql() {
             let (from, to) = (Self::int_param(&params, 0), Self::int_param(&params, 1));
             let mut out: Vec<&MockRow> = rows

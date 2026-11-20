@@ -58,10 +58,6 @@ impl Dialect for OracleDialect {
         "FETCH FIRST 1 ROWS ONLY"
     }
 
-    fn compact_revision_sql() -> &'static str {
-        "SELECT MAX(prev_revision) FROM rine WHERE name = 'compact_rev_key'"
-    }
-
     fn compacted_rev_sql() -> &'static str {
         "SELECT prev_revision FROM rine WHERE name = 'compact_rev_key'"
     }
@@ -73,29 +69,11 @@ impl Dialect for OracleDialect {
         )
     }
 
-    fn resolve_id_sql() -> &'static str {
-        "SELECT id FROM rine WHERE name = :1 AND prev_revision = :2"
-    }
-
-    fn history_by_name_sql() -> String {
-        format!(
-            "SELECT {COLS} FROM rine WHERE name = :1 AND id <= :2 ORDER BY id DESC",
-            COLS = Self::cols()
-        )
-    }
-
     fn events_sql() -> String {
         format!(
             "SELECT {COLS} FROM rine WHERE {rev} >= :1 AND {rev} <= :2 AND name <> 'compact_rev_key' ORDER BY id",
             COLS = Self::cols(),
             rev = Self::logical_revision()
-        )
-    }
-
-    fn get_sql() -> String {
-        format!(
-            "SELECT {COLS} FROM rine WHERE name = :1 AND deleted = 0 AND ROWNUM = 1 ORDER BY id DESC",
-            COLS = Self::cols()
         )
     }
 
@@ -120,21 +98,8 @@ impl Dialect for OracleDialect {
         )
     }
 
-    fn insert_sql() -> &'static str {
-        "INSERT INTO rine (name, created, deleted, create_revision, prev_revision, lease, version, value) \
-         VALUES (:1, :2, :3, :4, :5, :6, :7, :8)"
-    }
-
-    fn mark_deleted_sql() -> &'static str {
-        "UPDATE rine SET deleted = :1 WHERE name = :2 AND deleted = 0"
-    }
-
     fn set_deleted_by_id_sql() -> &'static str {
         "UPDATE rine SET deleted = :1 WHERE id = :2 AND deleted = 0"
-    }
-
-    fn set_create_rev_sql() -> &'static str {
-        "UPDATE rine SET create_revision = :1 WHERE id = :2"
     }
 
     fn compact_delete_sql() -> &'static str {
@@ -180,18 +145,13 @@ mod tests {
         let owned = [
             OracleDialect::list_range_sql(),
             OracleDialect::live_by_name_sql(),
-            OracleDialect::history_by_name_sql(),
             OracleDialect::events_sql(),
         ];
         for sql in owned.iter().map(String::as_str).chain([
-            OracleDialect::insert_sql(),
-            OracleDialect::mark_deleted_sql(),
             OracleDialect::set_compact_rev_sql(),
             OracleDialect::set_compact_rev_insert_sql(),
             OracleDialect::compact_delete_sql(),
             OracleDialect::set_deleted_by_id_sql(),
-            OracleDialect::set_create_rev_sql(),
-            OracleDialect::resolve_id_sql(),
         ]) {
             assert!(sql.contains(":1"), "{sql}");
             assert!(!sql.contains('?'), "{sql}");

@@ -7,7 +7,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use rine_etcd::{
     etcdserverpb::{PutRequest, RangeRequest, kv_client::KvClient},
-    server::EtcdServer,
+    server::{EtcdServer, ListenAddr},
 };
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity, ServerTlsConfig};
 
@@ -84,7 +84,13 @@ async fn spawn(tls: ServerTlsConfig) -> SocketAddr {
     drop(listener);
     let backend = Arc::new(rine_etcd::MemoryBackend::new());
     tokio::spawn(async move {
-        EtcdServer::new(backend).serve_tls(addr, tls).await.unwrap();
+        EtcdServer::new(backend)
+            .serve_many(vec![ListenAddr {
+                addr,
+                tls: Some(tls),
+            }])
+            .await
+            .unwrap();
     });
     for _ in 0..100 {
         if tokio::net::TcpStream::connect(addr).await.is_ok() {

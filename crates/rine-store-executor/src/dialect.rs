@@ -2,9 +2,8 @@
 //!
 //! [`Dialect`] abstracts the per-database SQL (`:1` vs `?` placeholders,
 //! DDL, a few functions); the MVCC logic in `SqlBackend` is shared. The
-//! strings are covered by unit tests (via `MockExec`) so SQL regressions are
-//! caught without a database; the live XE test in CI covers Oracle against a
-//! real database.
+//! strings are covered by unit tests asserting placeholder style, plus the
+//! live XE test in CI covers Oracle against a real database.
 
 use rine_etcd::backend::ListOptions;
 
@@ -78,24 +77,13 @@ pub trait Dialect: Send + Sync + 'static {
              WHERE snapshot_rank = 1 AND deleted <> 1 ORDER BY name"
         )
     }
-    fn compact_revision_sql() -> &'static str;
     fn compacted_rev_sql() -> &'static str;
 
     /// Latest live row for one key.
     fn live_by_name_sql() -> String;
 
-    /// Resolve the id of a just-inserted row via the (name, prev_revision)
-    /// unique index.
-    fn resolve_id_sql() -> &'static str;
-
-    /// History for one key at or below a revision, newest first.
-    fn history_by_name_sql() -> String;
-
     /// Event log slice for watch replay.
     fn events_sql() -> String;
-
-    /// Single-key read.
-    fn get_sql() -> String;
 
     /// Range reads. Caller picks the predicate by end-of-range convention:
     /// empty = single key, `x00` = `>= key`, else `[key, end)`.
@@ -112,14 +100,8 @@ pub trait Dialect: Send + Sync + 'static {
         None
     }
 
-    /// Optimistic insert: the new revision row, keyed by
-    /// `(name, prev_revision = parent id)`.
-    fn insert_sql() -> &'static str;
-
     /// Delete marks the live row deleted and appends a tombstone revision.
-    fn mark_deleted_sql() -> &'static str;
     fn set_deleted_by_id_sql() -> &'static str;
-    fn set_create_rev_sql() -> &'static str;
 
     /// Drop history below `rev`, keeping the newest row at or below `rev`
     /// per key (that row is the historical read base).

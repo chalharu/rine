@@ -1,7 +1,4 @@
-//! SQL execution abstraction over an Oracle session.
-//!
-//! `OracleBackend` programs against this trait; the step-1 driver implements
-//! it for `Connection` once query execution lands. Tests use `MockExecutor`.
+//! SQL execution abstraction for one database session.
 
 use async_trait::async_trait;
 use rine_etcd::error::{Error, Result};

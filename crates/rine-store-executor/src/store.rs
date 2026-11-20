@@ -850,25 +850,13 @@ mod tests {
         fn first_row() -> &'static str {
             ""
         }
-        fn compact_revision_sql() -> &'static str {
-            unimplemented!()
-        }
         fn compacted_rev_sql() -> &'static str {
             unimplemented!()
         }
         fn live_by_name_sql() -> String {
             unimplemented!()
         }
-        fn resolve_id_sql() -> &'static str {
-            unimplemented!()
-        }
-        fn history_by_name_sql() -> String {
-            unimplemented!()
-        }
         fn events_sql() -> String {
-            unimplemented!()
-        }
-        fn get_sql() -> String {
             unimplemented!()
         }
         fn list_exact_sql() -> String {
@@ -880,16 +868,7 @@ mod tests {
         fn list_range_sql() -> String {
             unimplemented!()
         }
-        fn insert_sql() -> &'static str {
-            unimplemented!()
-        }
-        fn mark_deleted_sql() -> &'static str {
-            unimplemented!()
-        }
         fn set_deleted_by_id_sql() -> &'static str {
-            unimplemented!()
-        }
-        fn set_create_rev_sql() -> &'static str {
             unimplemented!()
         }
         fn compact_delete_sql() -> &'static str {
