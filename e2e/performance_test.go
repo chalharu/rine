@@ -102,23 +102,29 @@ func TestPerformance(t *testing.T) {
 			})
 		})
 		t.Run("Range", func(t *testing.T) {
-			// Prefix scan over the 1000 keys written by Put, bounded to 100
-			// rows per request. Exercises the list/live-range pushdown path.
+			// Self-contained prefix scan: 500 dedicated keys, 50 scans
+			// bounded to 100 rows. Exercises the list/live-range pushdown.
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+			defer cancel()
+			const rangekeys = 500
+			for i := range rangekeys {
+				if _, err := c.Put(ctx, p+"r/"+strconv.Itoa(i), value); err != nil {
+					t.Fatal(err)
+				}
+			}
 			const scans = 50
 			lat := make([]time.Duration, scans)
 			for i := range scans {
-				rctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 				start := time.Now()
-				r, err := c.Get(rctx, p, clientv3.WithPrefix(), clientv3.WithLimit(100))
+				r, err := c.Get(ctx, p+"r/", clientv3.WithPrefix(), clientv3.WithLimit(100))
 				lat[i] = time.Since(start)
-				cancel()
 				noError(t, err)
-				if len(r.Kvs) != 100 || r.Count != int64(requests) {
-					t.Fatalf("prefix scan: got %d rows count %d, want 100 rows count %d", len(r.Kvs), r.Count, requests)
+				if len(r.Kvs) != 100 || r.Count != int64(rangekeys) {
+					t.Fatalf("prefix scan: got %d rows count %d, want 100 rows count %d", len(r.Kvs), r.Count, rangekeys)
 				}
 			}
 			slices.Sort(lat)
-			t.Logf("%d prefix scans (limit 100 over %d keys): p50=%v p99=%v", scans, requests, lat[len(lat)/2], lat[len(lat)-1])
+			t.Logf("%d prefix scans (limit 100 over %d keys): p50=%v p99=%v", scans, rangekeys, lat[len(lat)/2], lat[len(lat)-1])
 		})
 		t.Run("Watch", func(t *testing.T) {
 			// Live fan-out: one watcher, 200 sequential puts, count events.
