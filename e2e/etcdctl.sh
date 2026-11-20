@@ -18,9 +18,9 @@ export ETCDCTL_API=3
 
 # TLS: set TLS_CA (and TLS_CERT/TLS_KEY for mTLS) to talk to a
 # TLS-enabled server. ENDPOINT must use the https:// scheme then.
-if [ -n "${TLS_CA:-}" ]; then
+if [[ -n "${TLS_CA:-}" ]]; then
     TLS_FLAGS=(--cacert="$TLS_CA")
-    if [ -n "${TLS_CERT:-}" ]; then
+    if [[ -n "${TLS_CERT:-}" ]]; then
         TLS_FLAGS+=(--cert="$TLS_CERT" --key="$TLS_KEY")
     fi
 else
@@ -29,15 +29,17 @@ fi
 
 PASS=0
 fail() {
-    echo "FAIL: $1 (expected: [$2], got: [$3])" >&2
+    local label=$1 expected=$2 actual=$3
+    echo "FAIL: $label (expected: [$expected], got: [$actual])" >&2
     exit 1
 }
 check() { # check <label> <expected> <actual>
-    if [ "$2" != "$3" ]; then
-        fail "$1" "$2" "$3"
+    local label=$1 expected=$2 actual=$3
+    if [[ "$expected" != "$actual" ]]; then
+        fail "$label" "$expected" "$actual"
     fi
     PASS=$((PASS + 1))
-    echo "ok: $1"
+    echo "ok: $label"
 }
 
 ectl() {

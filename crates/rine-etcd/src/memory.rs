@@ -7,7 +7,7 @@
 
 use std::{
     collections::BTreeMap,
-    ops::Bound::{Excluded, Included, Unbounded},
+    ops::Bound::{self, Excluded, Included, Unbounded},
     sync::Arc,
 };
 
@@ -96,25 +96,69 @@ impl MemoryBackend {
         Ok(())
     }
 
+    /// Guard a historical read: reject compacted revisions and reads past
+    /// the current revision. Returns the live revision for the snapshot.
+    fn check_readable(g: &Inner, revision: Revision) -> Result<Revision> {
+        if revision > 0 && revision < g.compact_rev {
+            return Err(Error::Compacted {
+                requested: revision,
+                compacted: g.compact_rev,
+            });
+        }
+        if revision > g.rev {
+            return Err(Error::FutureRev {
+                requested: revision,
+                current: g.rev,
+            });
+        }
+        Ok(g.rev)
+    }
+
+    /// Replay the post-compaction event log over the compacted snapshot so
+    /// a historical read observes exactly the keys live at `revision`.
+    fn replay_history(
+        g: &Inner,
+        prefix: &[u8],
+        range_end: Option<&[u8]>,
+        revision: Revision,
+        bounds: (Bound<&[u8]>, Bound<&[u8]>),
+    ) -> BTreeMap<Bytes, KeyValue> {
+        let mut snapshot = BTreeMap::new();
+        snapshot.extend(
+            g.compacted
+                .range::<[u8], _>(bounds)
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+        // Empty when reading exactly at the compaction revision (the range
+        // would start past its end).
+        if g.compact_rev < revision {
+            for events in g
+                .history
+                .range((g.compact_rev + 1)..=revision)
+                .map(|(_, v)| v)
+            {
+                for event in events
+                    .iter()
+                    .filter(|e| in_range(&e.key, prefix, range_end))
+                {
+                    if let Some(kv) = &event.kv {
+                        snapshot.insert(event.key.clone(), kv.clone());
+                    } else {
+                        snapshot.remove(event.key.as_ref());
+                    }
+                }
+            }
+        }
+        snapshot
+    }
+
     fn list_locked(
         g: &Inner,
         prefix: &[u8],
         range_end: Option<&[u8]>,
         opts: ListOptions,
     ) -> Result<(Revision, Vec<KeyValue>, i64)> {
-        if opts.revision > 0 && opts.revision < g.compact_rev {
-            return Err(Error::Compacted {
-                requested: opts.revision,
-                compacted: g.compact_rev,
-            });
-        }
-        let rev = g.rev;
-        if opts.revision > rev {
-            return Err(Error::FutureRev {
-                requested: opts.revision,
-                current: rev,
-            });
-        }
+        let rev = Self::check_readable(g, opts.revision)?;
         let upper = match range_end {
             None | Some([]) => Included(prefix),
             Some([0]) => Unbounded,
@@ -122,36 +166,12 @@ impl MemoryBackend {
             Some(_) => return Ok((rev, Vec::new(), 0)),
         };
         let bounds = (Included(prefix), upper);
-        let mut snapshot = BTreeMap::new();
+        let owned;
         let values = if opts.revision <= 0 || opts.revision == rev {
             &g.kvs
         } else {
-            snapshot.extend(
-                g.compacted
-                    .range::<[u8], _>(bounds)
-                    .map(|(k, v)| (k.clone(), v.clone())),
-            );
-            // Replay post-compaction history; empty when reading exactly at
-            // the compaction revision (the range would start past its end).
-            if g.compact_rev < opts.revision {
-                for events in g
-                    .history
-                    .range((g.compact_rev + 1)..=opts.revision)
-                    .map(|(_, v)| v)
-                {
-                    for event in events
-                        .iter()
-                        .filter(|e| in_range(&e.key, prefix, range_end))
-                    {
-                        if let Some(kv) = &event.kv {
-                            snapshot.insert(event.key.clone(), kv.clone());
-                        } else {
-                            snapshot.remove(event.key.as_ref());
-                        }
-                    }
-                }
-            }
-            &snapshot
+            owned = Self::replay_history(g, prefix, range_end, opts.revision, bounds);
+            &owned
         };
         let project = |kv: &KeyValue| {
             if opts.keys_only {

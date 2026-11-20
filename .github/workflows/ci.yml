@@ -122,7 +122,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2.9.3
       - name: build rine
-        run: cargo build -p rine
+        run: cargo build --locked -p rine
       - name: start rine on the SQLite backend
         run: |
           rm -f /tmp/rine.db
@@ -144,7 +144,7 @@ jobs:
           exit 1
       - name: download official etcdctl (v3.5.35)
         run: |
-          curl -sL https://github.com/etcd-io/etcd/releases/download/v3.5.35/etcd-v3.5.35-linux-amd64.tar.gz -o /tmp/etcd.tgz
+          curl -sL --proto '=https' --tlsv1.2 https://github.com/etcd-io/etcd/releases/download/v3.5.35/etcd-v3.5.35-linux-amd64.tar.gz -o /tmp/etcd.tgz
           tar xzf /tmp/etcd.tgz -C /tmp
           /tmp/etcd-v3.5.35-linux-amd64/etcdctl version
       - name: official-client conformance
@@ -219,7 +219,7 @@ jobs:
           echo "Oracle XE did not open port 1521 in time"
           exit 1
       - name: build rine
-        run: cargo build -p rine
+        run: cargo build --locked -p rine
       - name: start rine on the Oracle backend
         run: |
           ./target/debug/rine > /tmp/rine.log 2>&1 &
@@ -240,7 +240,7 @@ jobs:
           exit 1
       - name: download official etcdctl (v3.5.35)
         run: |
-          curl -sL https://github.com/etcd-io/etcd/releases/download/v3.5.35/etcd-v3.5.35-linux-amd64.tar.gz -o /tmp/etcd.tgz
+          curl -sL --proto '=https' --tlsv1.2 https://github.com/etcd-io/etcd/releases/download/v3.5.35/etcd-v3.5.35-linux-amd64.tar.gz -o /tmp/etcd.tgz
           tar xzf /tmp/etcd.tgz -C /tmp
           /tmp/etcd-v3.5.35-linux-amd64/etcdctl version
       - name: official-client conformance

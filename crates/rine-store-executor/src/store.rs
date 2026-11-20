@@ -195,52 +195,70 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         range_end: Option<&[u8]>,
         opts: &ListOptions,
     ) -> Result<(Revision, Vec<KeyValue>, i64)> {
-        // Latest reads ride one read transaction (revision + rows + count
-        // in a single `query_batch`): rows come back in index order with
-        // LIMIT, the count (when needed) from a covering index — no
-        // `COUNT(*) OVER ()` sort over the full range.
         if opts.revision <= 0 {
-            let (rows_sql, count_sql) = D::live_range_queries(range_end, opts);
-            let mut params = vec![SqlValue::Str(key_str(prefix))];
-            if let Some(end) = range_end.filter(|end| !end.is_empty() && *end != [0]) {
-                params.push(SqlValue::Str(key_str(end)));
-            }
-            let has_rows = rows_sql.is_some();
-            let has_count = count_sql.is_some();
-            let mut queries = vec![(D::current_revision_sql(), vec![])];
-            if let Some(sql) = rows_sql {
-                let mut binds = params.clone();
-                if opts.limit > 0 {
-                    binds.push(SqlValue::Int(opts.limit));
-                }
-                queries.push((sql, binds));
-            }
-            if let Some(sql) = count_sql {
-                queries.push((sql, params));
-            }
-            let mut results = self.exec.query_batch(queries).await?.into_iter();
-            let revision = Self::cell(results.next(), 1)?.max(1);
-            let mut kvs = Vec::new();
-            if has_rows {
-                let rows = results
-                    .next()
-                    .ok_or_else(|| Error::Backend("missing range result".into()))?;
-                kvs.reserve(rows.len());
-                for r in &rows {
-                    kvs.push(row_to_kv(r)?);
-                }
-            }
-            let total = if has_count {
-                results
-                    .next()
-                    .and_then(|rows| rows.into_iter().next())
-                    .ok_or_else(|| Error::Backend("missing range count".into()))?
-                    .get_int(0)?
-            } else {
-                kvs.len() as i64
-            };
-            return Ok((revision, kvs, total));
+            return self.list_latest(prefix, range_end, opts).await;
         }
+        self.list_history(prefix, range_end, opts).await
+    }
+
+    /// Latest reads ride one read transaction (revision + rows + count
+    /// in a single `query_batch`): rows come back in index order with
+    /// LIMIT, the count (when needed) from a covering index — no
+    /// `COUNT(*) OVER ()` sort over the full range.
+    async fn list_latest(
+        &self,
+        prefix: &[u8],
+        range_end: Option<&[u8]>,
+        opts: &ListOptions,
+    ) -> Result<(Revision, Vec<KeyValue>, i64)> {
+        let (rows_sql, count_sql) = D::live_range_queries(range_end, opts);
+        let mut params = vec![SqlValue::Str(key_str(prefix))];
+        if let Some(end) = range_end.filter(|end| !end.is_empty() && *end != [0]) {
+            params.push(SqlValue::Str(key_str(end)));
+        }
+        let has_rows = rows_sql.is_some();
+        let has_count = count_sql.is_some();
+        let mut queries = vec![(D::current_revision_sql(), vec![])];
+        if let Some(sql) = rows_sql {
+            let mut binds = params.clone();
+            if opts.limit > 0 {
+                binds.push(SqlValue::Int(opts.limit));
+            }
+            queries.push((sql, binds));
+        }
+        if let Some(sql) = count_sql {
+            queries.push((sql, params));
+        }
+        let mut results = self.exec.query_batch(queries).await?.into_iter();
+        let revision = Self::cell(results.next(), 1)?.max(1);
+        let mut kvs = Vec::new();
+        if has_rows {
+            let rows = results
+                .next()
+                .ok_or_else(|| Error::Backend("missing range result".into()))?;
+            kvs.reserve(rows.len());
+            for r in &rows {
+                kvs.push(row_to_kv(r)?);
+            }
+        }
+        let total = if has_count {
+            results
+                .next()
+                .and_then(|rows| rows.into_iter().next())
+                .ok_or_else(|| Error::Backend("missing range count".into()))?
+                .get_int(0)?
+        } else {
+            kvs.len() as i64
+        };
+        Ok((revision, kvs, total))
+    }
+
+    async fn list_history(
+        &self,
+        prefix: &[u8],
+        range_end: Option<&[u8]>,
+        opts: &ListOptions,
+    ) -> Result<(Revision, Vec<KeyValue>, i64)> {
         let cur = self.check_rev(opts.revision).await?;
         let mut sql = D::list_history_sql(range_end);
         let mut params = vec![SqlValue::Str(key_str(prefix))];
