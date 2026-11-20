@@ -13,6 +13,9 @@ jobs:
   unit:
     name: unit tests (no DB)
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4.4.0
       - uses: dtolnay/rust-toolchain@stable
@@ -27,7 +30,9 @@ jobs:
       - name: unit tests with coverage
         run: |
           mkdir -p coverage
-          cargo llvm-cov --workspace --lcov --output-path coverage/lcov-unit.info
+          cargo llvm-cov --workspace --lcov --output-path coverage/raw-unit.info
+          sh scripts/lcov-workspace.sh coverage/raw-unit.info coverage/lcov-unit.info
+          rm coverage/raw-unit.info
       - name: upload coverage
         uses: actions/upload-artifact@v4
         with:
@@ -61,6 +66,8 @@ jobs:
       ORACLE_USER: rine
       ORACLE_PASSWORD: RinePass123_
       RINE_LIVE_ORACLE: 1
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4.4.0
       - uses: dtolnay/rust-toolchain@stable
@@ -91,7 +98,9 @@ jobs:
       - name: full workspace tests against live XE
         run: |
           cargo llvm-cov --no-report --workspace
-          cargo llvm-cov report --lcov --output-path coverage/lcov-oracle.info
+          cargo llvm-cov report --lcov --output-path coverage/raw-oracle.info
+          sh scripts/lcov-workspace.sh coverage/raw-oracle.info coverage/lcov-oracle.info
+          rm coverage/raw-oracle.info
       - name: upload coverage
         uses: actions/upload-artifact@v4
         with:
@@ -261,6 +270,7 @@ jobs:
           path: coverage
           merge-multiple: true
       - name: SonarCloud scan
-        uses: SonarSource/sonarqube-scan-action@v4
+        uses: SonarSource/sonarqube-scan-action@v8
         env:
+          SONAR_HOST_URL: https://sonarcloud.io
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
