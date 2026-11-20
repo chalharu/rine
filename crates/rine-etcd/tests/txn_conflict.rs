@@ -12,7 +12,7 @@ use std::sync::{
 
 use async_trait::async_trait;
 use rine_etcd::{
-    backend::{Backend, Event, KeyValue, ListOptions, ReadSet, Revision},
+    backend::{Backend, Event, KeyValue, LeaseId, LeaseState, ListOptions, ReadSet, Revision},
     error::{Error, Result},
     etcdserverpb::{
         Compare, PutRequest, RangeRequest, RequestOp, TxnRequest,
@@ -82,6 +82,38 @@ impl Backend for FlakyBackend {
 
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Vec<Event>> {
         self.inner.subscribe()
+    }
+
+    async fn lease_grant(&self, ttl: i64, requested: LeaseId, now_ms: u64) -> Result<LeaseId> {
+        self.inner.lease_grant(ttl, requested, now_ms).await
+    }
+
+    async fn lease_lookup(&self, id: LeaseId) -> Result<Option<LeaseState>> {
+        self.inner.lease_lookup(id).await
+    }
+
+    async fn lease_keepalive(&self, id: LeaseId, now_ms: u64) -> Result<Option<i64>> {
+        self.inner.lease_keepalive(id, now_ms).await
+    }
+
+    async fn lease_attach(&self, id: LeaseId, key: Vec<u8>) -> Result<bool> {
+        self.inner.lease_attach(id, key).await
+    }
+
+    async fn lease_detach(&self, id: LeaseId, key: &[u8]) -> Result<()> {
+        self.inner.lease_detach(id, key).await
+    }
+
+    async fn lease_take_expired(&self, now_ms: u64) -> Result<Vec<(LeaseId, Vec<Vec<u8>>)>> {
+        self.inner.lease_take_expired(now_ms).await
+    }
+
+    async fn lease_revoke(&self, id: LeaseId) -> Result<Vec<Vec<u8>>> {
+        self.inner.lease_revoke(id).await
+    }
+
+    async fn lease_ids(&self) -> Result<Vec<LeaseId>> {
+        self.inner.lease_ids().await
     }
 }
 

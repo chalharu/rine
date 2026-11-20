@@ -431,3 +431,114 @@ async fn sqlite_conformance_helper_edges() {
     let (_, prev) = kv_delete(&b, b"missing").await.unwrap();
     assert!(prev.is_none());
 }
+
+#[tokio::test]
+async fn sqlite_leases_live_in_the_backend() {
+    use rine_etcd::backend::LeaseState;
+
+    const NOW: u64 = 1_700_000_000_000;
+    let b = backend().await;
+    // Auto ids are backend-unique and positive; requested ids are honored.
+    let auto = b.lease_grant(60, 0, NOW).await.unwrap();
+    assert!(auto > 0);
+    assert_eq!(b.lease_grant(60, 42, NOW).await.unwrap(), 42);
+    assert_ne!(auto, 42);
+    // Re-granting an id replaces it: deadline and keys reset.
+    b.lease_attach(auto, b"k".to_vec()).await.unwrap();
+    b.lease_grant(60, auto, NOW + 1).await.unwrap();
+    assert_eq!(
+        b.lease_lookup(auto).await.unwrap().unwrap(),
+        LeaseState {
+            granted_ttl: 60,
+            expires_at_ms: NOW + 1 + 60_000,
+            keys: Vec::new(),
+        }
+    );
+    // Keepalive moves the deadline out; unknown leases stay unknown.
+    assert_eq!(b.lease_keepalive(999_999, NOW + 2).await.unwrap(), None);
+    assert_eq!(b.lease_keepalive(auto, NOW + 2).await.unwrap(), Some(60));
+    assert_eq!(
+        b.lease_lookup(auto).await.unwrap().unwrap().expires_at_ms,
+        NOW + 2 + 60_000
+    );
+    // Attach dedups; unknown leases refuse; detach tolerates the unknown.
+    assert!(b.lease_attach(auto, b"k1".to_vec()).await.unwrap());
+    assert!(b.lease_attach(auto, b"k1".to_vec()).await.unwrap());
+    assert!(!b.lease_attach(999_999, b"k".to_vec()).await.unwrap());
+    b.lease_detach(auto, b"missing").await.unwrap();
+    b.lease_detach(999_999, b"k").await.unwrap();
+    b.lease_detach(auto, b"k1").await.unwrap();
+    assert!(b.lease_lookup(auto).await.unwrap().unwrap().keys.is_empty());
+    let mut ids = b.lease_ids().await.unwrap();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![auto.min(42), auto.max(42)]);
+    // Expiry takes only the past-due leases with their keys (binary names
+    // round-trip through the BLOB codec); the second take is empty, so
+    // rival expiry loops never work the same lease twice.
+    let short = b.lease_grant(0, 0, 1_000).await.unwrap();
+    b.lease_attach(short, b"gone".to_vec()).await.unwrap();
+    b.lease_attach(short, vec![0, 255, 1, 2]).await.unwrap();
+    let taken = b.lease_take_expired(1_001).await.unwrap();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].0, short);
+    let mut keys = taken[0].1.clone();
+    keys.sort();
+    assert_eq!(keys, vec![vec![0, 255, 1, 2], b"gone".to_vec()]);
+    assert!(b.lease_take_expired(1_001).await.unwrap().is_empty());
+    assert!(b.lease_lookup(auto).await.unwrap().is_some());
+    // Revoke hands back keys and drops the lease; unknown revokes are empty.
+    b.lease_attach(auto, b"victim".to_vec()).await.unwrap();
+    assert_eq!(
+        b.lease_revoke(auto).await.unwrap(),
+        vec![b"victim".to_vec()]
+    );
+    assert!(b.lease_lookup(auto).await.unwrap().is_none());
+    assert!(b.lease_revoke(auto).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn sqlite_leases_survive_reopen() {
+    let path = std::env::temp_dir().join(format!(
+        "rine-lease-reopen-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_file(&path);
+    const NOW: u64 = 1_700_000_000_000;
+    let id = {
+        let db = SqliteDb::open(&path).unwrap();
+        let b = SqliteBackend::new(Arc::new(db));
+        b.initialize().await.unwrap();
+        let id = b.lease_grant(3600, 0, NOW).await.unwrap();
+        b.lease_attach(id, b"keep".to_vec()).await.unwrap();
+        id
+    };
+    {
+        let db = SqliteDb::open(&path).unwrap();
+        let b = SqliteBackend::new(Arc::new(db));
+        b.initialize().await.unwrap();
+        let state = b.lease_lookup(id).await.unwrap().unwrap();
+        assert_eq!(state.granted_ttl, 3600);
+        assert_eq!(state.expires_at_ms, NOW + 3_600_000);
+        assert_eq!(state.keys, vec![b"keep".to_vec()]);
+        // Keepalive works after reopen: the deadline recomputes from the
+        // stored TTL, and expiry still collects the lease afterwards.
+        assert_eq!(
+            b.lease_keepalive(id, NOW + 1_000).await.unwrap(),
+            Some(3600)
+        );
+        assert_eq!(
+            b.lease_take_expired(NOW + 3_600_001 + 1_000)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(path.with_extension("db-shm"));
+}

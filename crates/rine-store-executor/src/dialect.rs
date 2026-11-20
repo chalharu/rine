@@ -103,6 +103,68 @@ pub trait Dialect: Send + Sync + 'static {
 
     fn db_size_sql() -> &'static str;
 
+    /// DDL for the durable lease table: one row per lease
+    /// (`id`, granted TTL seconds, wall-clock expiry millis, attached keys).
+    fn create_leases_table_sql() -> &'static str;
+
+    /// Schema probe for `ensure_schema`.
+    fn leases_probe_sql() -> &'static str;
+
+    /// Next auto-allocated lease id (no binds).
+    fn lease_max_id_sql() -> String {
+        "SELECT COALESCE(MAX(id), 0) FROM rine_leases".into()
+    }
+
+    /// Overwrite one lease row; the caller inserts when this matches no row.
+    fn lease_update_sql() -> String {
+        let (ttl, exp, keys, id) = (Self::bind(1), Self::bind(2), Self::bind(3), Self::bind(4));
+        format!(
+            "UPDATE rine_leases SET granted_ttl = {ttl}, expires_at_ms = {exp}, keys = {keys} WHERE id = {id}"
+        )
+    }
+
+    fn lease_insert_sql() -> String {
+        let binds = (1..=4).map(Self::bind).collect::<Vec<_>>().join(", ");
+        format!("INSERT INTO rine_leases (id, granted_ttl, expires_at_ms, keys) VALUES ({binds})")
+    }
+
+    fn lease_select_sql() -> String {
+        format!(
+            "SELECT granted_ttl, expires_at_ms, keys FROM rine_leases WHERE id = {}",
+            Self::bind(1)
+        )
+    }
+
+    fn lease_keepalive_sql() -> String {
+        format!(
+            "UPDATE rine_leases SET expires_at_ms = {} WHERE id = {}",
+            Self::bind(1),
+            Self::bind(2)
+        )
+    }
+
+    fn lease_delete_sql() -> String {
+        format!("DELETE FROM rine_leases WHERE id = {}", Self::bind(1))
+    }
+
+    fn lease_expired_select_sql() -> String {
+        format!(
+            "SELECT id, keys FROM rine_leases WHERE expires_at_ms <= {}",
+            Self::bind(1)
+        )
+    }
+
+    fn lease_expired_delete_sql() -> String {
+        format!(
+            "DELETE FROM rine_leases WHERE expires_at_ms <= {}",
+            Self::bind(1)
+        )
+    }
+
+    fn lease_ids_sql() -> String {
+        "SELECT id FROM rine_leases".into()
+    }
+
     /// Shared column list: id, name, created, deleted, create_revision,
     /// prev_revision, lease, version, value.
     fn cols() -> &'static str {

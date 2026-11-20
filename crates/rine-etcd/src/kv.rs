@@ -130,10 +130,10 @@ impl KvService {
         let fresh = self.backend.commit(batch.reads, batch.events).await?;
         for (key, old, new) in changes {
             if old != 0 {
-                self.leases.detach(old, &key).await;
+                self.leases.detach(old, &key).await?;
             }
             if new != 0 {
-                self.leases.attach(new, key.to_vec()).await;
+                self.leases.attach(new, key.to_vec()).await?;
             }
         }
         Ok(fresh)
@@ -350,7 +350,7 @@ impl KvService {
             },
             _ => (Bytes::copy_from_slice(&req.value), req.lease),
         };
-        if lease != 0 && !self.leases.exists(lease).await {
+        if lease != 0 && !self.leases.exists(lease).await.map_err(status_err)? {
             return Err(tonic::Status::failed_precondition(
                 "etcdserver: requested lease not found",
             ));

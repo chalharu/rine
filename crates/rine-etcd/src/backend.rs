@@ -15,6 +15,25 @@ pub type LeaseId = i64;
 /// storage-level serialization additionally lives in each `Backend`.
 pub type CommitLock = Arc<tokio::sync::Mutex<()>>;
 
+/// Durable lease record. `expires_at_ms` is wall-clock milliseconds since
+/// the UNIX epoch, so deadlines survive restarts and are comparable across
+/// nodes. `keys` are the names attached since the last grant; they are
+/// verified against the live rows before any delete, so a key that moved
+/// to another lease (or away) is never removed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeaseState {
+    pub granted_ttl: i64,
+    pub expires_at_ms: u64,
+    pub keys: Vec<Vec<u8>>,
+}
+
+impl LeaseState {
+    /// Wall-clock deadline for `ttl` seconds from `now_ms`.
+    pub fn deadline(ttl: i64, now_ms: u64) -> u64 {
+        now_ms.saturating_add((ttl.max(0) as u64).saturating_mul(1000))
+    }
+}
+
 /// Capacity of each backend's watch broadcast channel.
 pub const BROADCAST_CAP: usize = 1024;
 
@@ -144,6 +163,32 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Committed events, grouped by revision.
     fn subscribe(&self) -> broadcast::Receiver<Vec<Event>>;
+
+    /// Durably store a lease and return its id: `requested` when non-zero
+    /// (replacing any previous lease under that id), otherwise a
+    /// backend-unique id. The deadline is `now_ms` plus `ttl` seconds.
+    /// Allocation and storage are atomic, so rival nodes never hand out
+    /// the same id.
+    async fn lease_grant(&self, ttl: i64, requested: LeaseId, now_ms: u64) -> Result<LeaseId>;
+    /// Fetch one lease, if present.
+    async fn lease_lookup(&self, id: LeaseId) -> Result<Option<LeaseState>>;
+    /// Move a live lease's deadline out to `now_ms` plus its granted TTL.
+    /// Returns the granted TTL, or `None` for an unknown lease.
+    async fn lease_keepalive(&self, id: LeaseId, now_ms: u64) -> Result<Option<i64>>;
+    /// Record `key` on a live lease. Returns false for an unknown lease.
+    async fn lease_attach(&self, id: LeaseId, key: Vec<u8>) -> Result<bool>;
+    /// Forget `key` on a lease; a no-op when either is unknown.
+    async fn lease_detach(&self, id: LeaseId, key: &[u8]) -> Result<()>;
+    /// Atomically drop every lease at or past its deadline and hand back
+    /// their ids with attached keys, so rival expiry loops never work the
+    /// same lease twice. Key deletion itself stays with the caller, which
+    /// revalidates each key against the live rows first.
+    async fn lease_take_expired(&self, now_ms: u64) -> Result<Vec<(LeaseId, Vec<Vec<u8>>)>>;
+    /// Atomically drop one lease and hand back its attached keys
+    /// (empty when the lease is unknown).
+    async fn lease_revoke(&self, id: LeaseId) -> Result<Vec<Vec<u8>>>;
+    /// Ids of all live leases.
+    async fn lease_ids(&self) -> Result<Vec<LeaseId>>;
 }
 
 /// Construction of one named [`Backend`] implementation.

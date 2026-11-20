@@ -6,9 +6,12 @@
 //! metadata (create/mod revision, version, lease) etcd clients expect.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     ops::Bound::{self, Excluded, Included, Unbounded},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -17,8 +20,8 @@ use tokio::sync::{RwLock, broadcast};
 
 use crate::{
     backend::{
-        BROADCAST_CAP, Backend, BackendFactory, Event, KeyValue, ListOptions, ObservedRange,
-        ReadSet, Revision, in_range,
+        BROADCAST_CAP, Backend, BackendFactory, Event, KeyValue, LeaseId, LeaseState, ListOptions,
+        ObservedRange, ReadSet, Revision, in_range,
     },
     error::{Error, Result},
 };
@@ -34,8 +37,16 @@ struct Inner {
     history: BTreeMap<Revision, Vec<Event>>,
 }
 
+struct LeaseRecord {
+    granted_ttl: i64,
+    expires_at_ms: u64,
+    keys: Vec<Vec<u8>>,
+}
+
 pub struct MemoryBackend {
     inner: Arc<RwLock<Inner>>,
+    leases: Arc<RwLock<HashMap<i64, LeaseRecord>>>,
+    next_lease: Arc<AtomicI64>,
     tx: broadcast::Sender<Vec<Event>>,
 }
 
@@ -69,6 +80,8 @@ impl MemoryBackend {
                 compacted: BTreeMap::new(),
                 history: BTreeMap::new(),
             })),
+            leases: Arc::new(RwLock::new(HashMap::new())),
+            next_lease: Arc::new(AtomicI64::new(1)),
             tx,
         }
     }
@@ -325,6 +338,83 @@ impl Backend for MemoryBackend {
 
     fn subscribe(&self) -> broadcast::Receiver<Vec<Event>> {
         self.tx.subscribe()
+    }
+
+    async fn lease_grant(&self, ttl: i64, requested: LeaseId, now_ms: u64) -> Result<LeaseId> {
+        let id = if requested != 0 {
+            requested
+        } else {
+            self.next_lease.fetch_add(1, Ordering::Relaxed)
+        };
+        self.leases.write().await.insert(
+            id,
+            LeaseRecord {
+                granted_ttl: ttl,
+                expires_at_ms: LeaseState::deadline(ttl, now_ms),
+                keys: Vec::new(),
+            },
+        );
+        Ok(id)
+    }
+
+    async fn lease_lookup(&self, id: LeaseId) -> Result<Option<LeaseState>> {
+        Ok(self.leases.read().await.get(&id).map(|e| LeaseState {
+            granted_ttl: e.granted_ttl,
+            expires_at_ms: e.expires_at_ms,
+            keys: e.keys.clone(),
+        }))
+    }
+
+    async fn lease_keepalive(&self, id: LeaseId, now_ms: u64) -> Result<Option<i64>> {
+        Ok(self.leases.write().await.get_mut(&id).map(|e| {
+            e.expires_at_ms = LeaseState::deadline(e.granted_ttl, now_ms);
+            e.granted_ttl
+        }))
+    }
+
+    async fn lease_attach(&self, id: LeaseId, key: Vec<u8>) -> Result<bool> {
+        Ok(match self.leases.write().await.get_mut(&id) {
+            Some(e) if !e.keys.contains(&key) => {
+                e.keys.push(key);
+                true
+            }
+            Some(_) => true,
+            None => false,
+        })
+    }
+
+    async fn lease_detach(&self, id: LeaseId, key: &[u8]) -> Result<()> {
+        if let Some(e) = self.leases.write().await.get_mut(&id) {
+            e.keys.retain(|k| k != key);
+        }
+        Ok(())
+    }
+
+    async fn lease_take_expired(&self, now_ms: u64) -> Result<Vec<(LeaseId, Vec<Vec<u8>>)>> {
+        let mut leases = self.leases.write().await;
+        let expired: Vec<LeaseId> = leases
+            .iter()
+            .filter(|(_, e)| e.expires_at_ms <= now_ms)
+            .map(|(id, _)| *id)
+            .collect();
+        Ok(expired
+            .into_iter()
+            .filter_map(|id| leases.remove(&id).map(|e| (id, e.keys)))
+            .collect())
+    }
+
+    async fn lease_revoke(&self, id: LeaseId) -> Result<Vec<Vec<u8>>> {
+        Ok(self
+            .leases
+            .write()
+            .await
+            .remove(&id)
+            .map(|e| e.keys)
+            .unwrap_or_default())
+    }
+
+    async fn lease_ids(&self) -> Result<Vec<LeaseId>> {
+        Ok(self.leases.read().await.keys().copied().collect())
     }
 }
 

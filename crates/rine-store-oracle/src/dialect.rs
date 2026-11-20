@@ -134,6 +134,19 @@ impl Dialect for OracleDialect {
     fn db_size_sql() -> &'static str {
         "SELECT NVL(SUM(LENGTH(name) + NVL(DBMS_LOB.GETLENGTH(value), 0)), 0) FROM rine"
     }
+
+    fn create_leases_table_sql() -> &'static str {
+        "CREATE TABLE rine_leases (\
+            id NUMBER PRIMARY KEY, \
+            granted_ttl NUMBER DEFAULT 0, \
+            expires_at_ms NUMBER DEFAULT 0, \
+            keys BLOB\
+        )"
+    }
+
+    fn leases_probe_sql() -> &'static str {
+        "SELECT 1 FROM rine_leases WHERE ROWNUM = 1"
+    }
 }
 
 #[cfg(test)]
@@ -155,6 +168,13 @@ mod tests {
             OracleDialect::events_sql(),
             rows.unwrap(),
             count.unwrap(),
+            OracleDialect::lease_update_sql(),
+            OracleDialect::lease_insert_sql(),
+            OracleDialect::lease_select_sql(),
+            OracleDialect::lease_keepalive_sql(),
+            OracleDialect::lease_delete_sql(),
+            OracleDialect::lease_expired_select_sql(),
+            OracleDialect::lease_expired_delete_sql(),
         ];
         for sql in owned.iter().map(String::as_str).chain([
             OracleDialect::set_compact_rev_sql(),

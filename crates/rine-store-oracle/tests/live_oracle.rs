@@ -72,8 +72,11 @@ async fn live_backend_crud_and_compact() {
         return;
     }
     let db = connect_retry().await;
-    // Fresh schema on every run (ignore ORA-00942 when the table is absent).
+    // Fresh schema on every run (ignore ORA-00942 when a table is absent).
+    // Leases are global to the table, not the keyspace, so `rine_leases`
+    // resets here too instead of leaking ids across runs.
     let _ = db.execute("DROP TABLE rine", vec![]).await;
+    let _ = db.execute("DROP TABLE rine_leases", vec![]).await;
 
     let backend = OracleBackend::new(Arc::new(db));
     // Creation path: table was just dropped, so this builds the schema.
@@ -254,4 +257,49 @@ async fn live_stale_point_read_is_conflict() {
     ));
     let (_, current) = kv_get(&backend, &key, 0).await.unwrap();
     assert_eq!(current.unwrap().value, Bytes::from_static(b"v2"));
+}
+
+/// Lease state is a backend row, not process memory: grant, attach,
+/// keepalive, expiry-take and revoke all run against Oracle (BLOB key set
+/// included), so a restarted or rival node sees the same leases.
+#[tokio::test]
+async fn live_leases_live_in_the_backend() {
+    if !live_enabled() {
+        eprintln!("skipping live OracleBackend test (RINE_LIVE_ORACLE != 1)");
+        return;
+    }
+    let db = connect_retry().await;
+    let backend = OracleBackend::new(Arc::new(db));
+    backend.ensure_schema().await.expect("ensure_schema");
+
+    const NOW: u64 = 1_700_000_000_000;
+    let id = backend.lease_grant(3600, 0, NOW).await.expect("grant");
+    assert!(id > 0);
+    assert!(backend.lease_attach(id, b"live-k".to_vec()).await.unwrap());
+    let state = backend
+        .lease_lookup(id)
+        .await
+        .unwrap()
+        .expect("lease present");
+    assert_eq!(state.granted_ttl, 3600);
+    assert_eq!(state.expires_at_ms, NOW + 3_600_000);
+    assert_eq!(state.keys, vec![b"live-k".to_vec()]);
+    assert_eq!(
+        backend.lease_keepalive(id, NOW + 1_000).await.unwrap(),
+        Some(3600)
+    );
+    // A past-due grant is collected exactly once with its keys.
+    let short = backend.lease_grant(0, 0, 1_000).await.expect("short grant");
+    backend
+        .lease_attach(short, b"short-k".to_vec())
+        .await
+        .unwrap();
+    let taken = backend.lease_take_expired(1_001).await.unwrap();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].0, short);
+    assert!(backend.lease_take_expired(1_001).await.unwrap().is_empty());
+    assert!(backend.lease_lookup(id).await.unwrap().is_some());
+    backend.lease_detach(id, b"live-k").await.unwrap();
+    assert!(backend.lease_revoke(id).await.unwrap().is_empty());
+    assert!(backend.lease_lookup(id).await.unwrap().is_none());
 }
