@@ -20,7 +20,7 @@ use std::{
 use async_trait::async_trait;
 use oracledb::ToDbValue;
 use rine_etcd::{
-    backend::BackendFactory,
+    backend::{BackendFactory, Event, Revision},
     error::{Error, Result},
 };
 use rine_store_executor::{Row, SqlExecutor, SqlValue};
@@ -191,8 +191,99 @@ fn is_no_data(e: &oracledb::Error) -> bool {
     e.kind() == &oracledb::ErrorKind::NoDataFound || e.db_error_code() == Some(1403)
 }
 
+// RAW binds avoid a temporary LOB round trip for small values. TO_BLOB runs
+// on Oracle and the previous revision is checked while holding the table lock.
+const COMMIT_PUT: &str = r"
+DECLARE
+    k rine.name%TYPE := :key;
+    v RAW(2000) := :value;
+    expected NUMBER := :expected;
+    cr NUMBER := :create_rev;
+    lease_id NUMBER := :lease_id;
+    ver NUMBER := :version;
+    head_id NUMBER := 1;
+    head_rev NUMBER := 1;
+    prev_id NUMBER := 0;
+    live_rev NUMBER;
+BEGIN
+    LOCK TABLE rine IN EXCLUSIVE MODE;
+    BEGIN
+        SELECT id, created INTO head_id, head_rev
+        FROM rine ORDER BY id DESC FETCH FIRST 1 ROWS ONLY;
+    EXCEPTION WHEN NO_DATA_FOUND THEN
+        head_id := 1;
+        head_rev := 1;
+    END;
+    BEGIN
+        SELECT id, CASE WHEN deleted = 0 THEN created END
+        INTO prev_id, live_rev
+        FROM rine WHERE name = k ORDER BY id DESC FETCH FIRST 1 ROWS ONLY;
+    EXCEPTION WHEN NO_DATA_FOUND THEN
+        prev_id := 0;
+        live_rev := NULL;
+    END;
+    IF live_rev != expected
+       OR (live_rev IS NULL AND expected IS NOT NULL)
+       OR (live_rev IS NOT NULL AND expected IS NULL) THEN
+        ROLLBACK;
+        :fresh := 0;
+    ELSE
+        head_id := GREATEST(head_id, 1) + 1;
+        head_rev := GREATEST(head_rev, 1) + 1;
+        IF live_rev IS NOT NULL THEN
+            UPDATE rine SET deleted = head_id WHERE id = prev_id AND deleted = 0;
+        END IF;
+        INSERT INTO rine (id, name, created, deleted, create_revision, prev_revision,
+                          lease, version, value)
+        VALUES (head_id, k, head_rev, 0, NVL(cr, head_rev), prev_id, lease_id, ver, TO_BLOB(v));
+        :fresh := head_rev;
+        COMMIT WRITE IMMEDIATE WAIT;
+    END IF;
+END;";
+
 #[async_trait]
 impl SqlExecutor for OracleDb {
+    async fn try_commit_put(&self, event: &Event) -> Result<Option<Revision>> {
+        let Some(kv) = event
+            .kv
+            .as_ref()
+            .filter(|kv| (1..=2000).contains(&kv.value.len()))
+        else {
+            return Ok(None);
+        };
+        let key = String::from_utf8_lossy(&event.key).into_owned();
+        let value = kv.value.clone();
+        let expected = event.prev_kv.as_ref().map(|kv| kv.mod_revision);
+        let create = (kv.create_revision != event.revision).then_some(kv.create_revision);
+        let (lease, version) = (kv.lease, kv.version);
+        let fresh = self
+            .run_blocking(move |conn| {
+                let result = conn
+                    .execute(
+                        COMMIT_PUT,
+                        &[
+                            &key,
+                            &value.as_ref(),
+                            &expected,
+                            &create,
+                            &lease,
+                            &version,
+                            &oracledb::DB_TYPE_NUMBER,
+                        ],
+                    )
+                    .and_then(|mut result| result.out_bind_data().get::<i64>(0));
+                if result.is_err() {
+                    conn.rollback()?;
+                }
+                result
+            })
+            .await?;
+        if fresh == 0 {
+            return Err(Error::Conflict);
+        }
+        Ok(Some(fresh))
+    }
+
     async fn execute_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
         if self.in_unit.load(Ordering::SeqCst) {
             // Inside a commit unit the table lock serializes writers; the

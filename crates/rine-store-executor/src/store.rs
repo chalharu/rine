@@ -542,17 +542,7 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         self.exec.execute_batch(statements).await?;
         let rebased = events
             .into_iter()
-            .map(|mut event| {
-                let staged = event.revision;
-                event.revision = fresh;
-                if let Some(kv) = event.kv.as_mut() {
-                    kv.mod_revision = fresh;
-                    if kv.create_revision == staged {
-                        kv.create_revision = fresh;
-                    }
-                }
-                event
-            })
+            .map(|event| rebase(event, fresh))
             .collect();
         Ok((fresh, rebased))
     }
@@ -562,6 +552,18 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
     /// drops the [`commit`](Backend::commit) future that spawned this.
     async fn commit_inner(&self, reads: ReadSet, events: Vec<Event>) -> Result<Revision> {
         let _guard = self.writes.lock().await;
+        if let [event] = events.as_slice()
+            && !event.deleted
+            && key_str(&event.key) != D::compacted_rev_key()
+            && reads.ranges.is_empty()
+            && reads.points.iter().all(|(key, revision)| {
+                *key == event.key && *revision == event.prev_kv.as_ref().map(|kv| kv.mod_revision)
+            })
+            && let Some(fresh) = self.exec.try_commit_put(event).await?
+        {
+            let _ = self.tx.send(vec![rebase(event.clone(), fresh)]);
+            return Ok(fresh);
+        }
         self.exec.begin_unit().await?;
         match self.commit_guarded(&reads, events).await {
             Ok((fresh, rebased)) => {
@@ -577,6 +579,18 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
             }
         }
     }
+}
+
+fn rebase(mut event: Event, fresh: Revision) -> Event {
+    let staged = event.revision;
+    event.revision = fresh;
+    if let Some(kv) = event.kv.as_mut() {
+        kv.mod_revision = fresh;
+        if kv.create_revision == staged {
+            kv.create_revision = fresh;
+        }
+    }
+    event
 }
 
 fn key_str(key: &[u8]) -> String {

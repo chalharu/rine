@@ -315,6 +315,7 @@ impl KvService {
         &self,
         req: &PutRequest,
         batch: &mut WriteBatch,
+        unary: bool,
     ) -> Result<PutResponse, tonic::Status> {
         if req.key.is_empty() {
             return Err(tonic::Status::invalid_argument(
@@ -323,9 +324,12 @@ impl KvService {
         }
         // Predecessor fetch, deliberately *not* recorded in the read set:
         // the commit revalidates written keys against its batched snapshot.
-        let (_, rows, _) = self
+        let (revision, rows, _) = self
             .fetch(&req.key, None, ListOptions::default(), &mut None)
             .await?;
+        if unary {
+            batch.base = revision;
+        }
         let prev = rows.into_iter().next();
 
         let (value, lease) = match (req.ignore_value, req.ignore_lease) {
@@ -485,7 +489,7 @@ impl KvService {
                     )),
                 }),
                 Some(Request::RequestPut(p)) => Ok(ResponseOp {
-                    response: Some(Response::ResponsePut(self.do_put(p, batch).await?)),
+                    response: Some(Response::ResponsePut(self.do_put(p, batch, false).await?)),
                 }),
                 Some(Request::RequestDeleteRange(d)) => Ok(ResponseOp {
                     response: Some(Response::ResponseDeleteRange(
@@ -584,8 +588,12 @@ impl Kv for KvService {
         request: tonic::Request<PutRequest>,
     ) -> Result<tonic::Response<PutResponse>, tonic::Status> {
         let guard = self.writes.clone().lock_owned().await;
-        let mut batch = self.batch().await;
-        let mut response = self.do_put(&request.into_inner(), &mut batch).await?;
+        let mut batch = WriteBatch {
+            base: 0,
+            reads: ReadSet::default(),
+            events: Vec::new(),
+        };
+        let mut response = self.do_put(&request.into_inner(), &mut batch, true).await?;
         let fresh = self.commit(batch, guard).await.map_err(status_err)?;
         if let Some(h) = response.header.as_mut() {
             h.revision = fresh;

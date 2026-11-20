@@ -1,7 +1,10 @@
 //! SQL execution abstraction for one database session.
 
 use async_trait::async_trait;
-use rine_etcd::error::{Error, Result};
+use rine_etcd::{
+    backend::{Event, Revision},
+    error::{Error, Result},
+};
 
 /// Bound parameter values. Oracle NUMBER maps to `Int`, VARCHAR2 to `Str`,
 /// BLOB/RAW to `Bytes`.
@@ -58,6 +61,13 @@ impl Row {
 
 #[async_trait]
 pub trait SqlExecutor: Send + Sync {
+    /// Optional durable single-Put path. An unsupported event returns `None`
+    /// without side effects. An implementation must validate the predecessor
+    /// under the same cross-node lock used by normal commits.
+    async fn try_commit_put(&self, _event: &Event) -> Result<Option<Revision>> {
+        Ok(None)
+    }
+
     /// Run INSERT/UPDATE/DELETE/MERGE. Returns affected rows.
     async fn execute(&self, sql: &str, params: Vec<SqlValue>) -> Result<u64>;
     /// Execute all statements in one database transaction.

@@ -12,7 +12,7 @@ use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use rine_etcd::{
-    backend::{Backend, ListOptions, ReadSet},
+    backend::{Backend, Event, ListOptions, ReadSet},
     error::Error,
 };
 use rine_store_conformance::{crud, history_compact_events, kv_create, kv_get, kv_update};
@@ -196,8 +196,9 @@ async fn live_stale_point_read_is_conflict() {
     assert!(matches!(err, Error::Conflict));
     // The live row's guard passes, then fails after an update.
     let (_, kv) = kv_get(&backend, &key, 0).await.expect("get");
+    let prev = kv.expect("key exists");
     let live = ReadSet {
-        points: vec![(key.clone(), kv.map(|kv| kv.mod_revision))],
+        points: vec![(key.clone(), Some(prev.mod_revision))],
         ranges: Vec::new(),
     };
     backend
@@ -209,4 +210,31 @@ async fn live_stale_point_read_is_conflict() {
         .expect("update");
     let err = backend.commit(live, vec![]).await.unwrap_err();
     assert!(matches!(err, Error::Conflict));
+
+    let revision = prev.mod_revision + 1;
+    let mut stale = prev.clone();
+    stale.value = Bytes::from_static(b"stale");
+    stale.mod_revision = revision;
+    stale.version += 1;
+    let mut watch = backend.subscribe();
+    let err = backend
+        .commit(
+            ReadSet::default(),
+            vec![Event {
+                revision,
+                key: key.clone(),
+                deleted: false,
+                kv: Some(stale),
+                prev_kv: Some(prev),
+            }],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Conflict));
+    assert!(matches!(
+        watch.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    let (_, current) = kv_get(&backend, &key, 0).await.unwrap();
+    assert_eq!(current.unwrap().value, Bytes::from_static(b"v2"));
 }
