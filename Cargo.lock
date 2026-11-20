@@ -1690,6 +1690,7 @@ dependencies = [
  "rine-store-executor",
  "rusqlite",
  "tokio",
+ "tokio-stream",
  "tonic",
 ]
 

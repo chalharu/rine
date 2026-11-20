@@ -3,6 +3,14 @@
 //! Semantics follow etcd: server-assigned IDs (client-specified accepted when
 //! unused), history replay from `start_revision`, cancel/progress, and cancel
 //! with `compact_revision` when history is unavailable.
+//!
+//! Live delivery is twofold: the backend broadcast is the fast path for this
+//! process's own commits, while a periodic catch-up replays the shared event
+//! log from each watcher's oldest undelivered revision. Commits from a rival
+//! node sharing the backend never enter this process's broadcast channel, so
+//! without the catch-up they would never reach local watchers. Both sources
+//! derive from the same total revision order and share the per-watcher
+//! `next_rev` cursor, so deliveries are gap-free and duplicate-free.
 
 use std::{
     collections::HashMap,
@@ -18,7 +26,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
     backend::{Backend, Event, header, in_range},
-    error::status_err,
+    error::{Error, status_err},
     etcdserverpb::{
         WatchCancelRequest, WatchCreateRequest, WatchProgressRequest, WatchRequest, WatchResponse,
         watch_server::Watch,
@@ -27,8 +35,17 @@ use crate::{
     mvccpb,
 };
 
+/// Cross-instance catch-up cadence: bounds the extra delay before a rival
+/// node's commit reaches local watchers. One range scan per stream per tick.
+const CATCH_UP_INTERVAL: Duration = Duration::from_millis(200);
+/// Revisions fetched per catch-up tick: bounds one catch-up after a long
+/// broadcast outage; the cursor simply resumes on the next tick.
+const CATCH_UP_MAX_SPAN: i64 = 512;
+
 struct Watcher {
-    live_from: i64,
+    /// Next undelivered revision. Advanced by both the broadcast fast path
+    /// and the catch-up poll, so neither source replays the other.
+    next_rev: i64,
     key: Vec<u8>,
     range_end: Vec<u8>,
     no_put: bool,
@@ -113,6 +130,8 @@ impl Watch for WatchService {
             let mut progress = tokio::time::interval(Duration::from_secs(10));
             // Skip the immediate first tick.
             progress.tick().await;
+            let mut catchup = tokio::time::interval(CATCH_UP_INTERVAL);
+            catchup.tick().await;
 
             loop {
                 tokio::select! {
@@ -154,29 +173,26 @@ impl Watch for WatchService {
                         let batch = match ev {
                             Ok(e) => e,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                // Missed events: cancel watchers that can no longer catch up.
-                                let compacted = backend.compacted_revision().await;
-                                for (id, _) in watchers.drain() {
-                                    let _ = tx.send(Ok(WatchResponse {
-                                        header: Some(header(compacted)),
-                                        watch_id: id,
-                                        canceled: true,
-                                        compact_revision: compacted,
-                                        cancel_reason: "etcdserver: mvcc: required revision has been compacted".into(),
-                                        ..Default::default()
-                                    })).await;
-                                }
+                                // Missed broadcasts: recover from the shared
+                                // log when retention allows; only truly
+                                // compacted watchers cancel (see `catch_up`).
+                                catch_up(&backend, &tx, &mut watchers).await;
                                 continue;
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         };
-                        let Some(first) = batch.first() else { continue };
-                        for (id, w) in &watchers {
-                            if first.revision < w.live_from { continue; }
-                            let events = watch_events(w, &batch);
+                        let Some(last_rev) = batch.last().map(|e| e.revision) else { continue };
+                        for (id, w) in &mut watchers {
+                            let fresh: Vec<Event> = batch
+                                .iter()
+                                .filter(|e| e.revision >= w.next_rev)
+                                .cloned()
+                                .collect();
+                            let events = watch_events(w, &fresh);
+                            w.next_rev = w.next_rev.max(last_rev + 1);
                             if events.is_empty() { continue; }
                             let _ = tx.send(Ok(WatchResponse {
-                                header: Some(header(first.revision)),
+                                header: Some(header(last_rev)),
                                 watch_id: *id,
                                 events,
                                 ..Default::default()
@@ -195,10 +211,91 @@ impl Watch for WatchService {
                             }
                         }
                     }
+                    _ = catchup.tick() => {
+                        catch_up(&backend, &tx, &mut watchers).await;
+                    }
                 }
             }
         });
         Ok(tonic::Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+/// Deliver every revision the broadcast missed: commits from a rival node
+/// sharing the backend never enter this process's channel, so each watch
+/// stream replays the shared event log from its oldest undelivered revision
+/// on a poll. Both sources derive from the same total revision order and
+/// share the per-watcher `next_rev` cursor, so deliveries are gap-free and
+/// duplicate-free. The fetch is capped to `CATCH_UP_MAX_SPAN` revisions so
+/// one catch-up after a long outage cannot balloon; the cursor resumes on
+/// the next tick.
+async fn catch_up(
+    backend: &Arc<dyn Backend>,
+    tx: &mpsc::Sender<Result<WatchResponse, tonic::Status>>,
+    watchers: &mut HashMap<i64, Watcher>,
+) {
+    if watchers.is_empty() {
+        return;
+    }
+    let min_next = watchers
+        .values()
+        .map(|w| w.next_rev)
+        .min()
+        .unwrap_or(1)
+        .max(1);
+    let cur = backend.current_revision().await;
+    if min_next > cur {
+        return;
+    }
+    let to = (min_next + CATCH_UP_MAX_SPAN - 1).min(cur);
+    match backend.events(min_next, to).await {
+        Ok(hist) => {
+            for (id, w) in watchers.iter_mut() {
+                let fresh: Vec<Event> = hist
+                    .iter()
+                    .filter(|e| e.revision >= w.next_rev)
+                    .cloned()
+                    .collect();
+                let events = watch_events(w, &fresh);
+                w.next_rev = w.next_rev.max(to + 1);
+                if events.is_empty() {
+                    continue;
+                }
+                let _ = tx
+                    .send(Ok(WatchResponse {
+                        header: Some(header(to)),
+                        watch_id: *id,
+                        events,
+                        ..Default::default()
+                    }))
+                    .await;
+            }
+        }
+        Err(Error::Compacted { compacted, .. }) => {
+            // Only watchers that can no longer catch up cancel; the rest
+            // retry from their own cursors on the next tick.
+            let stale: Vec<i64> = watchers
+                .iter()
+                .filter(|(_, w)| w.next_rev <= compacted)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in stale {
+                watchers.remove(&id);
+                let _ = tx
+                    .send(Ok(WatchResponse {
+                        header: Some(header(compacted)),
+                        watch_id: id,
+                        canceled: true,
+                        compact_revision: compacted,
+                        cancel_reason: "etcdserver: mvcc: required revision has been compacted"
+                            .into(),
+                        ..Default::default()
+                    }))
+                    .await;
+            }
+        }
+        // Transient storage error: keep the cursors, retry next tick.
+        Err(_) => {}
     }
 }
 
@@ -229,7 +326,7 @@ async fn handle_create(
         c.start_revision
     };
     let watcher = Watcher {
-        live_from: start.max(cur + 1),
+        next_rev: start.max(cur + 1),
         key: c.key.clone(),
         range_end: c.range_end.clone(),
         no_put: c.filters.contains(&(0i32)),
@@ -361,7 +458,7 @@ mod tests {
 
     fn watcher(key: &[u8]) -> Watcher {
         Watcher {
-            live_from: 0,
+            next_rev: 0,
             key: key.to_vec(),
             range_end: Vec::new(),
             no_put: false,
@@ -539,5 +636,67 @@ mod tests {
         )
         .await;
         assert!(watchers.is_empty());
+    }
+
+    async fn caught(
+        backend: &Arc<dyn Backend>,
+        watchers: &mut HashMap<i64, Watcher>,
+    ) -> Vec<WatchResponse> {
+        let (tx, mut rx) = mpsc::channel(16);
+        catch_up(backend, &tx, watchers).await;
+        drop(tx);
+        let mut out = Vec::new();
+        while let Some(r) = rx.recv().await {
+            out.push(r.unwrap());
+        }
+        out
+    }
+
+    fn ranged(key: &[u8], next_rev: i64) -> Watcher {
+        Watcher {
+            next_rev,
+            key: key.to_vec(),
+            range_end: Vec::new(),
+            no_put: false,
+            no_delete: false,
+            prev_kv: false,
+            progress_notify: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn catch_up_replays_missed_revisions_without_broadcast() {
+        // Revs 2 and 3 committed; the watcher never saw a broadcast.
+        let backend = backend_with(&[b"a", b"b"]).await;
+        let mut watchers = HashMap::new();
+        watchers.insert(7, ranged(b"a", 2));
+        // A cursor past the current revision fetches nothing.
+        watchers.insert(8, ranged(b"a", 99));
+        let out = caught(&backend, &mut watchers).await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].watch_id, 7);
+        assert_eq!(out[0].events.len(), 1);
+        assert_eq!(out[0].events[0].kv.as_ref().unwrap().key, b"a".to_vec());
+        // Cursors advanced past everything fetched; a second tick is quiet
+        // and duplicate-free even though the broadcast never arrived.
+        assert_eq!(watchers[&7].next_rev, 4);
+        assert_eq!(watchers[&8].next_rev, 99);
+        assert!(caught(&backend, &mut watchers).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn catch_up_cancels_only_compacted_watchers() {
+        let backend = backend_with(&[b"h"]).await;
+        backend.compact(2).await.unwrap();
+        let mut watchers = HashMap::new();
+        watchers.insert(7, ranged(b"h", 2));
+        watchers.insert(8, ranged(b"h", 99));
+        let out = caught(&backend, &mut watchers).await;
+        assert_eq!(out.len(), 1);
+        assert!(out[0].canceled);
+        assert_eq!(out[0].watch_id, 7);
+        assert!(out[0].compact_revision > 0);
+        assert!(!watchers.contains_key(&7));
+        assert!(watchers.contains_key(&8));
     }
 }
