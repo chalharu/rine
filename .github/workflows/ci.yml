@@ -1,30 +1,34 @@
 name: CI
-
 on:
   push:
     branches:
       - main
   pull_request:
-
 env:
   CARGO_TERM_COLOR: always
-
+permissions:
+  contents: read
 jobs:
   unit:
     name: unit tests (no DB)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2.9.3
       - name: install cargo-llvm-cov
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.90.6
         with:
           tool: cargo-llvm-cov
       - name: unit tests with coverage
@@ -34,17 +38,19 @@ jobs:
           sh scripts/lcov-workspace.sh coverage/raw-unit.info coverage/lcov-unit.info
           rm coverage/raw-unit.info
       - name: upload coverage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: coverage-unit
           path: coverage/lcov-unit.info
           if-no-files-found: error
       - name: clippy
         run: cargo clippy --workspace --tests
-
   oracle-xe:
     name: integration tests (Oracle XE)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
     services:
       oracle:
         image: gvenzl/oracle-xe:21.3.0-slim@sha256:ecdf4302ac3d134e1bac5ef6e0c223c2d0f4d4d2b6d551aa79b2346f1ab8f792
@@ -55,10 +61,7 @@ jobs:
         ports:
           - 1521:1521
         options: >-
-          --health-cmd healthcheck.sh
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
+          --health-cmd healthcheck.sh --health-interval 10s --health-timeout 5s --health-retries 10
     env:
       ORACLE_HOST: 127.0.0.1
       ORACLE_PORT: 1521
@@ -70,6 +73,8 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
@@ -88,7 +93,7 @@ jobs:
           echo "Oracle XE did not open port 1521 in time"
           exit 1
       - name: install cargo-llvm-cov
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.90.6
         with:
           tool: cargo-llvm-cov
       - name: backend integration test (live XE)
@@ -102,21 +107,25 @@ jobs:
           sh scripts/lcov-workspace.sh coverage/raw-oracle.info coverage/lcov-oracle.info
           rm coverage/raw-oracle.info
       - name: upload coverage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: coverage-oracle
           path: coverage/lcov-oracle.info
           if-no-files-found: error
-
   sqlite-e2e:
     name: official client e2e (SQLite and upstream etcd)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     env:
       RINE_BACKEND: sqlite
       RINE_SQLITE_PATH: /tmp/rine.db
       RINE_LISTEN: 127.0.0.1:2379
     steps:
       - uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
@@ -176,10 +185,12 @@ jobs:
       - name: rine server log
         if: failure()
         run: cat /tmp/rine.log
-
   etcdctl-e2e:
     name: official client e2e (Oracle backend)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     services:
       oracle:
         image: gvenzl/oracle-xe:21.3.0-slim@sha256:ecdf4302ac3d134e1bac5ef6e0c223c2d0f4d4d2b6d551aa79b2346f1ab8f792
@@ -190,10 +201,7 @@ jobs:
         ports:
           - 1521:1521
         options: >-
-          --health-cmd healthcheck.sh
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
+          --health-cmd healthcheck.sh --health-interval 10s --health-timeout 5s --health-retries 10
     env:
       RINE_BACKEND: oracle
       RINE_ORACLE_CONNECT: 127.0.0.1:1521/XEPDB1
@@ -202,6 +210,8 @@ jobs:
       RINE_LISTEN: 127.0.0.1:2379
     steps:
       - uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
@@ -255,16 +265,20 @@ jobs:
       - name: rine server log
         if: failure()
         run: cat /tmp/rine.log
-
   sonarcloud:
     name: SonarCloud analysis
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
     needs: [unit, oracle-xe]
     steps:
       - uses: actions/checkout@v4.4.0
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+          persist-credentials: false
+      - uses: actions/download-artifact@v4.3.0
         with:
           pattern: coverage-*
           path: coverage
@@ -276,7 +290,7 @@ jobs:
           done
           rm coverage/lcov-*.info
       - name: SonarCloud scan
-        uses: SonarSource/sonarqube-scan-action@v8
+        uses: SonarSource/sonarqube-scan-action@v8.5.0
         env:
           SONAR_HOST_URL: https://sonarcloud.io
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

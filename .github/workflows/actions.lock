@@ -5,45 +5,45 @@ version: 'v0.0.3'
 workflows:
     '.github/workflows/ci.yml':
         - 'actions/checkout@v4.4.0'
+        - 'actions/download-artifact@v4.3.0'
+        - 'actions/upload-artifact@v4.6.2'
         - 'dtolnay/rust-toolchain@stable'
+        - 'sonarsource/sonarqube-scan-action@v8.5.0'
         - 'swatinem/rust-cache@v2.9.3'
-        - 'taiki-e/install-action@v2'
-        - 'actions/upload-artifact@v4'
-        - 'actions/download-artifact@v4'
-        - 'sonarsource/sonarqube-scan-action@v8'
+        - 'taiki-e/install-action@v2.90.6'
 dependencies:
     'actions/checkout@v4.4.0':
         ref: 'v4.4.0'
         commit: 'sha1-11d5960a326750d5838078e36cf38b85af677262'
         owner_id: 44036562
         repo_id: 197814629
+    'actions/download-artifact@v4.3.0':
+        ref: 'v4.3.0'
+        commit: 'sha1-d3f86a106a0bac45b974a628896c90dbdf5c8093'
+        owner_id: 44036562
+        repo_id: 192626254
+    'actions/upload-artifact@v4.6.2':
+        ref: 'v4.6.2'
+        commit: 'sha1-ea165f8d65b6e75b540449e92b4886f43607fa02'
+        owner_id: 44036562
+        repo_id: 192625955
     'dtolnay/rust-toolchain@stable':
         ref: 'stable'
         commit: 'sha1-39008827e6b4319a349e9a42dfc90579dd25f1ca'
         owner_id: 1940490
         repo_id: 260749683
+    'sonarsource/sonarqube-scan-action@v8.5.0':
+        ref: 'v8.5.0'
+        commit: 'sha1-59202af334b4ba7b5db01b701b8e79f8b3bef0f4'
+        owner_id: 545988
+        repo_id: 366408409
     'swatinem/rust-cache@v2.9.3':
         ref: 'v2.9.3'
         commit: 'sha1-d1527c8f67ef9af357290475d4af4b0fab8f12e0'
         owner_id: 580492
         repo_id: 298565987
-    'taiki-e/install-action@v2':
-        ref: 'v2'
+    'taiki-e/install-action@v2.90.6':
+        ref: 'v2.90.6'
         commit: 'sha1-75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f'
         owner_id: 43724913
         repo_id: 442947557
-    'actions/upload-artifact@v4':
-        ref: 'v4'
-        commit: 'sha1-ea165f8d65b6e75b540449e92b4886f43607fa02'
-        owner_id: 44036562
-        repo_id: 192625955
-    'actions/download-artifact@v4':
-        ref: 'v4'
-        commit: 'sha1-d3f86a106a0bac45b974a628896c90dbdf5c8093'
-        owner_id: 44036562
-        repo_id: 192626254
-    'sonarsource/sonarqube-scan-action@v8':
-        ref: 'v8'
-        commit: 'sha1-59202af334b4ba7b5db01b701b8e79f8b3bef0f4'
-        owner_id: 545988
-        repo_id: 366408409
