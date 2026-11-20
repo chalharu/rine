@@ -14,8 +14,6 @@ use crate::{
 
 pub struct ClusterService {
     backend: Arc<dyn Backend>,
-    member_id: u64,
-    member_name: String,
     client_url: String,
 }
 
@@ -23,8 +21,6 @@ impl ClusterService {
     pub fn new(backend: Arc<dyn Backend>, client_url: String) -> Self {
         Self {
             backend,
-            member_id: MEMBER_ID,
-            member_name: "rine".into(),
             client_url,
         }
     }
@@ -40,8 +36,8 @@ impl Cluster for ClusterService {
         Ok(tonic::Response::new(MemberListResponse {
             header: Some(header(rev)),
             members: vec![Member {
-                id: self.member_id,
-                name: self.member_name.clone(),
+                id: MEMBER_ID,
+                name: "rine".into(),
                 peer_ur_ls: vec![self.client_url.clone()],
                 client_ur_ls: vec![self.client_url.clone()],
                 is_learner: false,
@@ -52,15 +48,11 @@ impl Cluster for ClusterService {
 
 pub struct MaintenanceService {
     backend: Arc<dyn Backend>,
-    member_id: u64,
 }
 
 impl MaintenanceService {
     pub fn new(backend: Arc<dyn Backend>) -> Self {
-        Self {
-            backend,
-            member_id: MEMBER_ID,
-        }
+        Self { backend }
     }
 }
 
@@ -76,7 +68,7 @@ impl Maintenance for MaintenanceService {
             header: Some(header(rev)),
             version: VERSION.into(),
             db_size: size,
-            leader: self.member_id,
+            leader: MEMBER_ID,
             raft_index: rev.max(0) as u64,
             raft_term: 0,
             raft_applied_index: rev.max(0) as u64,

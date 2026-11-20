@@ -179,15 +179,13 @@ impl std::error::Error for SqliteRealUnexpected {}
 #[async_trait]
 impl SqlExecutor for SqliteDb {
     async fn execute_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
-        if self.in_unit.load(Ordering::SeqCst) {
-            // Inside a commit unit the connection already holds BEGIN
-            // IMMEDIATE; run the statements directly instead of nesting a
-            // second transaction.
-            return self
-                .run_blocking(move |conn| apply_batch(conn, statements))
-                .await;
-        }
+        // Inside a commit unit the connection already holds BEGIN IMMEDIATE;
+        // run the statements directly instead of nesting a second transaction.
+        let unit = self.in_unit.load(Ordering::SeqCst);
         self.run_blocking(move |conn| {
+            if unit {
+                return apply_batch(conn, statements);
+            }
             let tx = conn.unchecked_transaction()?;
             apply_batch(&tx, statements)?;
             tx.commit()

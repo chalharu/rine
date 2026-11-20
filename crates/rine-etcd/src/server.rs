@@ -111,3 +111,37 @@ impl EtcdServer {
         Ok(())
     }
 }
+
+/// Serve `backend` on an OS-assigned plaintext port and wait until a real
+/// Range succeeds. Returns the `http://` endpoint for gRPC clients.
+/// Test and embedding helper so the bind/serve/readiness probe lives
+/// once instead of once per integration test.
+pub async fn serve_ephemeral(backend: Arc<dyn Backend>) -> String {
+    use crate::etcdserverpb::{RangeRequest, kv_client::KvClient};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let endpoint = format!("http://{addr}");
+    tokio::spawn(async move {
+        EtcdServer::new(backend)
+            .serve_many(vec![ListenAddr { addr, tls: None }])
+            .await
+            .unwrap();
+    });
+    // Wait until servable.
+    for _ in 0..50 {
+        if let Ok(mut c) = KvClient::connect(endpoint.clone()).await
+            && c.range(RangeRequest {
+                key: b"x".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    endpoint
+}

@@ -44,23 +44,16 @@ impl Dialect for OracleDialect {
         CREATE_INDEXES
     }
 
-    /// Pre-existing tables converge here: every index is re-attempted and a
-    /// concurrent creator's `AlreadyExists` is tolerated, so no index probe
-    /// is needed.
-    fn ensure_indexes_sql() -> &'static [&'static str] {
-        CREATE_INDEXES
-    }
-
     fn probe_sql() -> &'static str {
         "SELECT 1 FROM rine WHERE ROWNUM = 1"
     }
 
-    fn bind(index: usize) -> String {
-        format!(":{index}")
+    fn current_revision_sql() -> String {
+        "SELECT created FROM rine ORDER BY id DESC FETCH FIRST 1 ROWS ONLY".into()
     }
 
-    fn first_row() -> &'static str {
-        "FETCH FIRST 1 ROWS ONLY"
+    fn bind(index: usize) -> String {
+        format!(":{index}")
     }
 
     fn compacted_rev_sql() -> &'static str {
@@ -71,27 +64,6 @@ impl Dialect for OracleDialect {
         format!(
             "SELECT {COLS} FROM rine WHERE created >= :1 AND created <= :2 AND name <> 'compact_rev_key' ORDER BY id",
             COLS = Self::cols(),
-        )
-    }
-
-    fn list_exact_sql() -> String {
-        format!(
-            "SELECT {COLS} FROM rine WHERE name = :1 AND deleted = 0 ORDER BY name, id",
-            COLS = Self::cols()
-        )
-    }
-
-    fn list_ge_sql() -> String {
-        format!(
-            "SELECT {COLS} FROM rine WHERE name >= :1 AND deleted = 0 ORDER BY name, id",
-            COLS = Self::cols()
-        )
-    }
-
-    fn list_range_sql() -> String {
-        format!(
-            "SELECT {COLS} FROM rine WHERE name >= :1 AND name < :2 AND deleted = 0 ORDER BY name, id",
-            COLS = Self::cols()
         )
     }
 
@@ -113,18 +85,14 @@ impl Dialect for OracleDialect {
          VALUES (0, 'compact_rev_key', 0, 0, 0, :1, 0)"
     }
 
-    /// Latest read split into rows + count, mirroring SQLite: rows in index
-    /// order with `FETCH FIRST`, count from a covering index. Both run in
-    /// one `query_batch` on one connection.
+    /// Latest read split into rows + count: rows in index order with
+    /// `FETCH FIRST`, count from a covering index. Both run in one
+    /// `query_batch` on one connection.
     fn live_range_queries(
         end: Option<&[u8]>,
         opts: &ListOptions,
     ) -> (Option<String>, Option<String>) {
-        let (predicate, limit_bind) = match end {
-            None | Some([]) => ("name = :1", ":2"),
-            Some([0]) => ("name >= :1", ":2"),
-            Some(_) => ("name >= :1 AND name < :2", ":3"),
-        };
+        let (predicate, binds) = Self::range_predicate(end);
         let filter = format!("{predicate} AND deleted = 0 AND name <> 'compact_rev_key'");
         let rows = (!opts.count_only).then(|| {
             let cols = if opts.keys_only {
@@ -133,16 +101,14 @@ impl Dialect for OracleDialect {
                 Self::cols()
             };
             let limit = if opts.limit > 0 {
-                format!(" ORDER BY name, id FETCH FIRST {limit_bind} ROWS ONLY")
+                format!(" FETCH FIRST {} ROWS ONLY", Self::bind(binds + 1))
             } else {
                 String::new()
             };
-            // Unlimited ranges keep the covering order without a fetch cap.
-            let order = if limit.is_empty() { " ORDER BY name, id" } else { "" };
-            format!("SELECT {cols} FROM rine WHERE {filter}{order}{limit}")
+            format!("SELECT {cols} FROM rine WHERE {filter} ORDER BY name, id{limit}")
         });
         // Point lookups and unlimited ranges derive the count from the rows.
-        let count = (opts.count_only || (opts.limit > 0 && !matches!(end, None | Some([]))))
+        let count = Self::needs_count(end, opts)
             .then(|| format!("SELECT COUNT(*) FROM rine WHERE {filter}"));
         (rows, count)
     }
@@ -184,7 +150,7 @@ mod tests {
             },
         );
         let owned = [
-            OracleDialect::list_range_sql(),
+            OracleDialect::list_history_sql(Some(b"x")),
             OracleDialect::commit_state_sql(2),
             OracleDialect::events_sql(),
             rows.unwrap(),

@@ -5,12 +5,9 @@
 //! `FlakyBackend` fails the first commit with `Error::Conflict`, then behaves
 //! like a normal `MemoryBackend`.
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 use async_trait::async_trait;
@@ -24,7 +21,7 @@ use rine_etcd::{
         request_op::Request,
         response_op::Response,
     },
-    server::{EtcdServer, ListenAddr},
+    server::serve_ephemeral,
 };
 
 struct FlakyBackend {
@@ -88,37 +85,9 @@ impl Backend for FlakyBackend {
     }
 }
 
-async fn spawn() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    let endpoint = format!("http://{addr}");
-    let backend = Arc::new(FlakyBackend::new());
-    tokio::spawn(async move {
-        EtcdServer::new(backend)
-            .serve_many(vec![ListenAddr { addr, tls: None }])
-            .await
-            .unwrap();
-    });
-    for _ in 0..50 {
-        if let Ok(mut c) = KvClient::connect(endpoint.clone()).await
-            && c.range(RangeRequest {
-                key: b"x".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .is_ok()
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    endpoint
-}
-
 #[tokio::test]
 async fn txn_conflict_reports_not_succeeded() {
-    let ep = spawn().await;
+    let ep = serve_ephemeral(Arc::new(FlakyBackend::new())).await;
     let mut kv = KvClient::connect(ep).await.unwrap();
 
     // Compare passes (missing key has version 0), but the commit of the

@@ -32,22 +32,12 @@ struct LeaseEntry {
     keys: Vec<Vec<u8>>,
 }
 
+#[derive(Clone)]
 pub struct LeaseManager {
     writes: CommitLock,
     inner: Arc<RwLock<HashMap<i64, LeaseEntry>>>,
     backend: Arc<dyn Backend>,
     next_id: Arc<AtomicI64>,
-}
-
-impl Clone for LeaseManager {
-    fn clone(&self) -> Self {
-        Self {
-            writes: self.writes.clone(),
-            inner: self.inner.clone(),
-            backend: self.backend.clone(),
-            next_id: self.next_id.clone(),
-        }
-    }
 }
 
 impl LeaseManager {

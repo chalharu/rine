@@ -90,13 +90,11 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
             Err(Error::TableMissing(_)) => self.create_schema().await,
             Err(e) => Err(e),
         }?;
-        // `create_indexes_sql` covers fresh tables; `ensure_indexes_sql`
-        // converges pre-existing tables missing an index. Re-running either
-        // tolerates a concurrent creator via `AlreadyExists`.
-        for stmt in D::create_indexes_sql()
-            .iter()
-            .chain(D::ensure_indexes_sql().iter())
-        {
+        // One index list for fresh and pre-existing tables alike: re-running
+        // tolerates a concurrent creator via `AlreadyExists`, so tables
+        // created before an index existed converge here instead of failing
+        // or running degraded.
+        for stmt in D::create_indexes_sql() {
             self.create_statement_with_retry(stmt).await?;
         }
         Ok(())
@@ -132,28 +130,37 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         self.exec.execute(stmt, vec![]).await.map(|_| ())
     }
 
-    async fn current_rev_inner(&self) -> Result<Revision> {
-        let row = self
-            .exec
-            .query_row(&D::current_revision_sql(), vec![])
-            .await?;
-        match row {
-            Some(r) if !r.is_null(0) => Ok(r.get_int(0)?.max(1)),
-            _ => Ok(1),
+    /// Single-integer watermark (`current_revision`, `compacted_revision`):
+    /// missing or NULL reads as `default` (fresh table, absent watermark row).
+    async fn watermark(&self, sql: &str, default: Revision) -> Result<Revision> {
+        match self.exec.query_row(sql, vec![]).await? {
+            Some(r) if !r.is_null(0) => Ok(r.get_int(0)?),
+            _ => Ok(default),
         }
     }
 
+    async fn current_rev_inner(&self) -> Result<Revision> {
+        self.watermark(&D::current_revision_sql(), 1)
+            .await
+            .map(|v| v.max(1))
+    }
+
     async fn compacted_inner(&self) -> Result<Revision> {
-        let row = self.exec.query_row(D::compacted_rev_sql(), vec![]).await?;
-        Ok(match row {
-            Some(r) if !r.is_null(0) => r.get_int(0).unwrap_or(0),
-            _ => 0,
-        })
+        self.watermark(D::compacted_rev_sql(), 0).await
+    }
+
+    /// First column of the first row, or `default` when the query is empty
+    /// (fresh table). A present but NULL cell is a schema bug, not emptiness.
+    fn cell(rows: Option<Vec<Row>>, default: i64) -> Result<i64> {
+        match rows.and_then(|r| r.into_iter().next()) {
+            Some(r) => r.get_int(0),
+            None => Ok(default),
+        }
     }
 
     async fn check_rev(&self, rev: Revision) -> Result<Revision> {
         // Both watermarks in one trip (a single blocking call on Oracle).
-        let mut rows = self
+        let mut results = self
             .exec
             .query_batch(vec![
                 (D::current_revision_sql(), vec![]),
@@ -161,20 +168,9 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
             ])
             .await?
             .into_iter();
-        let cur = rows
-            .next()
-            .and_then(|rows| rows.into_iter().next())
-            .map(|r| r.get_int(0))
-            .transpose()?
-            .unwrap_or(1)
-            .max(1);
+        let cur = Self::cell(results.next(), 1)?.max(1);
         if rev > 0 {
-            let c = rows
-                .next()
-                .and_then(|rows| rows.into_iter().next())
-                .map(|r| r.get_int(0))
-                .transpose()?
-                .unwrap_or(0);
+            let c = Self::cell(results.next(), 0)?;
             if rev < c {
                 return Err(Error::Compacted {
                     requested: rev,
@@ -223,13 +219,7 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
                 queries.push((sql, params));
             }
             let mut results = self.exec.query_batch(queries).await?.into_iter();
-            let revision = results
-                .next()
-                .and_then(|rows| rows.into_iter().next())
-                .map(|r| r.get_int(0))
-                .transpose()?
-                .unwrap_or(1)
-                .max(1);
+            let revision = Self::cell(results.next(), 1)?.max(1);
             let mut kvs = Vec::new();
             if has_rows {
                 let rows = results
@@ -252,14 +242,11 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
             return Ok((revision, kvs, total));
         }
         let cur = self.check_rev(opts.revision).await?;
-        let (mut sql, mut params) = match range_end {
-            None | Some([]) => (D::list_exact_sql(), vec![SqlValue::Str(key_str(prefix))]),
-            Some([0]) => (D::list_ge_sql(), vec![SqlValue::Str(key_str(prefix))]),
-            Some(end) => (
-                D::list_range_sql(),
-                vec![SqlValue::Str(key_str(prefix)), SqlValue::Str(key_str(end))],
-            ),
-        };
+        let mut sql = D::list_history_sql(range_end);
+        let mut params = vec![SqlValue::Str(key_str(prefix))];
+        if let Some(end) = range_end.filter(|end| !end.is_empty() && *end != [0]) {
+            params.push(SqlValue::Str(key_str(end)));
+        }
         if opts.revision > 0 && opts.revision < cur {
             sql = D::snapshot_sql(range_end);
             params.push(SqlValue::Int(opts.revision));
@@ -267,7 +254,7 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         let rows = self.exec.query_all(&sql, params).await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
-            if r.get_str(1)? != D::compacted_rev_key() {
+            if r.get_str(1)? != "compact_rev_key" {
                 out.push(row_to_kv(r)?);
             }
         }
@@ -332,15 +319,10 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
             .collect();
         // One lookup per chunk (empty commits still read the metadata row).
         // The newest physical row carries the highest logical revision.
-        let no_names: &[String] = &[];
-        let chunks: Vec<&[String]> = {
-            let chunks: Vec<&[String]> = names.chunks(COMMIT_NAMES_PER_QUERY).collect();
-            if chunks.is_empty() {
-                vec![no_names]
-            } else {
-                chunks
-            }
-        };
+        let mut chunks: Vec<&[String]> = names.chunks(COMMIT_NAMES_PER_QUERY).collect();
+        if chunks.is_empty() {
+            chunks.push(&[]);
+        }
         let mut latest = HashMap::new();
         let (mut fresh, mut id) = (0, 0);
         for chunk in chunks {
@@ -384,7 +366,7 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         let mut statements = Vec::new();
         for event in &events {
             let name = key_str(&event.key);
-            if name == D::compacted_rev_key() {
+            if name == "compact_rev_key" {
                 return Err(Error::Backend(
                     "key is reserved for compaction metadata".into(),
                 ));
@@ -440,7 +422,7 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         let _guard = self.writes.lock().await;
         if let [event] = events.as_slice()
             && !event.deleted
-            && key_str(&event.key) != D::compacted_rev_key()
+            && key_str(&event.key) != "compact_rev_key"
             && reads.ranges.is_empty()
             && reads.points.iter().all(|(key, revision)| {
                 *key == event.key && *revision == event.prev_kv.as_ref().map(|kv| kv.mod_revision)
@@ -539,8 +521,9 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
         range_end: Option<&[u8]>,
         opts: ListOptions,
     ) -> Result<(Revision, Vec<KeyValue>, i64)> {
-        // Latest reads run lock-free on one statement; historical reads take
-        // the write mutex to observe a stable snapshot.
+        // Latest reads run lock-free in one `query_batch` read transaction;
+        // historical reads take the write mutex so a concurrent compact
+        // cannot delete the history under the read.
         if opts.revision <= 0 {
             return self.list_inner(prefix, range_end, &opts).await;
         }
@@ -687,33 +670,21 @@ mod tests {
             "CREATE TABLE rine"
         }
         fn create_indexes_sql() -> &'static [&'static str] {
-            &[]
-        }
-        fn ensure_indexes_sql() -> &'static [&'static str] {
             &["CREATE INDEX idx_test"]
         }
         fn probe_sql() -> &'static str {
             "PROBE TABLE"
         }
+        fn current_revision_sql() -> String {
+            unimplemented!()
+        }
         fn bind(_index: usize) -> String {
             "?".into()
-        }
-        fn first_row() -> &'static str {
-            ""
         }
         fn compacted_rev_sql() -> &'static str {
             unimplemented!()
         }
         fn events_sql() -> String {
-            unimplemented!()
-        }
-        fn list_exact_sql() -> String {
-            unimplemented!()
-        }
-        fn list_ge_sql() -> String {
-            unimplemented!()
-        }
-        fn list_range_sql() -> String {
             unimplemented!()
         }
         fn live_range_queries(

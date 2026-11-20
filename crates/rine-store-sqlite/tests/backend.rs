@@ -141,15 +141,15 @@ async fn sqlite_driver_errors_are_typed() {
 
 #[tokio::test]
 async fn sqlite_ensure_schema_adds_missing_unique_index() {
+    use rine_store_executor::Dialect as _;
+    use rine_store_sqlite::SqliteDialect;
+
     // A DBA-prepared table without the backstop index: startup must add the
     // index itself instead of failing or running degraded.
     let db = SqliteDb::open_in_memory().unwrap();
-    db.execute(
-        "CREATE TABLE rine (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(630), created INTEGER DEFAULT 0, deleted INTEGER DEFAULT 0, create_revision INTEGER DEFAULT 0, prev_revision INTEGER DEFAULT 0, lease INTEGER DEFAULT 0, version INTEGER DEFAULT 1, value BLOB)",
-        vec![],
-    )
-    .await
-    .unwrap();
+    db.execute(SqliteDialect::create_table_sql(), vec![])
+        .await
+        .unwrap();
     let before = db
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'rine_name_prev_revision_uindex'",

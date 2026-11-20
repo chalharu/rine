@@ -96,7 +96,6 @@ impl MemoryBackend {
         Ok(())
     }
 
-    #[allow(clippy::type_complexity)]
     fn list_locked(
         g: &Inner,
         prefix: &[u8],

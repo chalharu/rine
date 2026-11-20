@@ -1,47 +1,22 @@
 //! gRPC over the SQLite-backed store: proves the full stack serves the
 //! etcd API against a real (in-memory) database.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
-use rine_etcd::{
-    etcdserverpb::{
-        Compare, PutRequest, RangeRequest, RequestOp, TxnRequest,
-        compare::{CompareResult, CompareTarget, TargetUnion},
-        kv_client::KvClient,
-        request_op,
-    },
-    server::{EtcdServer, ListenAddr},
+use rine_etcd::etcdserverpb::{
+    Compare, PutRequest, RangeRequest, RequestOp, TxnRequest,
+    compare::{CompareResult, CompareTarget, TargetUnion},
+    kv_client::KvClient,
+    request_op,
 };
+use rine_etcd::server::serve_ephemeral;
 use rine_store_sqlite::{SqliteBackend, SqliteDb};
 
 async fn spawn() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    let endpoint = format!("http://{addr}");
     let db = SqliteDb::open_in_memory().unwrap();
     let backend = Arc::new(SqliteBackend::new(Arc::new(db)));
     backend.ensure_schema().await.unwrap();
-    tokio::spawn(async move {
-        EtcdServer::new(backend)
-            .serve_many(vec![ListenAddr { addr, tls: None }])
-            .await
-            .unwrap();
-    });
-    for _ in 0..50 {
-        if let Ok(mut c) = KvClient::connect(endpoint.clone()).await
-            && c.range(RangeRequest {
-                key: b"x".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .is_ok()
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    endpoint
+    serve_ephemeral(backend).await
 }
 
 #[tokio::test]

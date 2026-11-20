@@ -18,37 +18,8 @@ use rine_etcd::{
         watch_client::WatchClient,
         watch_request,
     },
-    server::{EtcdServer, ListenAddr},
+    server::serve_ephemeral,
 };
-
-async fn spawn() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    let endpoint = format!("http://{addr}");
-    let backend = Arc::new(MemoryBackend::new());
-    tokio::spawn(async move {
-        EtcdServer::new(backend)
-            .serve_many(vec![ListenAddr { addr, tls: None }])
-            .await
-            .unwrap();
-    });
-    // Wait until servable.
-    for _ in 0..50 {
-        if let Ok(mut c) = KvClient::connect(endpoint.clone()).await
-            && c.range(RangeRequest {
-                key: b"x".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .is_ok()
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    endpoint
-}
 
 fn put_op(key: &[u8], value: &[u8]) -> RequestOp {
     RequestOp {
@@ -62,7 +33,7 @@ fn put_op(key: &[u8], value: &[u8]) -> RequestOp {
 
 #[tokio::test]
 async fn kv_put_range_sort() {
-    let ep = spawn().await;
+    let ep = serve_ephemeral(Arc::new(MemoryBackend::new())).await;
     let mut kv = KvClient::connect(ep).await.unwrap();
     for (k, v) in [
         (b"b".as_slice(), b"2".as_slice()),
@@ -95,7 +66,7 @@ async fn kv_put_range_sort() {
 
 #[tokio::test]
 async fn txn_create_cas_delete() {
-    let ep = spawn().await;
+    let ep = serve_ephemeral(Arc::new(MemoryBackend::new())).await;
     let mut kv = KvClient::connect(ep).await.unwrap();
 
     // create: MOD == 0
@@ -172,7 +143,7 @@ async fn txn_create_cas_delete() {
 
 #[tokio::test]
 async fn compact_and_history() {
-    let ep = spawn().await;
+    let ep = serve_ephemeral(Arc::new(MemoryBackend::new())).await;
     let mut kv = KvClient::connect(ep).await.unwrap();
     kv.put(PutRequest {
         key: b"h".to_vec(),
@@ -212,7 +183,7 @@ async fn compact_and_history() {
 
 #[tokio::test]
 async fn status_member_list() {
-    let ep = spawn().await;
+    let ep = serve_ephemeral(Arc::new(MemoryBackend::new())).await;
     let mut m = MaintenanceClient::connect(ep.clone()).await.unwrap();
     let s = m.status(StatusRequest {}).await.unwrap().into_inner();
     assert_eq!(s.version, "3.5.0");
@@ -228,7 +199,7 @@ async fn status_member_list() {
 
 #[tokio::test]
 async fn lease_grant_put_ttl() {
-    let ep = spawn().await;
+    let ep = serve_ephemeral(Arc::new(MemoryBackend::new())).await;
     let mut lease = LeaseClient::connect(ep.clone()).await.unwrap();
     let g = lease
         .lease_grant(LeaseGrantRequest { ttl: 60, id: 0 })
@@ -263,7 +234,7 @@ async fn lease_grant_put_ttl() {
 
 #[tokio::test]
 async fn watch_receives_put() {
-    let ep = spawn().await;
+    let ep = serve_ephemeral(Arc::new(MemoryBackend::new())).await;
     let mut watch = WatchClient::connect(ep.clone()).await.unwrap();
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     let mut stream = watch

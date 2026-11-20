@@ -12,25 +12,11 @@ pub trait Dialect: Send + Sync + 'static {
     fn create_table_sql() -> &'static str;
     fn create_indexes_sql() -> &'static [&'static str];
 
-    /// Index DDL applied to pre-existing tables (idempotent: re-running
-    /// tolerates an already-existing index). Fresh tables get these from
-    /// `create_indexes_sql`; tables created before an index existed converge
-    /// here instead of failing or running degraded.
-    fn ensure_indexes_sql() -> &'static [&'static str] {
-        &[]
-    }
-
     /// Schema probe for `ensure_schema`.
     fn probe_sql() -> &'static str;
 
-    fn current_revision_sql() -> String {
-        format!(
-            "SELECT created FROM rine ORDER BY id DESC {}",
-            Self::first_row()
-        )
-    }
+    fn current_revision_sql() -> String;
     fn bind(index: usize) -> String;
-    fn first_row() -> &'static str;
 
     fn insert_event_sql() -> String {
         let binds = (1..=9).map(Self::bind).collect::<Vec<_>>().join(", ");
@@ -43,16 +29,27 @@ pub trait Dialect: Send + Sync + 'static {
         format!("SELECT {} FROM rine WHERE id IN ({binds})", Self::cols())
     }
 
+    /// `WHERE` predicate for the end-of-range convention (`None`/`[]` = single
+    /// key, `[0]` = `>= key`, else `[key, end)`), with bind placeholders.
+    /// Returns the predicate and the number of key binds (2 for `[key, end)`).
+    fn range_predicate(end: Option<&[u8]>) -> (String, usize) {
+        let (first, second) = (Self::bind(1), Self::bind(2));
+        match end {
+            None | Some([]) => (format!("name = {first}"), 1),
+            Some([0]) => (format!("name >= {first}"), 1),
+            Some(_) => (format!("name >= {first} AND name < {second}"), 2),
+        }
+    }
+
+    /// Whether a range read needs a separate full-count query: point lookups
+    /// and unlimited ranges derive the count from the returned rows.
+    fn needs_count(end: Option<&[u8]>, opts: &ListOptions) -> bool {
+        opts.count_only || (opts.limit > 0 && !matches!(end, None | Some([])))
+    }
+
     fn snapshot_sql(end: Option<&[u8]>) -> String {
-        let key = Self::bind(1);
-        let (predicate, revision) = match end {
-            None | Some([]) => (format!("name = {key}"), Self::bind(2)),
-            Some([0]) => (format!("name >= {key}"), Self::bind(2)),
-            Some(_) => (
-                format!("name >= {key} AND name < {}", Self::bind(2)),
-                Self::bind(3),
-            ),
-        };
+        let (predicate, binds) = Self::range_predicate(end);
+        let revision = Self::bind(binds + 1);
         let cols = Self::cols();
         format!(
             "SELECT {cols} FROM (SELECT {cols}, ROW_NUMBER() OVER (PARTITION BY name ORDER BY id DESC) AS snapshot_rank \
@@ -65,11 +62,16 @@ pub trait Dialect: Send + Sync + 'static {
     /// Event log slice for watch replay.
     fn events_sql() -> String;
 
-    /// Range reads. Caller picks the predicate by end-of-range convention:
-    /// empty = single key, `x00` = `>= key`, else `[key, end)`.
-    fn list_exact_sql() -> String;
-    fn list_ge_sql() -> String;
-    fn list_range_sql() -> String;
+    /// Historical range read: live rows at `revision == cur` semantics are
+    /// handled by the caller; this covers point lookups, `>= key`, and
+    /// `[key, end)` with the end-of-range convention above.
+    fn list_history_sql(end: Option<&[u8]>) -> String {
+        let (predicate, _) = Self::range_predicate(end);
+        format!(
+            "SELECT {COLS} FROM rine WHERE {predicate} AND deleted = 0 ORDER BY name, id",
+            COLS = Self::cols(),
+        )
+    }
 
     /// Latest-range pushdown: split value and count retrieval so a limited
     /// range can serve rows in index order with LIMIT while the count uses
@@ -100,11 +102,6 @@ pub trait Dialect: Send + Sync + 'static {
     fn set_compact_rev_insert_sql() -> &'static str;
 
     fn db_size_sql() -> &'static str;
-
-    /// Revision bookkeeping mirrors rine's `compact_rev_key` row.
-    fn compacted_rev_key() -> &'static str {
-        "compact_rev_key"
-    }
 
     /// Shared column list: id, name, created, deleted, create_revision,
     /// prev_revision, lease, version, value.

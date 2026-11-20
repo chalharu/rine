@@ -588,6 +588,8 @@ impl Kv for KvService {
         request: tonic::Request<PutRequest>,
     ) -> Result<tonic::Response<PutResponse>, tonic::Status> {
         let guard = self.writes.clone().lock_owned().await;
+        // No `batch()` revision fetch: `do_put` sets `base` from its own
+        // predecessor fetch for unary puts, so the initial value is dead.
         let mut batch = WriteBatch {
             base: 0,
             reads: ReadSet::default(),

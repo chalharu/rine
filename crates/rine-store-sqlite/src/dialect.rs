@@ -32,14 +32,10 @@ impl Dialect for SqliteDialect {
             "CREATE INDEX rine_id_deleted_index ON rine(id, deleted)",
             "CREATE INDEX rine_prev_revision_index ON rine(prev_revision)",
             "CREATE UNIQUE INDEX rine_name_prev_revision_uindex ON rine(name, prev_revision)",
-        ]
-    }
-
-    fn ensure_indexes_sql() -> &'static [&'static str] {
-        &[
-            "CREATE INDEX IF NOT EXISTS rine_live_name_index ON rine(name) \
-           WHERE deleted = 0 AND name <> 'compact_rev_key'",
-            "CREATE UNIQUE INDEX IF NOT EXISTS rine_name_prev_revision_uindex ON rine(name, prev_revision)",
+            // Partial live index: pre-existing tables converge here since a
+            // concurrent creator's `AlreadyExists` is tolerated.
+            "CREATE INDEX rine_live_name_index ON rine(name) \
+            WHERE deleted = 0 AND name <> 'compact_rev_key'",
         ]
     }
 
@@ -47,12 +43,12 @@ impl Dialect for SqliteDialect {
         "SELECT 1 FROM rine LIMIT 1"
     }
 
-    fn bind(_: usize) -> String {
-        "?".into()
+    fn current_revision_sql() -> String {
+        "SELECT created FROM rine ORDER BY id DESC LIMIT 1".into()
     }
 
-    fn first_row() -> &'static str {
-        "LIMIT 1"
+    fn bind(_: usize) -> String {
+        "?".into()
     }
 
     fn compacted_rev_sql() -> &'static str {
@@ -66,27 +62,6 @@ impl Dialect for SqliteDialect {
         )
     }
 
-    fn list_exact_sql() -> String {
-        format!(
-            "SELECT {COLS} FROM rine WHERE name = ? AND deleted = 0 ORDER BY name, id",
-            COLS = Self::cols()
-        )
-    }
-
-    fn list_ge_sql() -> String {
-        format!(
-            "SELECT {COLS} FROM rine WHERE name >= ? AND deleted = 0 ORDER BY name, id",
-            COLS = Self::cols()
-        )
-    }
-
-    fn list_range_sql() -> String {
-        format!(
-            "SELECT {COLS} FROM rine WHERE name >= ? AND name < ? AND deleted = 0 ORDER BY name, id",
-            COLS = Self::cols()
-        )
-    }
-
     /// Latest read split into rows + count so each uses the covering index:
     /// rows in index order with LIMIT, count without touching values. No
     /// `COUNT(*) OVER ()` sort over the full range. Both statements run in
@@ -95,11 +70,7 @@ impl Dialect for SqliteDialect {
         end: Option<&[u8]>,
         opts: &ListOptions,
     ) -> (Option<String>, Option<String>) {
-        let predicate = match end {
-            None | Some([]) => "name = ?",
-            Some([0]) => "name >= ?",
-            Some(_) => "name >= ? AND name < ?",
-        };
+        let (predicate, _) = Self::range_predicate(end);
         let filter = format!("{predicate} AND deleted = 0 AND name <> 'compact_rev_key'");
         let rows = (!opts.count_only).then(|| {
             let cols = if opts.keys_only {
@@ -111,7 +82,7 @@ impl Dialect for SqliteDialect {
             format!("SELECT {cols} FROM rine WHERE {filter} ORDER BY name, id{limit}")
         });
         // Point lookups and unlimited ranges derive the count from the rows.
-        let count = (opts.count_only || (opts.limit > 0 && !matches!(end, None | Some([]))))
+        let count = Self::needs_count(end, opts)
             .then(|| format!("SELECT COUNT(*) FROM rine WHERE {filter}"));
         (rows, count)
     }
@@ -172,7 +143,7 @@ mod tests {
             },
         );
         let owned = [
-            SqliteDialect::list_range_sql(),
+            SqliteDialect::list_history_sql(Some(b"x")),
             SqliteDialect::commit_state_sql(2),
             SqliteDialect::events_sql(),
             rows.unwrap(),

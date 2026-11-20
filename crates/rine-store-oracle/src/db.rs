@@ -191,8 +191,11 @@ fn is_no_data(e: &oracledb::Error) -> bool {
     e.kind() == &oracledb::ErrorKind::NoDataFound || e.db_error_code() == Some(1403)
 }
 
-// RAW binds avoid a temporary LOB round trip for small values. TO_BLOB runs
-// on Oracle and the previous revision is checked while holding the table lock.
+// RAW binds avoid a temporary LOB round trip for small values (1..=2000
+// bytes: empty values stay on the generic path so they are stored as empty
+// BLOBs rather than NULL, and larger values exceed RAW(2000)). TO_BLOB runs
+// on Oracle and the predecessor revision is checked while holding the table
+// lock. Revisions are non-negative, so NVL(..., -1) is a null-safe compare.
 const COMMIT_PUT: &str = r"
 DECLARE
     k rine.name%TYPE := :key;
@@ -222,9 +225,7 @@ BEGIN
         prev_id := 0;
         live_rev := NULL;
     END;
-    IF live_rev != expected
-       OR (live_rev IS NULL AND expected IS NOT NULL)
-       OR (live_rev IS NOT NULL AND expected IS NULL) THEN
+    IF NVL(live_rev, -1) != NVL(expected, -1) THEN
         ROLLBACK;
         :fresh := 0;
     ELSE
@@ -285,43 +286,35 @@ impl SqlExecutor for OracleDb {
     }
 
     async fn execute_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
-        if self.in_unit.load(Ordering::SeqCst) {
-            // Inside a commit unit the table lock serializes writers; the
-            // unit boundary commits, so statements must not commit one by one.
-            return self
-                .run_blocking(move |conn| apply_batch(conn, statements))
-                .await;
-        }
+        // Inside a commit unit the table lock serializes writers and the unit
+        // boundary commits, so statements must not commit one by one.
+        let unit = self.in_unit.load(Ordering::SeqCst);
         self.run_blocking(move |conn| {
-            let result = (|| {
+            let r = (|| {
                 apply_batch(conn, statements)?;
-                conn.commit()
+                if !unit {
+                    conn.commit()?;
+                }
+                Ok(())
             })();
-            if result.is_err() {
+            if !unit && r.is_err() {
                 conn.rollback()?;
             }
-            result
+            r
         })
         .await
     }
 
     async fn execute(&self, sql: &str, params: Vec<SqlValue>) -> Result<u64> {
-        if self.in_unit.load(Ordering::SeqCst) {
-            let sql = sql.to_string();
-            return self
-                .run_blocking(move |conn| {
-                    with_binds(&params, |refs| {
-                        Ok(conn.execute(&sql, refs)?.rows_affected())
-                    })
-                })
-                .await;
-        }
+        let unit = self.in_unit.load(Ordering::SeqCst);
         let sql = sql.to_string();
         self.run_blocking(move |conn| {
             let n = with_binds(&params, |refs| {
                 Ok(conn.execute(&sql, refs)?.rows_affected())
             })?;
-            conn.commit()?;
+            if !unit {
+                conn.commit()?;
+            }
             Ok(n)
         })
         .await

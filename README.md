@@ -8,7 +8,7 @@ An etcd-API-compatible key-value store backed by Oracle Database.
 - `crates/rine-store-executor`: shared `SqlBackend` over a SQL executor
   and dialect abstraction.
 - `crates/rine-store-oracle`: `OracleDialect`, the live `OracleDb` executor
-  (official `oracledb` driver), and a `MockExec` for unit tests.
+  (official `oracledb` driver), and a live XE integration test.
 - `crates/rine-store-sqlite`: same backend on SQLite (`SqliteDialect` +
   `SqliteDb` over rusqlite) — runs locally without any database server.
 - `crates/rine`: server binary (`memory`, `sqlite` or `oracle` backend,
@@ -43,7 +43,8 @@ while the server is running.
 On Linux/musl, the `rine` binary uses mimalloc to reduce allocation overhead
 under concurrent gRPC traffic. Other targets keep their system allocator.
 
-Oracle fetches the latest range and its revision/count in one statement.
+Oracle serves latest range reads as rows plus count in one read
+transaction (rows in index order with LIMIT, count from a covering index).
 Single-key writes of 1–2,000 byte values can validate the predecessor and
 commit in one Oracle call. Writes still serialize across nodes and wait for
 durable commit; deploy Rine close to Oracle to reduce the remaining latency.
