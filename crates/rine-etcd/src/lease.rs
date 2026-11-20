@@ -338,3 +338,220 @@ impl Lease for LeaseService {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        MemoryBackend,
+        backend::{Event, ReadSet},
+        etcdserverpb::{LeaseGrantRequest, LeaseRevokeRequest, LeaseTimeToLiveRequest},
+    };
+
+    async fn manager() -> (LeaseManager, Arc<dyn Backend>) {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let writes: CommitLock = Arc::new(tokio::sync::Mutex::new(()));
+        let mgr = LeaseManager::new(backend.clone(), writes);
+        (mgr, backend)
+    }
+
+    async fn put_key(backend: &Arc<dyn Backend>, key: &[u8], lease: i64) {
+        let key = Bytes::copy_from_slice(key);
+        let revision = backend.current_revision().await + 1;
+        backend
+            .commit(
+                ReadSet {
+                    points: vec![(key.clone(), None)],
+                    ranges: Vec::new(),
+                },
+                vec![Event {
+                    revision,
+                    key: key.clone(),
+                    deleted: false,
+                    kv: Some(KeyValue {
+                        key,
+                        value: Bytes::from("v"),
+                        create_revision: revision,
+                        mod_revision: revision,
+                        version: 1,
+                        lease,
+                    }),
+                    prev_kv: None,
+                }],
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn grant_assigns_ids_and_tracks_state() {
+        let (mgr, _) = manager().await;
+        let auto = mgr.grant(60, 0).await;
+        assert!(auto > 0);
+        assert_eq!(mgr.grant(60, 42).await, 42);
+        assert!(mgr.exists(auto).await);
+        assert!(mgr.exists(42).await);
+        assert!(!mgr.exists(43).await);
+        assert_eq!(mgr.keepalive(auto).await, 60);
+        assert_eq!(mgr.keepalive(999).await, 0);
+        let ids = mgr.all_ids().await;
+        assert!(ids.contains(&auto) && ids.contains(&42));
+        let (remain, granted, keys) = mgr.ttl_info(auto).await.unwrap();
+        assert_eq!(granted, 60);
+        assert!((0..=60).contains(&remain));
+        assert!(keys.is_empty());
+        assert!(mgr.ttl_info(999).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_detach_revoke_lifecycle() {
+        let (mgr, backend) = manager().await;
+        let id = mgr.grant(60, 0).await;
+        mgr.attach(id, b"k".to_vec()).await;
+        // Attaching twice does not duplicate.
+        mgr.attach(id, b"k".to_vec()).await;
+        // Detaching an unknown lease or key is a no-op.
+        mgr.detach(999, b"k").await;
+        mgr.detach(id, b"missing").await;
+        put_key(&backend, b"k", id).await;
+        mgr.revoke(id).await;
+        let (_, rows, _) = backend
+            .list(b"k", None, ListOptions::default())
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+        assert!(!mgr.exists(id).await);
+        // Revoking an empty or unknown lease is a no-op.
+        mgr.revoke(mgr.grant(60, 0).await).await;
+        mgr.revoke(999).await;
+    }
+
+    #[tokio::test]
+    async fn service_grant_revoke_timetolive_leases() {
+        let (mgr, backend) = manager().await;
+        let svc = LeaseService::new(backend.clone(), mgr.clone());
+        let err = svc
+            .lease_grant(tonic::Request::new(LeaseGrantRequest { ttl: 0, id: 0 }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        let g = svc
+            .lease_grant(tonic::Request::new(LeaseGrantRequest { ttl: 60, id: 7 }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((g.id, g.ttl), (7, 60));
+        put_key(&backend, b"sk", 7).await;
+        mgr.attach(7, b"sk".to_vec()).await;
+        let ttl = svc
+            .lease_time_to_live(tonic::Request::new(LeaseTimeToLiveRequest {
+                id: 7,
+                keys: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(ttl.keys, vec![b"sk".to_vec()]);
+        let err = svc
+            .lease_time_to_live(tonic::Request::new(LeaseTimeToLiveRequest {
+                id: 999,
+                keys: false,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        let list = svc
+            .lease_leases(tonic::Request::new(LeaseLeasesRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(list.leases.iter().any(|l| l.id == 7));
+        svc.lease_revoke(tonic::Request::new(LeaseRevokeRequest { id: 7 }))
+            .await
+            .unwrap();
+        let (_, rows, _) = backend
+            .list(b"sk", None, ListOptions::default())
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expiry_deletes_keys_and_ignores_missing() {
+        let (mgr, backend) = manager().await;
+        // Expires on the first tick: deadline is already past.
+        let quick = mgr.grant(0, 0).await;
+        put_key(&backend, b"q", quick).await;
+        mgr.attach(quick, b"q".to_vec()).await;
+        // Vanished before expiry: nothing to delete.
+        let gone = mgr.grant(0, 0).await;
+        mgr.attach(gone, b"absent".to_vec()).await;
+        // Idle lease with no keys at all.
+        mgr.grant(0, 0).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let (_, rows, _) = backend
+            .list(b"q", None, ListOptions::default())
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+        assert!(!mgr.exists(quick).await);
+        assert!(!mgr.exists(gone).await);
+    }
+}
+
+#[cfg(test)]
+mod expire_tests {
+    use super::*;
+    use crate::{MemoryBackend, backend::Event};
+
+    #[tokio::test]
+    async fn expire_keys_handles_empty_and_missing() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        // Nothing expired: no work, no commit.
+        LeaseManager::expire_keys(&backend, Vec::new()).await;
+        // Listed but gone: observed empty, nothing to delete.
+        LeaseManager::expire_keys(&backend, vec![(7, b"absent".to_vec())]).await;
+        assert_eq!(backend.current_revision().await, 1);
+        // A live key is deleted at a fresh revision.
+        let key = Bytes::from("gone");
+        backend
+            .commit(
+                ReadSet::default(),
+                vec![Event {
+                    revision: 2,
+                    key: key.clone(),
+                    deleted: false,
+                    kv: Some(KeyValue {
+                        key: key.clone(),
+                        value: Bytes::from("v"),
+                        create_revision: 2,
+                        mod_revision: 2,
+                        version: 1,
+                        lease: 7,
+                    }),
+                    prev_kv: None,
+                }],
+            )
+            .await
+            .unwrap();
+        LeaseManager::expire_keys(&backend, vec![(7, b"gone".to_vec())]).await;
+        let (_, rows, _) = backend
+            .list(b"gone", None, ListOptions::default())
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mixed_expiry_keeps_live_leases() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let writes: CommitLock = Arc::new(tokio::sync::Mutex::new(()));
+        let mgr = LeaseManager::new(backend, writes);
+        // Expires immediately; the survivor keeps its lease entry.
+        let quick = mgr.grant(0, 0).await;
+        let survivor = mgr.grant(600, 0).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!mgr.exists(quick).await);
+        assert!(mgr.exists(survivor).await);
+    }
+}

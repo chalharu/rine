@@ -333,7 +333,7 @@ mod tests {
     use super::*;
 
     /// Test-only single-key writes over `commit`.
-    async fn put(b: &MemoryBackend, key: &[u8], value: &[u8]) -> Revision {
+    pub(super) async fn put(b: &MemoryBackend, key: &[u8], value: &[u8]) -> Revision {
         let key = Bytes::copy_from_slice(key);
         let revision = b.current_revision().await + 1;
         b.commit(
@@ -360,7 +360,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn update(b: &MemoryBackend, key: &[u8], value: &[u8]) -> Revision {
+    pub(super) async fn update(b: &MemoryBackend, key: &[u8], value: &[u8]) -> Revision {
         let (_, prev) = get(b, key, 0).await;
         let prev = prev.unwrap();
         let key = Bytes::copy_from_slice(key);
@@ -389,7 +389,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn del(b: &MemoryBackend, key: &[u8]) {
+    pub(super) async fn del(b: &MemoryBackend, key: &[u8]) {
         let (_, prev) = get(b, key, 0).await;
         if let Some(prev) = prev {
             let key = Bytes::copy_from_slice(key);
@@ -412,7 +412,11 @@ mod tests {
         }
     }
 
-    async fn get(b: &MemoryBackend, key: &[u8], rev: Revision) -> (Revision, Option<KeyValue>) {
+    pub(super) async fn get(
+        b: &MemoryBackend,
+        key: &[u8],
+        rev: Revision,
+    ) -> (Revision, Option<KeyValue>) {
         let (cur, rows, _) = b
             .list(
                 key,
@@ -517,5 +521,124 @@ mod tests {
             .is_err()
         );
         assert!(b.events(r2 - 1, r2).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use crate::backend::ObservedRange;
+
+    #[tokio::test]
+    async fn factory_and_default() {
+        let f = MemoryFactory;
+        assert_eq!(f.name(), "memory");
+        let b = f.build().unwrap();
+        b.initialize().await.unwrap();
+        assert_eq!(b.compacted_revision().await, 0);
+        let d = MemoryBackend::default();
+        assert_eq!(d.db_size().await, 0);
+    }
+
+    #[tokio::test]
+    async fn future_revision_and_counts() {
+        let b = MemoryBackend::new();
+        super::tests::put(&b, b"a", b"1").await;
+        let err = b
+            .list(
+                b"a",
+                None,
+                ListOptions {
+                    revision: 99,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::FutureRev { .. }));
+        // Point and range count-only paths.
+        let (rev, rows, count) = b
+            .list(
+                b"a",
+                None,
+                ListOptions {
+                    count_only: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(rows.is_empty() && count == 1 && rev > 1);
+        let (_, rows, count) = b
+            .list(
+                b"a",
+                Some(&[0u8]),
+                ListOptions {
+                    count_only: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(rows.is_empty() && count == 1);
+        assert!(b.db_size().await > 0);
+    }
+
+    #[tokio::test]
+    async fn historical_delete_replay_and_compacted_events() {
+        let b = MemoryBackend::new();
+        super::tests::put(&b, b"a", b"1").await;
+        let r2 = b.current_revision().await;
+        b.compact(r2).await.unwrap();
+        // Reading exactly at the compaction revision needs no replay.
+        let (_, kv) = super::tests::get(&b, b"a", r2).await;
+        assert_eq!(kv.unwrap().value, Bytes::from("1"));
+        // A delete after compaction is replayed out of the compacted
+        // snapshot for historical reads past the compaction revision.
+        super::tests::put(&b, b"b", b"1").await;
+        super::tests::del(&b, b"a").await;
+        let del_rev = b.current_revision().await;
+        super::tests::put(&b, b"c", b"1").await;
+        let (_, kv) = super::tests::get(&b, b"a", del_rev).await;
+        assert!(kv.is_none());
+        let (_, kv) = super::tests::get(&b, b"b", del_rev).await;
+        assert_eq!(kv.unwrap().value, Bytes::from("1"));
+        let err = b.events(r2 - 1, r2).await.unwrap_err();
+        assert!(matches!(err, Error::Compacted { .. }));
+    }
+
+    #[tokio::test]
+    async fn range_commit_guards_snapshot() {
+        use crate::backend::Backend as _;
+        let b = MemoryBackend::new();
+        super::tests::put(&b, b"r/a", b"1").await;
+        super::tests::put(&b, b"r/b", b"2").await;
+        let (_, kvs, count) = b
+            .list(b"r/", Some(&[0u8]), ListOptions::default())
+            .await
+            .unwrap();
+        let observed = ObservedRange {
+            prefix: Bytes::from("r/"),
+            range_end: Some(Bytes::copy_from_slice(&[0u8])),
+            opts: ListOptions::default(),
+            observed: kvs
+                .iter()
+                .map(|kv| (kv.key.clone(), kv.mod_revision))
+                .collect(),
+            count,
+        };
+        let reads = ReadSet {
+            points: Vec::new(),
+            ranges: vec![observed.clone()],
+        };
+        b.commit(reads, vec![]).await.unwrap();
+        // Moving a key under the observed range conflicts.
+        super::tests::update(&b, b"r/a", b"3").await;
+        let reads = ReadSet {
+            points: Vec::new(),
+            ranges: vec![observed],
+        };
+        let err = b.commit(reads, vec![]).await.unwrap_err();
+        assert!(matches!(err, Error::Conflict));
     }
 }

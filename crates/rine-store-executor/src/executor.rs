@@ -124,3 +124,63 @@ mod tests {
         assert!(r.get_int(9).is_err());
     }
 }
+
+#[cfg(test)]
+mod default_tests {
+    use super::*;
+
+    /// Minimal executor: only the required methods, so the default
+    /// `try_commit_put` / `query_batch` / `begin_unit` / `end_unit` run here.
+    struct Passthrough;
+
+    #[async_trait]
+    impl SqlExecutor for Passthrough {
+        async fn execute(&self, _sql: &str, _params: Vec<SqlValue>) -> Result<u64> {
+            Ok(1)
+        }
+        async fn execute_batch(&self, _statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
+            Ok(())
+        }
+        async fn query_row(&self, _sql: &str, _params: Vec<SqlValue>) -> Result<Option<Row>> {
+            Ok(None)
+        }
+        async fn query_all(&self, _sql: &str, _params: Vec<SqlValue>) -> Result<Vec<Row>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_defaults_are_noops() {
+        use rine_etcd::backend::Event;
+        let e = Passthrough;
+        let event = Event {
+            revision: 1,
+            key: Default::default(),
+            deleted: false,
+            kv: None,
+            prev_kv: None,
+        };
+        assert!(e.try_commit_put(&event).await.unwrap().is_none());
+        e.execute_batch(vec![]).await.unwrap();
+        let rows = e
+            .query_batch(vec![("SELECT 1".to_string(), vec![SqlValue::Int(1)])])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        e.begin_unit().await.unwrap();
+        e.end_unit(true).await.unwrap();
+        e.end_unit(false).await.unwrap();
+    }
+
+    #[test]
+    fn row_getter_type_errors() {
+        use super::Row;
+        let r = Row {
+            values: vec![SqlValue::Int(1)],
+        };
+        assert!(r.get_str(0).is_err());
+        assert!(r.get_str(9).is_err());
+        assert!(r.get_bytes(0).is_err());
+        assert!(r.get_bytes(9).is_err());
+    }
+}

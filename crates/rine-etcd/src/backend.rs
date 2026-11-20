@@ -160,3 +160,33 @@ pub trait BackendFactory: Send + Sync {
     /// schema; call [`Backend::initialize`] afterwards.
     fn build(&self) -> anyhow::Result<Arc<dyn Backend>>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_predicate_covers_bounds() {
+        assert!(in_range(b"a", b"a", None));
+        assert!(!in_range(b"b", b"a", None));
+        assert!(in_range(b"b", b"a", Some(&[0])));
+        assert!(!in_range(b"a", b"b", Some(&[0])));
+        assert!(in_range(b"a", b"a", Some(b"c".as_slice())));
+        assert!(!in_range(b"c", b"a", Some(b"c".as_slice())));
+    }
+
+    #[test]
+    fn snapshot_match_rejects_moved_reads() {
+        let observed = ObservedRange {
+            prefix: Bytes::from("k"),
+            range_end: None,
+            opts: ListOptions::default(),
+            observed: vec![(Bytes::from("k"), 2)],
+            count: 1,
+        };
+        assert!(observed.matches_snapshot(&[(Bytes::from("k"), 2)], 1));
+        assert!(!observed.matches_snapshot(&[(Bytes::from("k"), 3)], 1));
+        assert!(!observed.matches_snapshot(&[(Bytes::from("k"), 2), (Bytes::from("x"), 1)], 2));
+        assert!(!observed.matches_snapshot(&[], 0));
+    }
+}

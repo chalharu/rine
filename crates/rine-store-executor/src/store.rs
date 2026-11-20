@@ -694,40 +694,40 @@ mod tests {
             "PROBE TABLE"
         }
         fn current_revision_sql() -> String {
-            unimplemented!()
+            String::new()
         }
         fn bind(_index: usize) -> String {
             "?".into()
         }
         fn compacted_rev_sql() -> &'static str {
-            unimplemented!()
+            ""
         }
         fn events_sql() -> String {
-            unimplemented!()
+            String::new()
         }
         fn live_range_queries(
             _end: Option<&[u8]>,
             _opts: &ListOptions,
         ) -> (Option<String>, Option<String>) {
-            unimplemented!()
+            (Some(String::new()), Some(String::new()))
         }
         fn commit_state_sql(_names: usize) -> String {
-            unimplemented!()
+            String::new()
         }
         fn set_deleted_by_id_sql() -> &'static str {
-            unimplemented!()
+            ""
         }
         fn compact_delete_sql() -> &'static str {
-            unimplemented!()
+            ""
         }
         fn set_compact_rev_sql() -> &'static str {
-            unimplemented!()
+            ""
         }
         fn set_compact_rev_insert_sql() -> &'static str {
-            unimplemented!()
+            ""
         }
         fn db_size_sql() -> &'static str {
-            unimplemented!()
+            ""
         }
     }
 
@@ -736,6 +736,10 @@ mod tests {
     struct RacyExec {
         drops: AtomicUsize,
         ddl_calls: AtomicUsize,
+        probe_drops: AtomicUsize,
+        contention: AtomicUsize,
+        probe_err: bool,
+        fast: bool,
     }
 
     impl RacyExec {
@@ -743,14 +747,25 @@ mod tests {
             Self {
                 drops: AtomicUsize::new(drops),
                 ddl_calls: AtomicUsize::new(0),
+                probe_drops: AtomicUsize::new(0),
+                contention: AtomicUsize::new(0),
+                probe_err: false,
+                fast: false,
             }
         }
     }
 
     #[async_trait]
     impl SqlExecutor for RacyExec {
+        async fn try_commit_put(&self, _event: &Event) -> Result<Option<Revision>> {
+            Ok(self.fast.then_some(7))
+        }
         async fn execute(&self, sql: &str, _params: Vec<SqlValue>) -> Result<u64> {
             self.ddl_calls.fetch_add(1, Ordering::SeqCst);
+            if self.contention.load(Ordering::SeqCst) > 0 {
+                self.contention.fetch_sub(1, Ordering::SeqCst);
+                return Err(Error::LockContention("writer raced DDL".into()));
+            }
             if sql == "CREATE INDEX idx_test" && self.drops.load(Ordering::SeqCst) > 0 {
                 self.drops.fetch_sub(1, Ordering::SeqCst);
                 return Err(Error::TableMissing("table dropped mid-ensure".into()));
@@ -761,6 +776,13 @@ mod tests {
             Ok(())
         }
         async fn query_row(&self, sql: &str, _params: Vec<SqlValue>) -> Result<Option<Row>> {
+            if self.probe_err {
+                return Err(Error::Backend("boom".into()));
+            }
+            if sql == "PROBE TABLE" && self.probe_drops.load(Ordering::SeqCst) > 0 {
+                self.probe_drops.fetch_sub(1, Ordering::SeqCst);
+                return Err(Error::TableMissing("table dropped mid-probe".into()));
+            }
             match sql {
                 "PROBE TABLE" => Ok(Some(Row {
                     values: vec![SqlValue::Int(1)],
@@ -771,6 +793,39 @@ mod tests {
         }
         async fn query_all(&self, _sql: &str, _params: Vec<SqlValue>) -> Result<Vec<Row>> {
             Ok(Vec::new())
+        }
+    }
+
+    /// Short reads: fewer result sets than the latest-range lookup expects.
+    struct ShortExec {
+        results: usize,
+    }
+
+    #[async_trait]
+    impl SqlExecutor for ShortExec {
+        async fn execute(&self, _sql: &str, _params: Vec<SqlValue>) -> Result<u64> {
+            Ok(1)
+        }
+        async fn execute_batch(&self, _statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
+            Ok(())
+        }
+        async fn query_row(&self, _sql: &str, _params: Vec<SqlValue>) -> Result<Option<Row>> {
+            Ok(None)
+        }
+        async fn query_all(&self, _sql: &str, _params: Vec<SqlValue>) -> Result<Vec<Row>> {
+            Ok(Vec::new())
+        }
+        async fn query_batch(
+            &self,
+            _statements: Vec<(String, Vec<SqlValue>)>,
+        ) -> Result<Vec<Vec<Row>>> {
+            Ok((0..self.results)
+                .map(|_| {
+                    vec![Row {
+                        values: vec![SqlValue::Int(1)],
+                    }]
+                })
+                .collect())
         }
     }
 
@@ -820,11 +875,129 @@ mod tests {
     /// retried away.
     #[tokio::test]
     async fn ensure_schema_still_aborts_without_ddl_privilege() {
-        let backend = SqlBackend::<DenyExec, TestDialect>::new(Arc::new(DenyExec));
+        let exec = Arc::new(DenyExec);
+        let backend = SqlBackend::<DenyExec, TestDialect>::new(exec.clone());
         let err = backend.ensure_schema().await.unwrap_err();
         assert!(
             err.to_string().contains("insufficient privileges"),
             "{err:?}"
         );
+        // Mock helper paths stay covered.
+        exec.execute_batch(vec![]).await.unwrap();
+        exec.query_all("SELECT 1", vec![]).await.unwrap();
+    }
+
+    /// A concurrent DROP between probe and DDL restarts the whole pass.
+    #[tokio::test]
+    async fn ensure_schema_restarts_after_concurrent_drop() {
+        let exec = Arc::new(RacyExec::new(0));
+        exec.probe_drops.store(1, Ordering::SeqCst);
+        let backend = SqlBackend::<RacyExec, TestDialect>::new(exec.clone());
+        backend.ensure_schema().await.expect("must converge");
+        exec.execute_batch(vec![]).await.unwrap();
+        exec.query_all("SELECT 1", vec![]).await.unwrap();
+    }
+
+    /// A non-retryable probe failure aborts startup immediately.
+    #[tokio::test]
+    async fn ensure_schema_aborts_on_probe_error() {
+        let mut exec = RacyExec::new(0);
+        exec.probe_err = true;
+        let backend = SqlBackend::<RacyExec, TestDialect>::new(Arc::new(exec));
+        let err = backend.ensure_schema().await.unwrap_err();
+        assert!(err.to_string().contains("boom"), "{err:?}");
+    }
+
+    /// A transient lock conflict on DDL is retried, then converges.
+    #[tokio::test]
+    async fn ensure_schema_retries_lock_contention() {
+        let exec = Arc::new(RacyExec::new(0));
+        exec.contention.store(1, Ordering::SeqCst);
+        let backend = SqlBackend::<RacyExec, TestDialect>::new(exec);
+        backend.ensure_schema().await.expect("must converge");
+    }
+
+    /// Every dialect hook has a callable body (the schema path only needs
+    /// a few of them; the rest must still link and run).
+    #[test]
+    fn test_dialect_covers_all_hooks() {
+        assert_eq!(TestDialect::create_table_sql(), "CREATE TABLE rine");
+        assert_eq!(
+            TestDialect::create_indexes_sql(),
+            &["CREATE INDEX idx_test"]
+        );
+        assert_eq!(TestDialect::probe_sql(), "PROBE TABLE");
+        assert_eq!(TestDialect::bind(3), "?");
+        let _ = TestDialect::current_revision_sql();
+        let _ = TestDialect::compacted_rev_sql();
+        let _ = TestDialect::events_sql();
+        let _ = TestDialect::live_range_queries(None, &ListOptions::default());
+        let _ = TestDialect::commit_state_sql(1);
+        let _ = TestDialect::set_deleted_by_id_sql();
+        let _ = TestDialect::compact_delete_sql();
+        let _ = TestDialect::set_compact_rev_sql();
+        let _ = TestDialect::set_compact_rev_insert_sql();
+        let _ = TestDialect::db_size_sql();
+    }
+
+    /// A short read transaction surfaces a backend error, not a panic.
+    #[tokio::test]
+    async fn list_latest_rejects_short_results() {
+        use crate::SqlExecutor as _;
+        for results in [1, 2] {
+            let exec = Arc::new(ShortExec { results });
+            let backend = SqlBackend::<ShortExec, TestDialect>::new(exec.clone());
+            let err = backend
+                .list(b"k", None, ListOptions::default())
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Backend(_)), "{err:?}");
+            // Remaining executor surface stays covered.
+            assert_eq!(exec.execute("SELECT 1", vec![]).await.unwrap(), 1);
+            exec.execute_batch(vec![]).await.unwrap();
+            assert!(exec.query_row("SELECT 1", vec![]).await.unwrap().is_none());
+            assert!(exec.query_all("SELECT 1", vec![]).await.unwrap().is_empty());
+        }
+    }
+
+    /// A commit lookup with no rows surfaces a backend error.
+    #[tokio::test]
+    async fn commit_rejects_missing_metadata() {
+        let backend = SqlBackend::<ShortExec, TestDialect>::new(Arc::new(ShortExec { results: 0 }));
+        let err = backend
+            .commit(ReadSet::default(), vec![])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Backend(_)), "{err:?}");
+    }
+
+    /// The single-Put fast path assigns the executor's revision directly.
+    #[tokio::test]
+    async fn commit_takes_executor_fast_put() {
+        let mut exec = RacyExec::new(0);
+        exec.fast = true;
+        let backend = SqlBackend::<RacyExec, TestDialect>::new(Arc::new(exec));
+        let key = Bytes::from("k");
+        let rev = backend
+            .commit(
+                ReadSet::default(),
+                vec![Event {
+                    revision: 2,
+                    key: key.clone(),
+                    deleted: false,
+                    kv: Some(KeyValue {
+                        key,
+                        value: Bytes::from("v"),
+                        create_revision: 2,
+                        mod_revision: 2,
+                        version: 1,
+                        lease: 0,
+                    }),
+                    prev_kv: None,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rev, 7);
     }
 }

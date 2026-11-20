@@ -685,3 +685,253 @@ impl Kv for KvService {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Revision;
+
+    fn kv(key: &[u8], version: i64, create: Revision, modified: Revision) -> KeyValue {
+        KeyValue {
+            key: Bytes::copy_from_slice(key),
+            value: Bytes::copy_from_slice(key),
+            create_revision: create,
+            mod_revision: modified,
+            version,
+            lease: 0,
+        }
+    }
+
+    fn rows() -> Vec<KeyValue> {
+        vec![kv(b"b", 1, 2, 4), kv(b"a", 3, 1, 5), kv(b"c", 2, 3, 3)]
+    }
+
+    fn keys(kvs: &[KeyValue]) -> Vec<&[u8]> {
+        kvs.iter().map(|kv| kv.key.as_ref()).collect()
+    }
+
+    #[test]
+    fn sort_kvs_covers_targets_and_directions() {
+        use crate::etcdserverpb::range_request::{SortOrder, SortTarget};
+        let none = SortOrder::None as i32;
+        let asc = SortOrder::Ascend as i32;
+        let desc = SortOrder::Descend as i32;
+        let (key, version, create, modr, value) = (
+            SortTarget::Key as i32,
+            SortTarget::Version as i32,
+            SortTarget::Create as i32,
+            SortTarget::Mod as i32,
+            SortTarget::Value as i32,
+        );
+        let mut kvs = rows();
+        sort_kvs(&mut kvs, none, version);
+        assert_eq!(keys(&kvs), vec![b"b".as_slice(), b"a", b"c"]);
+        sort_kvs(&mut kvs, asc, key);
+        assert_eq!(keys(&kvs), vec![b"a".as_slice(), b"b", b"c"]);
+        sort_kvs(&mut kvs, desc, key);
+        assert_eq!(keys(&kvs), vec![b"c".as_slice(), b"b", b"a"]);
+        sort_kvs(&mut kvs, asc, version);
+        assert_eq!(keys(&kvs), vec![b"b".as_slice(), b"c", b"a"]);
+        sort_kvs(&mut kvs, desc, version);
+        assert_eq!(keys(&kvs), vec![b"a".as_slice(), b"c", b"b"]);
+        sort_kvs(&mut kvs, asc, create);
+        assert_eq!(keys(&kvs), vec![b"a".as_slice(), b"b", b"c"]);
+        sort_kvs(&mut kvs, asc, modr);
+        assert_eq!(keys(&kvs), vec![b"c".as_slice(), b"b", b"a"]);
+        sort_kvs(&mut kvs, desc, value);
+        assert_eq!(keys(&kvs), vec![b"c".as_slice(), b"b", b"a"]);
+        // Unknown targets fall back to key order.
+        sort_kvs(&mut kvs, asc, 999);
+        assert_eq!(keys(&kvs), vec![b"a".as_slice(), b"b", b"c"]);
+        sort_kvs(&mut kvs, desc, 999);
+        assert_eq!(keys(&kvs), vec![b"c".as_slice(), b"b", b"a"]);
+    }
+
+    #[test]
+    fn write_batch_dedupes_and_tracks_revision() {
+        let mut batch = WriteBatch {
+            base: 7,
+            reads: ReadSet::default(),
+            events: Vec::new(),
+        };
+        assert_eq!(batch.revision(), 7);
+        let event = |key: &[u8]| Event {
+            revision: 8,
+            key: Bytes::copy_from_slice(key),
+            deleted: false,
+            kv: None,
+            prev_kv: None,
+        };
+        batch.push(event(b"a")).unwrap();
+        assert_eq!(batch.revision(), 8);
+        let err = batch.push(event(b"a")).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        // Point reads keep the first observation; ranges accumulate.
+        batch.record_point(b"p", Some(3));
+        batch.record_point(b"p", Some(4));
+        assert_eq!(batch.reads.points, vec![(Bytes::from("p"), Some(3))]);
+        batch.record_range(b"r", None, &ListOptions::default(), &[], 0);
+        batch.record_range(b"r", None, &ListOptions::default(), &[], 0);
+        assert_eq!(batch.reads.ranges.len(), 2);
+    }
+
+    #[test]
+    fn retarget_rewrites_nested_txn_headers() {
+        let mut op = ResponseOp {
+            response: Some(Response::ResponseTxn(crate::etcdserverpb::TxnResponse {
+                header: Some(crate::etcdserverpb::ResponseHeader {
+                    revision: 1,
+                    ..Default::default()
+                }),
+                responses: vec![ResponseOp {
+                    response: Some(Response::ResponsePut(crate::etcdserverpb::PutResponse {
+                        header: Some(crate::etcdserverpb::ResponseHeader {
+                            revision: 1,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    })),
+                }],
+                ..Default::default()
+            })),
+        };
+        KvService::retarget(&mut op, 9);
+        let inner_put = match op.response.as_ref().unwrap() {
+            Response::ResponseTxn(t) => match t.responses[0].response.as_ref().unwrap() {
+                Response::ResponsePut(p) => p,
+                _ => panic!("expected put"),
+            },
+            _ => panic!("expected txn"),
+        };
+        assert_eq!(inner_put.header.as_ref().unwrap().revision, 9);
+        // A response without header or body is a no-op, not a panic.
+        let mut bare = ResponseOp { response: None };
+        KvService::retarget(&mut bare, 9);
+        for response in [
+            Response::ResponseRange(crate::etcdserverpb::RangeResponse::default()),
+            Response::ResponsePut(crate::etcdserverpb::PutResponse::default()),
+            Response::ResponseDeleteRange(crate::etcdserverpb::DeleteRangeResponse::default()),
+            Response::ResponseTxn(crate::etcdserverpb::TxnResponse::default()),
+        ] {
+            let mut no_header = ResponseOp {
+                response: Some(response),
+            };
+            KvService::retarget(&mut no_header, 9);
+        }
+    }
+}
+
+#[cfg(test)]
+mod eval_tests {
+    use super::*;
+    use crate::{MemoryBackend, backend::ReadSet};
+
+    async fn service() -> KvService {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let writes: CommitLock = Arc::new(tokio::sync::Mutex::new(()));
+        let leases = LeaseManager::new(backend.clone(), writes.clone());
+        KvService::new(backend, leases, writes)
+    }
+
+    fn cmp_value(key: &[u8]) -> Compare {
+        use crate::etcdserverpb::compare::{CompareResult, CompareTarget, TargetUnion};
+        Compare {
+            result: CompareResult::Equal as i32,
+            target: CompareTarget::Value as i32,
+            key: key.to_vec(),
+            target_union: Some(TargetUnion::Value(b"x".to_vec())),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_key_value_compare_is_false() {
+        let svc = service().await;
+        let mut batch = WriteBatch {
+            base: 1,
+            reads: ReadSet::default(),
+            events: Vec::new(),
+        };
+        assert!(
+            !svc.eval_compare(&cmp_value(b"absent"), &mut batch)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn error_paths_report_invalid_argument() {
+        let svc = service().await;
+        // Empty key on range.
+        let err = svc
+            .do_range(
+                &RangeRequest {
+                    key: Vec::new(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        // Future revision on a point read.
+        let err = svc
+            .fetch(
+                b"k",
+                None,
+                ListOptions {
+                    revision: 99,
+                    ..Default::default()
+                },
+                &mut None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::OutOfRange);
+        // Compacted revision on a point read.
+        let backend = Arc::new(MemoryBackend::new());
+        let key = Bytes::from("k");
+        backend
+            .commit(
+                ReadSet::default(),
+                vec![Event {
+                    revision: 2,
+                    key: key.clone(),
+                    deleted: false,
+                    kv: Some(KeyValue {
+                        key: key.clone(),
+                        value: Bytes::from("v"),
+                        create_revision: 2,
+                        mod_revision: 2,
+                        version: 1,
+                        lease: 0,
+                    }),
+                    prev_kv: None,
+                }],
+            )
+            .await
+            .unwrap();
+        backend.compact(2).await.unwrap();
+        let svc2 = KvService::new(
+            backend,
+            LeaseManager::new(
+                Arc::new(MemoryBackend::new()),
+                Arc::new(tokio::sync::Mutex::new(())),
+            ),
+            Arc::new(tokio::sync::Mutex::new(())),
+        );
+        let err = svc2
+            .fetch(
+                b"k",
+                None,
+                ListOptions {
+                    revision: 1,
+                    ..Default::default()
+                },
+                &mut None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::OutOfRange);
+    }
+}

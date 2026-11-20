@@ -145,3 +145,18 @@ pub async fn serve_ephemeral(backend: Arc<dyn Backend>) -> String {
     }
     endpoint
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MemoryBackend;
+
+    #[tokio::test]
+    async fn empty_listeners_are_rejected() {
+        let err = EtcdServer::new(Arc::new(MemoryBackend::new()))
+            .serve_many(Vec::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no listen addresses"));
+    }
+}

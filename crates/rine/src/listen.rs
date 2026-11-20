@@ -109,7 +109,9 @@ async fn parse_listen_url(s: &str) -> anyhow::Result<(SocketAddr, bool)> {
     if let Ok(addr) = rest.parse::<SocketAddr>() {
         return Ok((addr, https));
     }
-    let mut addrs = tokio::net::lookup_host(rest).await?;
+    let mut addrs = tokio::net::lookup_host(rest)
+        .await
+        .map_err(|e| anyhow::anyhow!("could not resolve listen address: {rest} ({e:#})"))?;
     addrs
         .next()
         .map(|addr| (addr, https))
@@ -149,37 +151,100 @@ mod tests {
         assert_eq!(listeners[0].addr.port(), 2379);
     }
 
+    async fn err_of(cfg: ListenConfig) -> Result<String, anyhow::Error> {
+        let r = cfg.into_listeners().await;
+        assert!(r.is_err());
+        r.map(|_| String::new())
+    }
+
     #[tokio::test]
     async fn validation_errors() {
-        async fn err_of(cfg: ListenConfig) -> String {
-            match cfg.into_listeners().await {
-                Ok(_) => panic!("expected an error"),
-                Err(e) => e.to_string(),
-            }
-        }
-
         // Unknown scheme.
-        let err = err_of(plain(Some("ftp://127.0.0.1:21"))).await;
+        let err = err_of(plain(Some("ftp://127.0.0.1:21")))
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("unsupported scheme"), "{err:?}");
 
         // Empty URL list.
-        let err = err_of(plain(Some(" , "))).await;
+        let err = err_of(plain(Some(" , "))).await.unwrap_err().to_string();
         assert!(err.contains("no listen URLs"), "{err:?}");
 
         // Cert without key.
         let mut cfg = plain(None);
         cfg.cert_file = Some(PathBuf::from("/nonexistent-cert"));
-        let err = err_of(cfg).await;
+        let err = err_of(cfg).await.unwrap_err().to_string();
         assert!(err.contains("must be given together"), "{err:?}");
 
         // mTLS without TLS.
         let mut cfg = plain(None);
         cfg.client_cert_auth = true;
-        let err = err_of(cfg).await;
+        let err = err_of(cfg).await.unwrap_err().to_string();
         assert!(err.contains("needs TLS"), "{err:?}");
 
         // https without identity.
-        let err = err_of(plain(Some("https://127.0.0.1:2380"))).await;
+        let err = err_of(plain(Some("https://127.0.0.1:2380")))
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("needs --cert-file"), "{err:?}");
+    }
+
+    fn write_temp(name: &str, content: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("rine-test-{}-{name}", std::process::id()));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn https_identity_and_dns_names() {
+        let cert = write_temp("cert", b"cert-bytes");
+        let key = write_temp("key", b"key-bytes");
+        let ca = write_temp("ca", b"ca-bytes");
+        let mut cfg = plain(Some("https://localhost:2380"));
+        cfg.cert_file = Some(cert.clone());
+        cfg.key_file = Some(key.clone());
+        let listeners = cfg.into_listeners().await.unwrap();
+        assert_eq!(listeners.len(), 1);
+        assert!(listeners[0].tls.is_some());
+        // Hostnames resolve via DNS instead of direct parsing.
+        let listeners = plain(Some("http://localhost:2381"))
+            .into_listeners()
+            .await
+            .unwrap();
+        assert_eq!(listeners[0].addr.port(), 2381);
+        // mTLS without a CA file is rejected; with one it loads.
+        let mut cfg = plain(None);
+        cfg.cert_file = Some(cert.clone());
+        cfg.key_file = Some(key.clone());
+        cfg.client_cert_auth = true;
+        let err = err_of(cfg).await.unwrap_err().to_string();
+        assert!(err.contains("needs --trusted-ca-file"), "{err}");
+        // Cert files with a plaintext-only listener warn instead of failing.
+        let mut cfg = plain(None);
+        cfg.cert_file = Some(cert.clone());
+        cfg.key_file = Some(key.clone());
+        let listeners = cfg.into_listeners().await.unwrap();
+        assert!(listeners.iter().all(|l| l.tls.is_none()));
+        // mTLS identity loads the CA bytes.
+        let mut cfg = plain(Some("https://127.0.0.1:2382"));
+        cfg.cert_file = Some(cert.clone());
+        cfg.key_file = Some(key.clone());
+        cfg.client_cert_auth = true;
+        cfg.trusted_ca_file = Some(ca.clone());
+        let listeners = cfg.into_listeners().await.unwrap();
+        assert!(listeners[0].tls.as_ref().unwrap().client_ca.is_some());
+        for p in [cert, key, ca] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolvable_host_is_rejected() {
+        let err = err_of(plain(Some("http://nonexistent.invalid:1")))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not resolve"), "{err}");
     }
 }

@@ -61,32 +61,8 @@ async fn main() -> Result<()> {
 
     // Backend implementations register themselves here; `--backend` selects
     // one by the name its factory reports.
-    let factories: Vec<Box<dyn BackendFactory>> = {
-        // Without backend features nothing is pushed; keep the binding
-        // immutable-friendly across all feature combinations.
-        #[allow(unused_mut)]
-        let mut factories: Vec<Box<dyn BackendFactory>> = vec![Box::new(rine_etcd::MemoryFactory)];
-        #[cfg(feature = "sqlite")]
-        factories.push(Box::new(rine_store_sqlite::SqliteFactory::new(
-            args.sqlite.clone(),
-        )));
-        #[cfg(feature = "oracle")]
-        factories.push(Box::new(rine_store_oracle::OracleFactory::new(
-            args.oracle.clone(),
-        )));
-        factories
-    };
-    let factory = factories
-        .iter()
-        .find(|f| f.name() == args.backend)
-        .ok_or_else(|| {
-            let names = factories
-                .iter()
-                .map(|f| f.name())
-                .collect::<Vec<_>>()
-                .join("|");
-            anyhow::anyhow!("unknown backend: {} (expected {})", args.backend, names)
-        })?;
+    let factories = build_factories(&args);
+    let factory = select_factory(&factories, &args.backend)?;
     let backend = factory.build()?;
     backend.initialize().await?;
 
@@ -106,4 +82,90 @@ async fn main() -> Result<()> {
         .serve_many(listeners)
         .await?;
     Ok(())
+}
+
+/// Register every compiled-in backend factory.
+#[allow(unused_mut)]
+fn build_factories(args: &Args) -> Vec<Box<dyn BackendFactory>> {
+    let mut factories: Vec<Box<dyn BackendFactory>> = vec![Box::new(rine_etcd::MemoryFactory)];
+    #[cfg(feature = "sqlite")]
+    factories.push(Box::new(rine_store_sqlite::SqliteFactory::new(
+        args.sqlite.clone(),
+    )));
+    #[cfg(feature = "oracle")]
+    factories.push(Box::new(rine_store_oracle::OracleFactory::new(
+        args.oracle.clone(),
+    )));
+    factories
+}
+
+/// Pick the factory named by `--backend`, listing the compiled-in names on
+/// a miss so flag values can never drift from the implementations.
+fn select_factory<'a>(
+    factories: &'a [Box<dyn BackendFactory>],
+    name: &str,
+) -> Result<&'a dyn BackendFactory> {
+    factories
+        .iter()
+        .find(|f| f.name() == name)
+        .map(AsRef::as_ref)
+        .ok_or_else(|| {
+            let names = factories
+                .iter()
+                .map(|f| f.name())
+                .collect::<Vec<_>>()
+                .join("|");
+            anyhow::anyhow!("unknown backend: {name} (expected {names})")
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn factories() -> Vec<Box<dyn BackendFactory>> {
+        vec![Box::new(rine_etcd::MemoryFactory)]
+    }
+
+    #[test]
+    fn select_factory_finds_memory_and_rejects_unknown() {
+        let factories = factories();
+        assert!(matches!(
+            select_factory(&factories, "memory"),
+            Ok(f) if f.name() == "memory"
+        ));
+        assert!(matches!(
+            select_factory(&factories, "bogus"),
+            Err(e) if e.to_string().contains("unknown backend: bogus (expected memory)")
+        ));
+    }
+
+    #[test]
+    fn build_factories_registers_backends() {
+        let args = Args::try_parse_from(["rine"]).unwrap();
+        let names: Vec<_> = build_factories(&args).iter().map(|f| f.name()).collect();
+        assert!(names.contains(&"memory"));
+        #[cfg(feature = "sqlite")]
+        assert!(names.contains(&"sqlite"));
+        #[cfg(feature = "oracle")]
+        assert!(names.contains(&"oracle"));
+    }
+
+    #[test]
+    fn args_parse_from_flags() {
+        let args = Args::try_parse_from([
+            "rine",
+            "--backend",
+            "sqlite",
+            "--listen",
+            "127.0.0.1:2380",
+            "--sqlite-path",
+            "/tmp/x.db",
+        ])
+        .unwrap();
+        assert_eq!(args.backend, "sqlite");
+        assert_eq!(args.listen, "127.0.0.1:2380".parse().unwrap());
+        let defaults = Args::try_parse_from(["rine"]).unwrap();
+        assert_eq!(defaults.backend, "memory");
+    }
 }

@@ -98,3 +98,41 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn storage_errors_map_to_status_codes() {
+        assert_eq!(
+            status_err(Error::FutureRev {
+                requested: 9,
+                current: 2
+            })
+            .code(),
+            tonic::Code::OutOfRange
+        );
+        assert_eq!(status_err(Error::Conflict).code(), tonic::Code::Aborted);
+        assert_eq!(
+            status_err(Error::KeyExists(vec![1])).code(),
+            tonic::Code::AlreadyExists
+        );
+        assert_eq!(
+            status_err(Error::Backend("x".into())).code(),
+            tonic::Code::Internal
+        );
+        assert_eq!(
+            status_err(Error::TableMissing("t".into())).code(),
+            tonic::Code::Internal
+        );
+        assert_eq!(
+            status_err(Error::AlreadyExists("i".into())).code(),
+            tonic::Code::Internal
+        );
+        assert_eq!(
+            status_err(Error::LockContention("l".into())).code(),
+            tonic::Code::Internal
+        );
+    }
+}

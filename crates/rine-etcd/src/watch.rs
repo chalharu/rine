@@ -286,3 +286,258 @@ async fn handle_create(
     }
     watchers.insert(id, watcher);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        MemoryBackend,
+        backend::{Event, KeyValue, ReadSet},
+    };
+    use bytes::Bytes;
+
+    fn kv(key: &[u8], rev: i64) -> KeyValue {
+        KeyValue {
+            key: Bytes::copy_from_slice(key),
+            value: Bytes::from("v"),
+            create_revision: rev,
+            mod_revision: rev,
+            version: 1,
+            lease: 0,
+        }
+    }
+
+    fn put_event(key: &[u8], rev: i64) -> Event {
+        Event {
+            revision: rev,
+            key: Bytes::copy_from_slice(key),
+            deleted: false,
+            kv: Some(kv(key, rev)),
+            prev_kv: None,
+        }
+    }
+
+    fn del_event(key: &[u8], rev: i64) -> Event {
+        let prev = kv(key, rev - 1);
+        Event {
+            revision: rev,
+            key: Bytes::copy_from_slice(key),
+            deleted: true,
+            kv: None,
+            prev_kv: Some(prev),
+        }
+    }
+
+    async fn backend_with(keys: &[&[u8]]) -> Arc<dyn Backend> {
+        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        for (i, key) in keys.iter().enumerate() {
+            let rev = i as i64 + 2;
+            let key = Bytes::copy_from_slice(key);
+            b.commit(
+                ReadSet {
+                    points: vec![(key.clone(), None)],
+                    ranges: Vec::new(),
+                },
+                vec![Event {
+                    revision: rev,
+                    key: key.clone(),
+                    deleted: false,
+                    kv: Some(KeyValue {
+                        key,
+                        value: Bytes::from("v"),
+                        create_revision: rev,
+                        mod_revision: rev,
+                        version: 1,
+                        lease: 0,
+                    }),
+                    prev_kv: None,
+                }],
+            )
+            .await
+            .unwrap();
+        }
+        b
+    }
+
+    fn watcher(key: &[u8]) -> Watcher {
+        Watcher {
+            live_from: 0,
+            key: key.to_vec(),
+            range_end: Vec::new(),
+            no_put: false,
+            no_delete: false,
+            prev_kv: false,
+            progress_notify: false,
+        }
+    }
+
+    #[test]
+    fn matches_point_and_range() {
+        assert!(matches(&watcher(b"a"), b"a"));
+        assert!(!matches(&watcher(b"a"), b"b"));
+        let mut prefix = watcher(b"a");
+        prefix.range_end = b"c".to_vec();
+        assert!(matches(&prefix, b"a"));
+        assert!(matches(&prefix, b"b"));
+        assert!(!matches(&prefix, b"c"));
+        assert!(!matches(&prefix, b"z"));
+    }
+
+    #[test]
+    fn proto_events_cover_put_delete_and_prev() {
+        let put = to_proto_event(&put_event(b"k", 2), false);
+        assert_eq!(put.r#type, mvccpb::event::EventType::Put as i32);
+        assert!(put.prev_kv.is_none());
+        let put_prev = to_proto_event(&put_event(b"k", 2), true);
+        assert!(put_prev.prev_kv.is_none());
+        let del = to_proto_event(&del_event(b"k", 3), false);
+        assert_eq!(del.r#type, mvccpb::event::EventType::Delete as i32);
+        assert_eq!(del.kv.as_ref().unwrap().mod_revision, 3);
+        assert!(del.prev_kv.is_none());
+        let del_prev = to_proto_event(&del_event(b"k", 3), true);
+        assert!(del_prev.prev_kv.is_some());
+        // A delete without recorded state still yields a tombstone.
+        let bare = Event {
+            revision: 4,
+            key: Bytes::from("k"),
+            deleted: true,
+            kv: None,
+            prev_kv: None,
+        };
+        let bare_ev = to_proto_event(&bare, false);
+        assert_eq!(bare_ev.kv.as_ref().unwrap().version, 0);
+    }
+
+    #[test]
+    fn watch_events_filter_by_type() {
+        let events = vec![put_event(b"k", 2), del_event(b"k", 3)];
+        assert_eq!(watch_events(&watcher(b"k"), &events).len(), 2);
+        let mut no_put = watcher(b"k");
+        no_put.no_put = true;
+        assert_eq!(watch_events(&no_put, &events).len(), 1);
+        let mut no_del = watcher(b"k");
+        no_del.no_delete = true;
+        assert_eq!(watch_events(&no_del, &events).len(), 1);
+        assert!(watch_events(&watcher(b"other"), &events).is_empty());
+    }
+
+    async fn created(
+        backend: &Arc<dyn Backend>,
+        c: WatchCreateRequest,
+    ) -> (Vec<WatchResponse>, HashMap<i64, Watcher>) {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut watchers = HashMap::new();
+        let next_id = AtomicI64::new(1);
+        handle_create(backend, &next_id, &tx, &mut watchers, c).await;
+        drop(tx);
+        let mut out = Vec::new();
+        while let Some(r) = rx.recv().await {
+            out.push(r.unwrap());
+        }
+        (out, watchers)
+    }
+
+    fn create(key: &[u8], start: i64) -> WatchCreateRequest {
+        WatchCreateRequest {
+            key: key.to_vec(),
+            start_revision: start,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn create_assigns_ids_and_replays_history() {
+        let backend = backend_with(&[b"h"]).await;
+        // Server-assigned ID, live watch.
+        let (out, watchers) = created(&backend, create(b"h", 0)).await;
+        assert_eq!(out.len(), 1);
+        assert!(out[0].created);
+        assert_eq!(watchers.len(), 1);
+        // Client-specified ID is honored when unused, replaced when taken.
+        let (out, watchers) = created(
+            &backend,
+            WatchCreateRequest {
+                watch_id: 42,
+                ..create(b"h", 0)
+            },
+        )
+        .await;
+        assert_eq!(out[0].watch_id, 42);
+        let mut taken = watchers;
+        let (out, _) = {
+            let (tx, mut rx) = mpsc::channel(16);
+            let next_id = AtomicI64::new(100);
+            handle_create(
+                &backend,
+                &next_id,
+                &tx,
+                &mut taken,
+                WatchCreateRequest {
+                    watch_id: 42,
+                    ..create(b"h", 0)
+                },
+            )
+            .await;
+            drop(tx);
+            let mut out = Vec::new();
+            while let Some(r) = rx.recv().await {
+                out.push(r.unwrap());
+            }
+            (out, taken)
+        };
+        assert_ne!(out[0].watch_id, 42);
+        // Historical replay from an old revision.
+        let (out, _) = created(&backend, create(b"h", 1)).await;
+        assert_eq!(out.len(), 2);
+        assert!(!out[1].events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_honors_filters_and_prev_kv() {
+        let backend = backend_with(&[]).await;
+        let (out, watchers) = created(
+            &backend,
+            WatchCreateRequest {
+                prev_kv: true,
+                progress_notify: true,
+                filters: vec![0],
+                range_end: b"z".to_vec(),
+                ..create(b"a", 0)
+            },
+        )
+        .await;
+        assert_eq!(out.len(), 1);
+        let w = watchers.values().next().unwrap();
+        assert!(w.prev_kv && w.progress_notify && w.no_put && !w.no_delete);
+        assert_eq!(w.range_end, b"z".to_vec());
+    }
+
+    #[tokio::test]
+    async fn create_after_compact_cancels() {
+        let backend = backend_with(&[b"h"]).await;
+        backend.compact(2).await.unwrap();
+        let (out, watchers) = created(&backend, create(b"h", 1)).await;
+        assert_eq!(out.len(), 2);
+        assert!(out[0].created);
+        assert!(out[1].canceled);
+        assert!(out[1].compact_revision > 0);
+        assert!(watchers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_without_receiver_returns_early() {
+        let backend = backend_with(&[]).await;
+        let (tx, rx) = mpsc::channel(16);
+        drop(rx);
+        let mut watchers = HashMap::new();
+        handle_create(
+            &backend,
+            &AtomicI64::new(1),
+            &tx,
+            &mut watchers,
+            create(b"h", 0),
+        )
+        .await;
+        assert!(watchers.is_empty());
+    }
+}

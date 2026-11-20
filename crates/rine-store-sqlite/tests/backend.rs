@@ -212,3 +212,222 @@ async fn sqlite_unique_violation_maps_to_conflict() {
         .unwrap_err();
     assert!(matches!(err, Error::Conflict), "got {err:?}");
 }
+
+#[tokio::test]
+async fn sqlite_historical_reads_cover_snapshot_paths() {
+    let b = backend().await;
+    kv_create(&b, Bytes::from("h"), Bytes::from("v1"), 0)
+        .await
+        .unwrap();
+    kv_create(&b, Bytes::from("h2"), Bytes::from("v1"), 0)
+        .await
+        .unwrap();
+    let r2 = kv_update(&b, Bytes::from("h"), Bytes::from("v2"), 0, 0)
+        .await
+        .unwrap();
+    // Point read at an old revision.
+    let (_, kv) = kv_get(&b, b"h", r2 - 1).await.unwrap();
+    assert_eq!(kv.unwrap().value, Bytes::from("v1"));
+    // Historical range with an explicit end exercises the snapshot query.
+    let (_, rows, count) = b
+        .list(
+            b"h",
+            Some(b"h3"),
+            ListOptions {
+                revision: r2 - 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+    assert!(rows.iter().any(|kv| kv.value == "v1"));
+    // Historical count-only, limit, and keys-only variants.
+    for opts in [
+        ListOptions {
+            revision: r2 - 1,
+            count_only: true,
+            ..Default::default()
+        },
+        ListOptions {
+            revision: r2 - 1,
+            limit: 1,
+            ..Default::default()
+        },
+        ListOptions {
+            revision: r2 - 1,
+            keys_only: true,
+            ..Default::default()
+        },
+    ] {
+        let (cur, _, _) = b.list(b"h", Some(b"h3"), opts).await.unwrap();
+        assert!(cur >= r2);
+    }
+    // A future revision is rejected.
+    let err = b
+        .list(
+            b"h",
+            None,
+            ListOptions {
+                revision: r2 + 1000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, rine_etcd::error::Error::FutureRev { .. }));
+}
+
+#[tokio::test]
+async fn sqlite_commit_guards_ranges_and_reserved_keys() {
+    use rine_etcd::backend::{Event, ObservedRange, ReadSet};
+    use rine_etcd::error::Error;
+
+    let b = backend().await;
+    kv_create(&b, Bytes::from("g/a"), Bytes::from("1"), 0)
+        .await
+        .unwrap();
+    kv_create(&b, Bytes::from("g/b"), Bytes::from("2"), 0)
+        .await
+        .unwrap();
+    let (_, kvs, count) = b
+        .list(b"g/", Some(&[0u8]), ListOptions::default())
+        .await
+        .unwrap();
+    let observed = ObservedRange {
+        prefix: Bytes::from("g/"),
+        range_end: Some(Bytes::copy_from_slice(&[0u8])),
+        opts: ListOptions::default(),
+        observed: kvs
+            .iter()
+            .map(|kv| (kv.key.clone(), kv.mod_revision))
+            .collect(),
+        count,
+    };
+    // A matching snapshot commits cleanly.
+    b.commit(
+        ReadSet {
+            points: Vec::new(),
+            ranges: vec![observed.clone()],
+        },
+        vec![],
+    )
+    .await
+    .unwrap();
+    // Moving a key under the range conflicts.
+    kv_update(&b, Bytes::from("g/a"), Bytes::from("3"), 0, 0)
+        .await
+        .unwrap();
+    let err = b
+        .commit(
+            ReadSet {
+                points: Vec::new(),
+                ranges: vec![observed],
+            },
+            vec![],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Conflict));
+    // A guard on a deleted key observes no live revision.
+    kv_delete(&b, b"g/a").await.unwrap();
+    b.commit(
+        ReadSet {
+            points: vec![(Bytes::from("g/a"), None)],
+            ranges: Vec::new(),
+        },
+        vec![],
+    )
+    .await
+    .unwrap();
+    // The compaction watermark key is reserved.
+    let err = b
+        .commit(
+            ReadSet::default(),
+            vec![Event {
+                revision: 1,
+                key: Bytes::from("compact_rev_key"),
+                deleted: false,
+                kv: None,
+                prev_kv: None,
+            }],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Backend(_)));
+}
+
+#[tokio::test]
+async fn sqlite_executor_edges_and_lifecycle() {
+    use rine_store_executor::SqlExecutor as _;
+
+    let db = SqliteDb::open_in_memory().unwrap();
+    let b = SqliteBackend::new(Arc::new(db.clone()));
+    b.initialize().await.unwrap();
+    assert!(b.compacted_revision().await >= 0);
+    // Batch writes outside a commit unit run in their own transaction.
+    db.execute_batch(vec![(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY)".to_string(),
+        vec![],
+    )])
+    .await
+    .unwrap();
+    // A REAL value cannot be read as a row cell.
+    let err = db.query_all("SELECT 1.5", vec![]).await.unwrap_err();
+    assert!(matches!(err, rine_etcd::error::Error::Backend(_)));
+    assert!(!format!("{err:?}").is_empty());
+    // Batch reads inside a unit bypass the extra transaction; errors surface.
+    db.begin_unit().await.unwrap();
+    let rows = db
+        .query_batch(vec![("SELECT 1".to_string(), vec![])])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    db.end_unit(true).await.unwrap();
+    let err = db
+        .query_batch(vec![(
+            "SELECT * FROM no_such_table_xyz".to_string(),
+            vec![],
+        )])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, rine_etcd::error::Error::TableMissing(_)));
+    // File open plus the factory path.
+    let dir = std::env::temp_dir().join(format!("rine-test-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&dir);
+    let file_db = SqliteDb::open(&dir).unwrap();
+    use rine_etcd::backend::BackendFactory as _;
+    let factory = rine_store_sqlite::SqliteFactory::new(rine_store_sqlite::SqliteConfig {
+        path: dir.clone(),
+    });
+    assert_eq!(factory.name(), "sqlite");
+    let backend = factory.build().unwrap();
+    backend.initialize().await.unwrap();
+    drop(file_db);
+    let _ = std::fs::remove_file(&dir);
+}
+
+#[tokio::test]
+async fn sqlite_conformance_helper_edges() {
+    use rine_etcd::error::Error;
+
+    let b = backend().await;
+    // Duplicate create, conflicting update, and missing-key delete paths.
+    kv_create(&b, Bytes::from("e"), Bytes::from("1"), 0)
+        .await
+        .unwrap();
+    let err = kv_create(&b, Bytes::from("e"), Bytes::from("x"), 0)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Conflict), "got {err:?}");
+    let err = kv_update(&b, Bytes::from("gone"), Bytes::from("x"), 0, 0)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::KeyExists(_)), "got {err:?}");
+    let err = kv_update(&b, Bytes::from("e"), Bytes::from("x"), 1, 999)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Backend(_)), "got {err:?}");
+    let (_, prev) = kv_delete(&b, b"missing").await.unwrap();
+    assert!(prev.is_none());
+}
