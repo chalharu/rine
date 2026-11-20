@@ -22,7 +22,6 @@ use crate::{
         range_request::{SortOrder, SortTarget},
         response_op::Response,
     },
-    lease::LeaseManager,
     mvccpb,
 };
 
@@ -87,17 +86,12 @@ impl WriteBatch {
 
 pub struct KvService {
     backend: Arc<dyn Backend>,
-    leases: LeaseManager,
     writes: CommitLock,
 }
 
 impl KvService {
-    pub fn new(backend: Arc<dyn Backend>, leases: LeaseManager, writes: CommitLock) -> Self {
-        Self {
-            backend,
-            leases,
-            writes,
-        }
+    pub fn new(backend: Arc<dyn Backend>, writes: CommitLock) -> Self {
+        Self { backend, writes }
     }
 
     // ---- core handlers (shared by unary RPCs and Txn branches) ----
@@ -130,10 +124,10 @@ impl KvService {
         let fresh = self.backend.commit(batch.reads, batch.events).await?;
         for (key, old, new) in changes {
             if old != 0 {
-                self.leases.detach(old, &key).await?;
+                self.backend.lease_detach(old, &key).await?;
             }
             if new != 0 {
-                self.leases.attach(new, key.to_vec()).await?;
+                self.backend.lease_attach(new, key.to_vec()).await?;
             }
         }
         Ok(fresh)
@@ -350,7 +344,14 @@ impl KvService {
             },
             _ => (Bytes::copy_from_slice(&req.value), req.lease),
         };
-        if lease != 0 && !self.leases.exists(lease).await.map_err(status_err)? {
+        if lease != 0
+            && self
+                .backend
+                .lease_lookup(lease)
+                .await
+                .map_err(status_err)?
+                .is_none()
+        {
             return Err(tonic::Status::failed_precondition(
                 "etcdserver: requested lease not found",
             ));
@@ -472,40 +473,36 @@ impl KvService {
         Ok(true)
     }
 
-    fn apply_op<'a>(
-        &'a self,
-        op: &'a RequestOp,
+    async fn apply_op(
+        &self,
+        op: &RequestOp,
         depth: usize,
-        batch: &'a mut WriteBatch,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ResponseOp, tonic::Status>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            use crate::etcdserverpb::{request_op::Request, response_op::Response};
-            match op.request.as_ref() {
-                Some(Request::RequestRange(r)) => Ok(ResponseOp {
-                    response: Some(Response::ResponseRange(
-                        self.do_range(r, Some(batch)).await?,
-                    )),
-                }),
-                Some(Request::RequestPut(p)) => Ok(ResponseOp {
-                    response: Some(Response::ResponsePut(self.do_put(p, batch, false).await?)),
-                }),
-                Some(Request::RequestDeleteRange(d)) => Ok(ResponseOp {
-                    response: Some(Response::ResponseDeleteRange(
-                        self.do_delete(d, batch).await?,
-                    )),
-                }),
-                Some(Request::RequestTxn(t)) => Ok(ResponseOp {
-                    response: Some(Response::ResponseTxn(
-                        self.do_txn(t, depth + 1, batch).await?,
-                    )),
-                }),
-                None => Err(tonic::Status::invalid_argument(
-                    "etcdserver: empty request op",
+        batch: &mut WriteBatch,
+    ) -> Result<ResponseOp, tonic::Status> {
+        use crate::etcdserverpb::{request_op::Request, response_op::Response};
+        match op.request.as_ref() {
+            Some(Request::RequestRange(r)) => Ok(ResponseOp {
+                response: Some(Response::ResponseRange(
+                    self.do_range(r, Some(batch)).await?,
                 )),
-            }
-        })
+            }),
+            Some(Request::RequestPut(p)) => Ok(ResponseOp {
+                response: Some(Response::ResponsePut(self.do_put(p, batch, false).await?)),
+            }),
+            Some(Request::RequestDeleteRange(d)) => Ok(ResponseOp {
+                response: Some(Response::ResponseDeleteRange(
+                    self.do_delete(d, batch).await?,
+                )),
+            }),
+            Some(Request::RequestTxn(t)) => Ok(ResponseOp {
+                response: Some(Response::ResponseTxn(
+                    self.do_txn(t, depth + 1, batch).await?,
+                )),
+            }),
+            None => Err(tonic::Status::invalid_argument(
+                "etcdserver: empty request op",
+            )),
+        }
     }
 
     fn do_txn<'a>(
@@ -829,8 +826,7 @@ mod eval_tests {
     async fn service() -> KvService {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let writes: CommitLock = Arc::new(tokio::sync::Mutex::new(()));
-        let leases = LeaseManager::new(backend.clone(), writes.clone());
-        KvService::new(backend, leases, writes)
+        KvService::new(backend, writes)
     }
 
     fn cmp_value(key: &[u8]) -> Compare {
@@ -912,14 +908,7 @@ mod eval_tests {
             .await
             .unwrap();
         backend.compact(2).await.unwrap();
-        let svc2 = KvService::new(
-            backend,
-            LeaseManager::new(
-                Arc::new(MemoryBackend::new()),
-                Arc::new(tokio::sync::Mutex::new(())),
-            ),
-            Arc::new(tokio::sync::Mutex::new(())),
-        );
+        let svc2 = KvService::new(backend, Arc::new(tokio::sync::Mutex::new(())));
         let err = svc2
             .fetch(
                 b"k",

@@ -57,6 +57,7 @@ impl EtcdServer {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let writes: crate::backend::CommitLock = Arc::new(tokio::sync::Mutex::new(()));
         let leases = LeaseManager::new(self.backend.clone(), writes.clone());
+        leases.spawn_expiry_loop();
         let mut set = tokio::task::JoinSet::new();
         for l in listeners {
             let (backend, leases, writes) = (self.backend.clone(), leases.clone(), writes.clone());
@@ -94,11 +95,7 @@ impl EtcdServer {
             builder = builder.tls_config(config)?;
         }
         builder
-            .add_service(KvServer::new(KvService::new(
-                backend.clone(),
-                leases.clone(),
-                writes,
-            )))
+            .add_service(KvServer::new(KvService::new(backend.clone(), writes)))
             .add_service(WatchServer::new(WatchService::new(backend.clone())))
             .add_service(LeaseServer::new(LeaseService::new(backend.clone(), leases)))
             .add_service(ClusterServer::new(ClusterService::new(

@@ -20,8 +20,8 @@ use tokio::sync::{RwLock, broadcast};
 
 use crate::{
     backend::{
-        BROADCAST_CAP, Backend, BackendFactory, Event, KeyValue, LeaseId, LeaseState, ListOptions,
-        ObservedRange, ReadSet, Revision, in_range,
+        BROADCAST_CAP, Backend, Event, KeyValue, LeaseId, LeaseState, ListOptions, ObservedRange,
+        ReadSet, Revision, in_range,
     },
     error::{Error, Result},
 };
@@ -37,32 +37,14 @@ struct Inner {
     history: BTreeMap<Revision, Vec<Event>>,
 }
 
-struct LeaseRecord {
-    granted_ttl: i64,
-    expires_at_ms: u64,
-    keys: Vec<Vec<u8>>,
-}
-
 pub struct MemoryBackend {
     inner: Arc<RwLock<Inner>>,
-    leases: Arc<RwLock<HashMap<i64, LeaseRecord>>>,
+    leases: Arc<RwLock<HashMap<i64, LeaseState>>>,
     next_lease: Arc<AtomicI64>,
     tx: broadcast::Sender<Vec<Event>>,
 }
 
-/// Factory for the in-process [`MemoryBackend`]; takes no configuration.
-pub struct MemoryFactory;
-
-impl BackendFactory for MemoryFactory {
-    fn name(&self) -> &'static str {
-        "memory"
-    }
-
-    fn build(&self) -> anyhow::Result<Arc<dyn Backend>> {
-        Ok(Arc::new(MemoryBackend::new()))
-    }
-}
-
+/// In-process backend; takes no configuration.
 impl Default for MemoryBackend {
     fn default() -> Self {
         Self::new()
@@ -230,10 +212,6 @@ impl Backend for MemoryBackend {
         self.inner.read().await.rev
     }
 
-    async fn compacted_revision(&self) -> Revision {
-        self.inner.read().await.compact_rev
-    }
-
     async fn initialize(&self) -> Result<()> {
         Ok(())
     }
@@ -297,7 +275,14 @@ impl Backend for MemoryBackend {
                 compacted: g.compact_rev,
             });
         }
-        for r in (g.compact_rev + 1)..=revision {
+        // Drain only revisions that actually hold events instead of stepping
+        // one by one over a possibly huge sparse gap.
+        let stale: Vec<Revision> = g
+            .history
+            .range((g.compact_rev + 1)..=revision)
+            .map(|(r, _)| *r)
+            .collect();
+        for r in stale {
             if let Some(events) = g.history.remove(&r) {
                 for event in events {
                     if let Some(kv) = event.kv {
@@ -310,14 +295,6 @@ impl Backend for MemoryBackend {
         }
         g.compact_rev = revision;
         Ok(g.rev)
-    }
-
-    async fn db_size(&self) -> i64 {
-        let g = self.inner.read().await;
-        g.kvs
-            .iter()
-            .map(|(k, v)| (k.len() + v.value.len()) as i64)
-            .sum()
     }
 
     async fn events(&self, from: Revision, to: Revision) -> Result<Vec<Event>> {
@@ -348,7 +325,7 @@ impl Backend for MemoryBackend {
         };
         self.leases.write().await.insert(
             id,
-            LeaseRecord {
+            LeaseState {
                 granted_ttl: ttl,
                 expires_at_ms: LeaseState::deadline(ttl, now_ms),
                 keys: Vec::new(),
@@ -358,11 +335,7 @@ impl Backend for MemoryBackend {
     }
 
     async fn lease_lookup(&self, id: LeaseId) -> Result<Option<LeaseState>> {
-        Ok(self.leases.read().await.get(&id).map(|e| LeaseState {
-            granted_ttl: e.granted_ttl,
-            expires_at_ms: e.expires_at_ms,
-            keys: e.keys.clone(),
-        }))
+        Ok(self.leases.read().await.get(&id).cloned())
     }
 
     async fn lease_keepalive(&self, id: LeaseId, now_ms: u64) -> Result<Option<i64>> {
@@ -374,11 +347,12 @@ impl Backend for MemoryBackend {
 
     async fn lease_attach(&self, id: LeaseId, key: Vec<u8>) -> Result<bool> {
         Ok(match self.leases.write().await.get_mut(&id) {
-            Some(e) if !e.keys.contains(&key) => {
-                e.keys.push(key);
+            Some(e) => {
+                if !e.keys.contains(&key) {
+                    e.keys.push(key);
+                }
                 true
             }
-            Some(_) => true,
             None => false,
         })
     }
@@ -621,13 +595,10 @@ mod coverage_tests {
 
     #[tokio::test]
     async fn factory_and_default() {
-        let f = MemoryFactory;
-        assert_eq!(f.name(), "memory");
-        let b = f.build().unwrap();
+        let b = MemoryBackend::new();
         b.initialize().await.unwrap();
-        assert_eq!(b.compacted_revision().await, 0);
         let d = MemoryBackend::default();
-        assert_eq!(d.db_size().await, 0);
+        let _ = d.current_revision().await;
     }
 
     #[tokio::test]
@@ -671,7 +642,6 @@ mod coverage_tests {
             .await
             .unwrap();
         assert!(rows.is_empty() && count == 1);
-        assert!(b.db_size().await > 0);
     }
 
     #[tokio::test]

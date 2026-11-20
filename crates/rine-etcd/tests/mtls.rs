@@ -153,6 +153,9 @@ async fn tls_without_client_auth_accepts_ca_only_client() {
     assert_eq!(value, b"v".to_vec());
 }
 
+/// Reserve a likely-free port. The bind is dropped before the server
+/// rebinds, so a rival process can steal it in between (TOCTOU): callers
+/// retry the whole bind on `AddrInUse` instead of failing the test.
 async fn free_port() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -165,32 +168,55 @@ async fn mixed_plaintext_and_mtls_share_one_backend() {
     use rine_etcd::server::ListenAddr;
 
     let pki = test_pki();
-    let plain = free_port().await;
-    let tls_addr = free_port().await;
-    let tls_cfg = server_identity(&pki, true);
     let backend = Arc::new(rine_etcd::MemoryBackend::new());
-    tokio::spawn(async move {
-        EtcdServer::new(backend)
-            .serve_many(vec![
-                ListenAddr {
-                    addr: plain,
-                    tls: None,
-                },
-                ListenAddr {
-                    addr: tls_addr,
-                    tls: Some(tls_cfg),
-                },
-            ])
-            .await
-            .unwrap();
-    });
-    for addr in [plain, tls_addr] {
-        for _ in 0..100 {
-            if tokio::net::TcpStream::connect(addr).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+    // Retry the bind: a port reserved by `free_port` can be stolen before
+    // the server rebinds it.
+    for _ in 0..10 {
+        let plain = free_port().await;
+        let tls_addr = free_port().await;
+        let tls_cfg = server_identity(&pki, true);
+        let backend = backend.clone();
+        let bound = tokio::spawn(async move {
+            EtcdServer::new(backend)
+                .serve_many(vec![
+                    ListenAddr {
+                        addr: plain,
+                        tls: None,
+                    },
+                    ListenAddr {
+                        addr: tls_addr,
+                        tls: Some(tls_cfg),
+                    },
+                ])
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if bound.is_finished() {
+            continue;
         }
+        if run_mixed_case(plain, tls_addr, &pki).await {
+            return;
+        }
+        bound.abort();
+    }
+    panic!("mixed listeners never bound: ports kept colliding");
+}
+
+async fn run_mixed_case(plain: SocketAddr, tls_addr: SocketAddr, pki: &Pki) -> bool {
+    // Readiness: a stolen port never accepts, so bail out fast and retry
+    // the bind instead of failing the assertions below.
+    for _ in 0..40 {
+        let plain_ok = tokio::net::TcpStream::connect(plain).await.is_ok();
+        let tls_ok = tokio::net::TcpStream::connect(tls_addr).await.is_ok();
+        if plain_ok && tls_ok {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if tokio::net::TcpStream::connect(plain).await.is_err()
+        || tokio::net::TcpStream::connect(tls_addr).await.is_err()
+    {
+        return false;
     }
 
     // Write over plaintext, read back over mTLS: one shared backend.
@@ -207,12 +233,12 @@ async fn mixed_plaintext_and_mtls_share_one_backend() {
     })
     .await
     .unwrap();
-    let value = put_get(tls_addr, client_tls(&pki, true)).await.unwrap();
+    let value = put_get(tls_addr, client_tls(pki, true)).await.unwrap();
     assert_eq!(value, b"v".to_vec());
     // And the reverse direction: write over mTLS, read over plaintext.
     let channel = Channel::from_shared(format!("https://{tls_addr}"))
         .unwrap()
-        .tls_config(client_tls(&pki, true))
+        .tls_config(client_tls(pki, true))
         .unwrap()
         .connect()
         .await
@@ -243,4 +269,5 @@ async fn mixed_plaintext_and_mtls_share_one_backend() {
         got.kvs.first().map(|k| k.value.clone()).unwrap_or_default(),
         b"v2".to_vec()
     );
+    true
 }

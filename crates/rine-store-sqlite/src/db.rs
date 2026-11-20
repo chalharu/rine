@@ -7,15 +7,11 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
 use async_trait::async_trait;
-use rine_etcd::{
-    backend::BackendFactory,
-    error::{Error, Result},
-};
+use rine_etcd::error::{Error, Result};
 use rine_store_executor::{Row, SqlExecutor, SqlValue};
 use rusqlite::{ToSql, types::ToSqlOutput};
 use tokio::sync::Mutex;
@@ -23,7 +19,6 @@ use tokio::sync::Mutex;
 /// Live SQLite connection. `Clone` shares the same underlying connection.
 pub struct SqliteDb {
     conn: Arc<Mutex<rusqlite::Connection>>,
-    in_unit: Arc<AtomicBool>,
     /// Serializes transaction scopes on the shared connection: an open
     /// unit and an implicit per-batch transaction must never overlap, or
     /// the second BEGIN fails with "cannot start a transaction within a
@@ -41,7 +36,6 @@ impl Clone for SqliteDb {
     fn clone(&self) -> Self {
         Self {
             conn: self.conn.clone(),
-            in_unit: self.in_unit.clone(),
             tx: self.tx.clone(),
             unit_guard: self.unit_guard.clone(),
         }
@@ -51,7 +45,7 @@ impl Clone for SqliteDb {
 impl std::fmt::Debug for SqliteDb {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteDb")
-            .field("in_unit", &self.in_unit.load(Ordering::SeqCst))
+            .field("in_unit", &self.unit_guard.lock().unwrap().is_some())
             .finish_non_exhaustive()
     }
 }
@@ -60,7 +54,6 @@ impl SqliteDb {
     fn new(conn: rusqlite::Connection) -> Self {
         Self {
             conn: Arc::new(Mutex::new(conn)),
-            in_unit: Arc::new(AtomicBool::new(false)),
             tx: Arc::new(tokio::sync::Mutex::new(())),
             unit_guard: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -188,7 +181,7 @@ fn read_col(row: &rusqlite::Row, idx: usize) -> Result<SqlValue, rusqlite::Error
         rusqlite::types::ValueRef::Real(f) => Err(rusqlite::Error::FromSqlConversionFailure(
             idx,
             rusqlite::types::Type::Real,
-            Box::new(SqliteRealUnexpected(f)),
+            format!("unexpected REAL value {f}").into(),
         )),
         rusqlite::types::ValueRef::Text(t) => {
             Ok(SqlValue::Str(String::from_utf8_lossy(t).into_owned()))
@@ -197,23 +190,12 @@ fn read_col(row: &rusqlite::Row, idx: usize) -> Result<SqlValue, rusqlite::Error
     }
 }
 
-#[derive(Debug)]
-struct SqliteRealUnexpected(f64);
-
-impl std::fmt::Display for SqliteRealUnexpected {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unexpected REAL value {}", self.0)
-    }
-}
-
-impl std::error::Error for SqliteRealUnexpected {}
-
 #[async_trait]
 impl SqlExecutor for SqliteDb {
     async fn execute_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
         // Inside a commit unit the connection already holds BEGIN IMMEDIATE;
         // run the statements directly instead of nesting a second transaction.
-        if self.in_unit.load(Ordering::SeqCst) {
+        if self.unit_guard.lock().unwrap().is_some() {
             return self
                 .run_blocking(move |conn| apply_batch(conn, statements))
                 .await;
@@ -261,7 +243,7 @@ impl SqlExecutor for SqliteDb {
     }
 
     async fn query_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<Vec<Vec<Row>>> {
-        if self.in_unit.load(Ordering::SeqCst) {
+        if self.unit_guard.lock().unwrap().is_some() {
             return self
                 .run_blocking(move |conn| {
                     statements
@@ -301,7 +283,6 @@ impl SqlExecutor for SqliteDb {
         match r {
             Ok(()) => {
                 *self.unit_guard.lock().unwrap() = Some(guard);
-                self.in_unit.store(true, Ordering::SeqCst);
                 Ok(())
             }
             // The guard drops here: the scope is released on failure.
@@ -312,7 +293,6 @@ impl SqlExecutor for SqliteDb {
     async fn end_unit(&self, commit: bool) -> Result<()> {
         let sql = if commit { "COMMIT" } else { "ROLLBACK" };
         let r = self.run_blocking(move |conn| conn.execute_batch(sql)).await;
-        self.in_unit.store(false, Ordering::SeqCst);
         // Release the scope after the transaction is closed.
         self.unit_guard.lock().unwrap().take();
         r
@@ -331,24 +311,10 @@ pub struct SqliteConfig {
     pub path: PathBuf,
 }
 
-/// Factory that opens the configured SQLite file.
-pub struct SqliteFactory {
-    config: SqliteConfig,
-}
-
-impl SqliteFactory {
-    pub fn new(config: SqliteConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl BackendFactory for SqliteFactory {
-    fn name(&self) -> &'static str {
-        "sqlite"
-    }
-
-    fn build(&self) -> anyhow::Result<Arc<dyn rine_etcd::Backend>> {
-        let db = SqliteDb::open(&self.config.path)?;
+impl SqliteConfig {
+    /// Open the configured SQLite file as a shared backend.
+    pub fn open_backend(&self) -> rusqlite::Result<Arc<dyn rine_etcd::Backend>> {
+        let db = SqliteDb::open(&self.path)?;
         Ok(Arc::new(crate::SqliteBackend::new(Arc::new(db))))
     }
 }

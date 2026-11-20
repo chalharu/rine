@@ -15,7 +15,7 @@ use rine_store_sqlite::{SqliteBackend, SqliteDb};
 async fn backend() -> SqliteBackend {
     let db = SqliteDb::open_in_memory().unwrap();
     let b = SqliteBackend::new(Arc::new(db));
-    b.ensure_schema().await.unwrap();
+    b.initialize().await.unwrap();
     b
 }
 
@@ -28,7 +28,6 @@ async fn conformance_crud() {
 async fn conformance_history_compact_events() {
     let b = backend().await;
     history_compact_events(&b, "t").await;
-    assert!(b.db_size().await >= 0);
 }
 
 #[tokio::test]
@@ -50,8 +49,8 @@ async fn conformance_commit_duplicate_events_conflict_atomically() {
 async fn sqlite_ensure_schema_is_idempotent() {
     let db = SqliteDb::open_in_memory().unwrap();
     let b = SqliteBackend::new(Arc::new(db));
-    b.ensure_schema().await.unwrap();
-    b.ensure_schema().await.unwrap();
+    b.initialize().await.unwrap();
+    b.initialize().await.unwrap();
     kv_create(&b, Bytes::from("a"), Bytes::from("1"), 0)
         .await
         .unwrap();
@@ -159,7 +158,7 @@ async fn sqlite_ensure_schema_adds_missing_unique_index() {
         .unwrap();
     assert!(before.is_none());
     let b = SqliteBackend::new(Arc::new(db.clone()));
-    b.ensure_schema().await.unwrap();
+    b.initialize().await.unwrap();
     let after = db
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'rine_name_prev_revision_uindex'",
@@ -187,7 +186,7 @@ async fn sqlite_unique_violation_maps_to_conflict() {
 
     let db = SqliteDb::open_in_memory().unwrap();
     let b = SqliteBackend::new(Arc::new(db.clone()));
-    b.ensure_schema().await.unwrap();
+    b.initialize().await.unwrap();
     // (id, name, revision, deleted, create_rev, prev_rev, lease, version, value):
     // the second identical insert violates the (name, prev_revision) index.
     let row = || {
@@ -364,7 +363,6 @@ async fn sqlite_executor_edges_and_lifecycle() {
     let db = SqliteDb::open_in_memory().unwrap();
     let b = SqliteBackend::new(Arc::new(db.clone()));
     b.initialize().await.unwrap();
-    assert!(b.compacted_revision().await >= 0);
     // Batch writes outside a commit unit run in their own transaction.
     db.execute_batch(vec![(
         "CREATE TABLE t (id INTEGER PRIMARY KEY)".to_string(),
@@ -392,16 +390,13 @@ async fn sqlite_executor_edges_and_lifecycle() {
         .await
         .unwrap_err();
     assert!(matches!(err, rine_etcd::error::Error::TableMissing(_)));
-    // File open plus the factory path.
+    // File open plus the config open path.
     let dir = std::env::temp_dir().join(format!("rine-test-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&dir);
     let file_db = SqliteDb::open(&dir).unwrap();
-    use rine_etcd::backend::BackendFactory as _;
-    let factory = rine_store_sqlite::SqliteFactory::new(rine_store_sqlite::SqliteConfig {
-        path: dir.clone(),
-    });
-    assert_eq!(factory.name(), "sqlite");
-    let backend = factory.build().unwrap();
+    let backend = rine_store_sqlite::SqliteConfig { path: dir.clone() }
+        .open_backend()
+        .unwrap();
     backend.initialize().await.unwrap();
     drop(file_db);
     let _ = std::fs::remove_file(&dir);

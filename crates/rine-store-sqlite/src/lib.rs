@@ -8,7 +8,7 @@
 mod db;
 mod dialect;
 
-pub use db::{SqliteConfig, SqliteDb, SqliteFactory};
+pub use db::{SqliteConfig, SqliteDb};
 pub use dialect::SqliteDialect;
 
 pub type SqliteBackend = rine_store_executor::SqlBackend<SqliteDb, dialect::SqliteDialect>;

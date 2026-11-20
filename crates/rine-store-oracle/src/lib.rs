@@ -12,7 +12,7 @@
 mod db;
 mod dialect;
 
-pub use db::{OracleConfig, OracleDb, OracleFactory};
+pub use db::{OracleConfig, OracleDb};
 use rine_store_executor::SqlBackend;
 
 pub type OracleBackend = SqlBackend<OracleDb, dialect::OracleDialect>;

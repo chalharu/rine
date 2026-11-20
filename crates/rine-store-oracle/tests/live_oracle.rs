@@ -80,7 +80,7 @@ async fn live_backend_crud_and_compact() {
 
     let backend = OracleBackend::new(Arc::new(db));
     // Creation path: table was just dropped, so this builds the schema.
-    backend.ensure_schema().await.expect("ensure_schema");
+    backend.initialize().await.expect("ensure_schema");
 
     // --- CRUD + history + compact (shared conformance suite) ---
     // Unique keyspace per run: this binary runs twice per CI job against
@@ -123,8 +123,6 @@ async fn live_backend_crud_and_compact() {
         .await
         .unwrap();
     assert_eq!((header, rows.len(), count), (revision, 0, 0));
-
-    assert!(backend.db_size().await >= 0);
 }
 
 /// Reads must stay correct across DROP + CREATE of the table on one connection.
@@ -198,7 +196,7 @@ async fn live_stale_point_read_is_conflict() {
     }
     let db = connect_retry().await;
     let backend = OracleBackend::new(Arc::new(db));
-    backend.ensure_schema().await.expect("ensure_schema");
+    backend.initialize().await.expect("ensure_schema");
     let key = Bytes::from(format!("rine-live-guard-{}", std::process::id()));
     // Absent-key guard passes, then fails once the key is created elsewhere.
     let missing = ReadSet {
@@ -270,7 +268,7 @@ async fn live_leases_live_in_the_backend() {
     }
     let db = connect_retry().await;
     let backend = OracleBackend::new(Arc::new(db));
-    backend.ensure_schema().await.expect("ensure_schema");
+    backend.initialize().await.expect("ensure_schema");
 
     const NOW: u64 = 1_700_000_000_000;
     let id = backend.lease_grant(3600, 0, NOW).await.expect("grant");

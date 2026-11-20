@@ -40,9 +40,7 @@ pub struct LeaseManager {
 impl LeaseManager {
     /// Delete many expired keys in one guarded commit instead of one commit
     /// per key: a mass expiry (node loss, TTL sync) must not stall all
-    /// writers for seconds. Keys that moved under us abort the batch with a
-    /// conflict; those fall back to per-key best effort on the snapshot we
-    /// already hold (no re-list).
+    /// writers for seconds.
     async fn expire_keys(backend: &Arc<dyn Backend>, pairs: Vec<(i64, Vec<u8>)>) {
         if pairs.is_empty() {
             return;
@@ -77,45 +75,24 @@ impl LeaseManager {
                 prev_kv: Some(kv.clone()),
             })
             .collect();
-        match backend.commit(reads, events).await {
-            Ok(_) => {}
-            Err(Error::Conflict) => {
-                // Fall back key by key on the snapshot above, without
-                // re-listing: each delete is still guarded, so a key that
-                // moved again simply conflicts away.
-                for (_, key, prev) in &live {
-                    let reads = ReadSet {
-                        points: vec![(Bytes::copy_from_slice(key), Some(prev.mod_revision))],
-                        ranges: Vec::new(),
-                    };
-                    let _ = backend
-                        .commit(
-                            reads,
-                            vec![Event {
-                                revision: base + 1,
-                                key: Bytes::copy_from_slice(key),
-                                deleted: true,
-                                kv: None,
-                                prev_kv: Some(prev.clone()),
-                            }],
-                        )
-                        .await;
-                }
-            }
-            Err(_) => {}
-        }
+        // A key that moved under us conflicts away and is retried on the
+        // next expiry tick.
+        let _ = backend.commit(reads, events).await;
     }
 
     pub fn new(backend: Arc<dyn Backend>, writes: CommitLock) -> Self {
-        let mgr = Self { writes, backend };
-        // Expiry loop: delete keys whose lease deadline passed. The 500ms
-        // poll matches upstream etcd's lessor `runLoop`, bounding the extra
-        // lifetime of an expired lease the same way. Lease state lives in
-        // the backend, so every node (and every restart) sees the same
-        // deadlines; `take_expired` is atomic, so rival loops never work
-        // the same lease twice.
-        let backend = mgr.backend.clone();
-        let writes = mgr.writes.clone();
+        Self { writes, backend }
+    }
+
+    /// Poll for past-due leases and delete their keys. The 500ms cadence
+    /// matches upstream etcd's lessor `runLoop`. Lease state lives in the
+    /// backend, so every node (and every restart) sees the same deadlines;
+    /// `take_expired` is atomic, so rival loops never work the same lease
+    /// twice. Call once per process (the server does); tests that need
+    /// expiry call it explicitly instead of paying a task per manager.
+    pub fn spawn_expiry_loop(&self) {
+        let backend = self.backend.clone();
+        let writes = self.writes.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(500));
             loop {
@@ -139,23 +116,6 @@ impl LeaseManager {
                 .await;
             }
         });
-        mgr
-    }
-
-    pub async fn grant(&self, ttl: i64, requested: i64) -> Result<i64, Error> {
-        self.backend.lease_grant(ttl, requested, now_ms()).await
-    }
-
-    pub async fn exists(&self, id: i64) -> Result<bool, Error> {
-        Ok(self.backend.lease_lookup(id).await?.is_some())
-    }
-
-    pub async fn attach(&self, id: i64, key: Vec<u8>) -> Result<bool, Error> {
-        self.backend.lease_attach(id, key).await
-    }
-
-    pub(crate) async fn detach(&self, id: i64, key: &[u8]) -> Result<(), Error> {
-        self.backend.lease_detach(id, key).await
     }
 
     pub async fn revoke(&self, id: i64) -> Result<(), Error> {
@@ -166,25 +126,6 @@ impl LeaseManager {
         let _guard = self.writes.lock().await;
         Self::expire_keys(&self.backend, keys.into_iter().map(|k| (id, k)).collect()).await;
         Ok(())
-    }
-
-    pub async fn keepalive(&self, id: i64) -> Result<i64, Error> {
-        Ok(self
-            .backend
-            .lease_keepalive(id, now_ms())
-            .await?
-            .unwrap_or(0))
-    }
-
-    pub async fn ttl_info(&self, id: i64) -> Result<Option<(i64, i64, Vec<Vec<u8>>)>, Error> {
-        Ok(self.backend.lease_lookup(id).await?.map(|state| {
-            let remain = state.expires_at_ms.saturating_sub(now_ms()) / 1000;
-            (remain as i64, state.granted_ttl, state.keys)
-        }))
-    }
-
-    pub async fn all_ids(&self) -> Result<Vec<i64>, Error> {
-        self.backend.lease_ids().await
     }
 }
 
@@ -212,8 +153,8 @@ impl Lease for LeaseService {
             ));
         }
         let id = self
-            .leases
-            .grant(req.ttl, req.id)
+            .backend
+            .lease_grant(req.ttl, req.id, now_ms())
             .await
             .map_err(status_err)?;
         let rev = self.backend.current_revision().await;
@@ -244,7 +185,6 @@ impl Lease for LeaseService {
         request: tonic::Request<tonic::Streaming<LeaseKeepAliveRequest>>,
     ) -> Result<tonic::Response<Self::LeaseKeepAliveStream>, tonic::Status> {
         let mut inbound = request.into_inner();
-        let leases = self.leases.clone();
         let backend = self.backend.clone();
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
@@ -252,7 +192,12 @@ impl Lease for LeaseService {
                 // A transient storage error surfaces as TTL 0 (unknown
                 // lease), exactly like a missing lease; the stream stays
                 // open so the next response can still succeed.
-                let ttl = leases.keepalive(req.id).await.unwrap_or(0);
+                let ttl = backend
+                    .lease_keepalive(req.id, now_ms())
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
                 let rev = backend.current_revision().await;
                 let resp = LeaseKeepAliveResponse {
                     header: Some(header(rev)),
@@ -273,17 +218,26 @@ impl Lease for LeaseService {
     ) -> Result<tonic::Response<LeaseTimeToLiveResponse>, tonic::Status> {
         let req = request.into_inner();
         let rev = self.backend.current_revision().await;
-        match self.leases.ttl_info(req.id).await.map_err(status_err)? {
+        match self
+            .backend
+            .lease_lookup(req.id)
+            .await
+            .map_err(status_err)?
+        {
             None => Err(tonic::Status::not_found(
                 "etcdserver: requested lease not found",
             )),
-            Some((ttl, granted, keys)) => Ok(tonic::Response::new(LeaseTimeToLiveResponse {
-                header: Some(header(rev)),
-                id: req.id,
-                ttl,
-                granted_ttl: granted,
-                keys: if req.keys { keys } else { Vec::new() },
-            })),
+            Some(state) => {
+                let remain = state.expires_at_ms.saturating_sub(now_ms()) / 1000;
+                let (ttl, granted, keys) = (remain as i64, state.granted_ttl, state.keys);
+                Ok(tonic::Response::new(LeaseTimeToLiveResponse {
+                    header: Some(header(rev)),
+                    id: req.id,
+                    ttl,
+                    granted_ttl: granted,
+                    keys: if req.keys { keys } else { Vec::new() },
+                }))
+            }
         }
     }
 
@@ -292,7 +246,7 @@ impl Lease for LeaseService {
         _request: tonic::Request<LeaseLeasesRequest>,
     ) -> Result<tonic::Response<LeaseLeasesResponse>, tonic::Status> {
         let rev = self.backend.current_revision().await;
-        let ids = self.leases.all_ids().await.map_err(status_err)?;
+        let ids = self.backend.lease_ids().await.map_err(status_err)?;
         Ok(tonic::Response::new(LeaseLeasesResponse {
             header: Some(header(rev)),
             leases: ids.into_iter().map(|id| LeaseStatus { id }).collect(),
@@ -314,6 +268,22 @@ mod tests {
         let writes: CommitLock = Arc::new(tokio::sync::Mutex::new(()));
         let mgr = LeaseManager::new(backend.clone(), writes);
         (mgr, backend)
+    }
+
+    pub(super) async fn grant(backend: &Arc<dyn Backend>, ttl: i64, requested: i64) -> i64 {
+        backend.lease_grant(ttl, requested, now_ms()).await.unwrap()
+    }
+
+    pub(super) async fn exists(backend: &Arc<dyn Backend>, id: i64) -> bool {
+        backend.lease_lookup(id).await.unwrap().is_some()
+    }
+
+    async fn keepalive(backend: &Arc<dyn Backend>, id: i64) -> i64 {
+        backend
+            .lease_keepalive(id, now_ms())
+            .await
+            .unwrap()
+            .unwrap_or(0)
     }
 
     async fn put_key(backend: &Arc<dyn Backend>, key: &[u8], lease: i64) {
@@ -346,34 +316,33 @@ mod tests {
 
     #[tokio::test]
     async fn grant_assigns_ids_and_tracks_state() {
-        let (mgr, _) = manager().await;
-        let auto = mgr.grant(60, 0).await.unwrap();
+        let (_, backend) = manager().await;
+        let auto = grant(&backend, 60, 0).await;
         assert!(auto > 0);
-        assert_eq!(mgr.grant(60, 42).await.unwrap(), 42);
-        assert!(mgr.exists(auto).await.unwrap());
-        assert!(mgr.exists(42).await.unwrap());
-        assert!(!mgr.exists(43).await.unwrap());
-        assert_eq!(mgr.keepalive(auto).await.unwrap(), 60);
-        assert_eq!(mgr.keepalive(999).await.unwrap(), 0);
-        let ids = mgr.all_ids().await.unwrap();
+        assert_eq!(grant(&backend, 60, 42).await, 42);
+        assert!(exists(&backend, auto).await);
+        assert!(exists(&backend, 42).await);
+        assert!(!exists(&backend, 43).await);
+        assert_eq!(keepalive(&backend, auto).await, 60);
+        assert_eq!(keepalive(&backend, 999).await, 0);
+        let ids = backend.lease_ids().await.unwrap();
         assert!(ids.contains(&auto) && ids.contains(&42));
-        let (remain, granted, keys) = mgr.ttl_info(auto).await.unwrap().unwrap();
-        assert_eq!(granted, 60);
-        assert!((0..=60).contains(&remain));
-        assert!(keys.is_empty());
-        assert!(mgr.ttl_info(999).await.unwrap().is_none());
+        let state = backend.lease_lookup(auto).await.unwrap().unwrap();
+        assert_eq!(state.granted_ttl, 60);
+        assert!(state.keys.is_empty());
+        assert!(backend.lease_lookup(999).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn attach_detach_revoke_lifecycle() {
         let (mgr, backend) = manager().await;
-        let id = mgr.grant(60, 0).await.unwrap();
-        mgr.attach(id, b"k".to_vec()).await.unwrap();
+        let id = grant(&backend, 60, 0).await;
+        backend.lease_attach(id, b"k".to_vec()).await.unwrap();
         // Attaching twice does not duplicate.
-        mgr.attach(id, b"k".to_vec()).await.unwrap();
+        backend.lease_attach(id, b"k".to_vec()).await.unwrap();
         // Detaching an unknown lease or key is a no-op.
-        mgr.detach(999, b"k").await.unwrap();
-        mgr.detach(id, b"missing").await.unwrap();
+        backend.lease_detach(999, b"k").await.unwrap();
+        backend.lease_detach(id, b"missing").await.unwrap();
         put_key(&backend, b"k", id).await;
         mgr.revoke(id).await.unwrap();
         let (_, rows, _) = backend
@@ -381,9 +350,9 @@ mod tests {
             .await
             .unwrap();
         assert!(rows.is_empty());
-        assert!(!mgr.exists(id).await.unwrap());
+        assert!(!exists(&backend, id).await);
         // Revoking an empty or unknown lease is a no-op.
-        mgr.revoke(mgr.grant(60, 0).await.unwrap()).await.unwrap();
+        mgr.revoke(grant(&backend, 60, 0).await).await.unwrap();
         mgr.revoke(999).await.unwrap();
     }
 
@@ -403,7 +372,7 @@ mod tests {
             .into_inner();
         assert_eq!((g.id, g.ttl), (7, 60));
         put_key(&backend, b"sk", 7).await;
-        mgr.attach(7, b"sk".to_vec()).await.unwrap();
+        backend.lease_attach(7, b"sk".to_vec()).await.unwrap();
         let ttl = svc
             .lease_time_to_live(tonic::Request::new(LeaseTimeToLiveRequest {
                 id: 7,
@@ -440,23 +409,27 @@ mod tests {
     #[tokio::test]
     async fn expiry_deletes_keys_and_ignores_missing() {
         let (mgr, backend) = manager().await;
+        mgr.spawn_expiry_loop();
         // Expires on the first tick: deadline is already past.
-        let quick = mgr.grant(0, 0).await.unwrap();
+        let quick = grant(&backend, 0, 0).await;
         put_key(&backend, b"q", quick).await;
-        mgr.attach(quick, b"q".to_vec()).await.unwrap();
+        backend.lease_attach(quick, b"q".to_vec()).await.unwrap();
         // Vanished before expiry: nothing to delete.
-        let gone = mgr.grant(0, 0).await.unwrap();
-        mgr.attach(gone, b"absent".to_vec()).await.unwrap();
+        let gone = grant(&backend, 0, 0).await;
+        backend
+            .lease_attach(gone, b"absent".to_vec())
+            .await
+            .unwrap();
         // Idle lease with no keys at all.
-        mgr.grant(0, 0).await.unwrap();
+        grant(&backend, 0, 0).await;
         tokio::time::sleep(Duration::from_millis(1200)).await;
         let (_, rows, _) = backend
             .list(b"q", None, ListOptions::default())
             .await
             .unwrap();
         assert!(rows.is_empty());
-        assert!(!mgr.exists(quick).await.unwrap());
-        assert!(!mgr.exists(gone).await.unwrap());
+        assert!(!exists(&backend, quick).await);
+        assert!(!exists(&backend, gone).await);
     }
 }
 
@@ -505,14 +478,16 @@ mod expire_tests {
 
     #[tokio::test]
     async fn mixed_expiry_keeps_live_leases() {
+        use super::tests::{exists, grant};
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let writes: CommitLock = Arc::new(tokio::sync::Mutex::new(()));
-        let mgr = LeaseManager::new(backend, writes);
+        let mgr = LeaseManager::new(backend.clone(), writes);
+        mgr.spawn_expiry_loop();
         // Expires immediately; the survivor keeps its lease entry.
-        let quick = mgr.grant(0, 0).await.unwrap();
-        let survivor = mgr.grant(600, 0).await.unwrap();
+        let quick = grant(&backend, 0, 0).await;
+        let survivor = grant(&backend, 600, 0).await;
         tokio::time::sleep(Duration::from_millis(1200)).await;
-        assert!(!mgr.exists(quick).await.unwrap());
-        assert!(mgr.exists(survivor).await.unwrap());
+        assert!(!exists(&backend, quick).await);
+        assert!(exists(&backend, survivor).await);
     }
 }

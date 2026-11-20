@@ -11,7 +11,7 @@ pub type Revision = i64;
 pub type LeaseId = i64;
 
 /// Mutual exclusion between user writes and lease expiry/revoke.
-/// Owned by the server and shared by `KvService` and `LeaseManager`;
+/// Owned by the server and shared by the RPC services and `LeaseManager`;
 /// storage-level serialization additionally lives in each `Backend`.
 pub type CommitLock = Arc<tokio::sync::Mutex<()>>;
 
@@ -134,7 +134,6 @@ impl ObservedRange {
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
     async fn current_revision(&self) -> Revision;
-    async fn compacted_revision(&self) -> Revision;
 
     async fn initialize(&self) -> Result<()>;
 
@@ -155,7 +154,6 @@ pub trait Backend: Send + Sync + 'static {
         opts: ListOptions,
     ) -> Result<(Revision, Vec<KeyValue>, i64)>;
     async fn compact(&self, revision: Revision) -> Result<Revision>;
-    async fn db_size(&self) -> i64;
 
     /// Events in [from, to] for watch replay.
     /// Returns `Error::Compacted` when `from` is at or below the compaction watermark.
@@ -189,21 +187,6 @@ pub trait Backend: Send + Sync + 'static {
     async fn lease_revoke(&self, id: LeaseId) -> Result<Vec<Vec<u8>>>;
     /// Ids of all live leases.
     async fn lease_ids(&self) -> Result<Vec<LeaseId>>;
-}
-
-/// Construction of one named [`Backend`] implementation.
-///
-/// Each storage crate provides a factory over its own CLI config struct
-/// (a `clap::Args` derive); the server binary registers every compiled-in
-/// factory and selects one via `--backend`. The [`name`](Self::name) is
-/// both the selector and the unknown-backend error text, so flag values
-/// can never drift from the implementations.
-pub trait BackendFactory: Send + Sync {
-    /// Backend identifier used with `--backend`.
-    fn name(&self) -> &'static str;
-    /// Build the backend (open files, connect). Does not provision the
-    /// schema; call [`Backend::initialize`] afterwards.
-    fn build(&self) -> anyhow::Result<Arc<dyn Backend>>;
 }
 
 #[cfg(test)]

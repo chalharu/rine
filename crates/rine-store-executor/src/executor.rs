@@ -55,7 +55,7 @@ impl Row {
     }
 
     pub fn is_null(&self, i: usize) -> bool {
-        matches!(self.values.get(i), Some(SqlValue::Null) | None)
+        matches!(self.values.get(i), Some(SqlValue::Null))
     }
 }
 
@@ -120,8 +120,13 @@ mod tests {
         assert_eq!(r.get_str(1).unwrap(), "k");
         assert_eq!(r.get_bytes(2).unwrap(), vec![1, 2]);
         assert!(r.is_null(3));
+        assert!(!r.is_null(9));
         assert!(r.get_int(1).is_err());
         assert!(r.get_int(9).is_err());
+        assert!(r.get_str(0).is_err());
+        assert!(r.get_str(9).is_err());
+        assert!(r.get_bytes(0).is_err());
+        assert!(r.get_bytes(9).is_err());
     }
 }
 
@@ -170,17 +175,5 @@ mod default_tests {
         e.begin_unit().await.unwrap();
         e.end_unit(true).await.unwrap();
         e.end_unit(false).await.unwrap();
-    }
-
-    #[test]
-    fn row_getter_type_errors() {
-        use super::Row;
-        let r = Row {
-            values: vec![SqlValue::Int(1)],
-        };
-        assert!(r.get_str(0).is_err());
-        assert!(r.get_str(9).is_err());
-        assert!(r.get_bytes(0).is_err());
-        assert!(r.get_bytes(9).is_err());
     }
 }

@@ -182,22 +182,7 @@ impl Watch for WatchService {
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         };
                         let Some(last_rev) = batch.last().map(|e| e.revision) else { continue };
-                        for (id, w) in &mut watchers {
-                            let fresh: Vec<Event> = batch
-                                .iter()
-                                .filter(|e| e.revision >= w.next_rev)
-                                .cloned()
-                                .collect();
-                            let events = watch_events(w, &fresh);
-                            w.next_rev = w.next_rev.max(last_rev + 1);
-                            if events.is_empty() { continue; }
-                            let _ = tx.send(Ok(WatchResponse {
-                                header: Some(header(last_rev)),
-                                watch_id: *id,
-                                events,
-                                ..Default::default()
-                            })).await;
-                        }
+                        emit_new(&mut watchers, &tx, last_rev, &batch).await;
                     }
                     _ = progress.tick() => {
                         let rev = backend.current_revision().await;
@@ -250,26 +235,7 @@ async fn catch_up(
     let to = (min_next + CATCH_UP_MAX_SPAN - 1).min(cur);
     match backend.events(min_next, to).await {
         Ok(hist) => {
-            for (id, w) in watchers.iter_mut() {
-                let fresh: Vec<Event> = hist
-                    .iter()
-                    .filter(|e| e.revision >= w.next_rev)
-                    .cloned()
-                    .collect();
-                let events = watch_events(w, &fresh);
-                w.next_rev = w.next_rev.max(to + 1);
-                if events.is_empty() {
-                    continue;
-                }
-                let _ = tx
-                    .send(Ok(WatchResponse {
-                        header: Some(header(to)),
-                        watch_id: *id,
-                        events,
-                        ..Default::default()
-                    }))
-                    .await;
-            }
+            emit_new(watchers, tx, to, &hist).await;
         }
         Err(Error::Compacted { compacted, .. }) => {
             // Only watchers that can no longer catch up cancel; the rest
@@ -296,6 +262,38 @@ async fn catch_up(
         }
         // Transient storage error: keep the cursors, retry next tick.
         Err(_) => {}
+    }
+}
+
+/// Fan out one fetched batch (live broadcast or catch-up poll) to every
+/// watcher from its own cursor. Both sources share the per-watcher
+/// `next_rev` cursor (forward-only), so deliveries are gap-free and
+/// duplicate-free across sources.
+async fn emit_new(
+    watchers: &mut HashMap<i64, Watcher>,
+    tx: &mpsc::Sender<Result<WatchResponse, tonic::Status>>,
+    rev: i64,
+    batch: &[Event],
+) {
+    for (id, w) in watchers.iter_mut() {
+        let fresh: Vec<Event> = batch
+            .iter()
+            .filter(|e| e.revision >= w.next_rev)
+            .cloned()
+            .collect();
+        let events = watch_events(w, &fresh);
+        w.next_rev = w.next_rev.max(rev + 1);
+        if events.is_empty() {
+            continue;
+        }
+        let _ = tx
+            .send(Ok(WatchResponse {
+                header: Some(header(rev)),
+                watch_id: *id,
+                events,
+                ..Default::default()
+            }))
+            .await;
     }
 }
 

@@ -101,8 +101,6 @@ pub trait Dialect: Send + Sync + 'static {
     /// ... followed by insert-if-missing (for dialects without `MERGE`).
     fn set_compact_rev_insert_sql() -> &'static str;
 
-    fn db_size_sql() -> &'static str;
-
     /// DDL for the durable lease table: one row per lease
     /// (`id`, granted TTL seconds, wall-clock expiry millis, attached keys).
     fn create_leases_table_sql() -> &'static str;
@@ -132,14 +130,6 @@ pub trait Dialect: Send + Sync + 'static {
         format!(
             "SELECT granted_ttl, expires_at_ms, keys FROM rine_leases WHERE id = {}",
             Self::bind(1)
-        )
-    }
-
-    fn lease_keepalive_sql() -> String {
-        format!(
-            "UPDATE rine_leases SET expires_at_ms = {} WHERE id = {}",
-            Self::bind(1),
-            Self::bind(2)
         )
     }
 

@@ -1,8 +1,7 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use clap::Parser;
-use rine_etcd::backend::BackendFactory;
 
 mod listen;
 
@@ -59,11 +58,23 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
-    // Backend implementations register themselves here; `--backend` selects
-    // one by the name its factory reports.
-    let factories = build_factories(&args);
-    let factory = select_factory(&factories, &args.backend)?;
-    let backend = factory.build()?;
+    // One backend per `--backend` name; unknown names list the compiled-in
+    // options so flag values can never drift from the implementations.
+    let backend: Arc<dyn rine_etcd::Backend> = match args.backend.as_str() {
+        "memory" => Arc::new(rine_etcd::MemoryBackend::new()),
+        #[cfg(feature = "sqlite")]
+        "sqlite" => args.sqlite.open_backend()?,
+        #[cfg(feature = "oracle")]
+        "oracle" => args.oracle.open_backend()?,
+        other => {
+            let mut names = vec!["memory"];
+            #[cfg(feature = "sqlite")]
+            names.push("sqlite");
+            #[cfg(feature = "oracle")]
+            names.push("oracle");
+            anyhow::bail!("unknown backend: {other} (expected {})", names.join("|"));
+        }
+    };
     backend.initialize().await?;
 
     // Transport setup (URL parsing, TLS validation) lives with the binary;
@@ -84,72 +95,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Register every compiled-in backend factory.
-#[allow(unused_mut)]
-fn build_factories(args: &Args) -> Vec<Box<dyn BackendFactory>> {
-    let mut factories: Vec<Box<dyn BackendFactory>> = vec![Box::new(rine_etcd::MemoryFactory)];
-    #[cfg(feature = "sqlite")]
-    factories.push(Box::new(rine_store_sqlite::SqliteFactory::new(
-        args.sqlite.clone(),
-    )));
-    #[cfg(feature = "oracle")]
-    factories.push(Box::new(rine_store_oracle::OracleFactory::new(
-        args.oracle.clone(),
-    )));
-    factories
-}
-
-/// Pick the factory named by `--backend`, listing the compiled-in names on
-/// a miss so flag values can never drift from the implementations.
-fn select_factory<'a>(
-    factories: &'a [Box<dyn BackendFactory>],
-    name: &str,
-) -> Result<&'a dyn BackendFactory> {
-    factories
-        .iter()
-        .find(|f| f.name() == name)
-        .map(AsRef::as_ref)
-        .ok_or_else(|| {
-            let names = factories
-                .iter()
-                .map(|f| f.name())
-                .collect::<Vec<_>>()
-                .join("|");
-            anyhow::anyhow!("unknown backend: {name} (expected {names})")
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn factories() -> Vec<Box<dyn BackendFactory>> {
-        vec![Box::new(rine_etcd::MemoryFactory)]
-    }
-
-    #[test]
-    fn select_factory_finds_memory_and_rejects_unknown() {
-        let factories = factories();
-        assert!(matches!(
-            select_factory(&factories, "memory"),
-            Ok(f) if f.name() == "memory"
-        ));
-        assert!(matches!(
-            select_factory(&factories, "bogus"),
-            Err(e) if e.to_string().contains("unknown backend: bogus (expected memory)")
-        ));
-    }
-
-    #[test]
-    fn build_factories_registers_backends() {
-        let args = Args::try_parse_from(["rine"]).unwrap();
-        let names: Vec<_> = build_factories(&args).iter().map(|f| f.name()).collect();
-        assert!(names.contains(&"memory"));
-        #[cfg(feature = "sqlite")]
-        assert!(names.contains(&"sqlite"));
-        #[cfg(feature = "oracle")]
-        assert!(names.contains(&"oracle"));
-    }
 
     #[test]
     fn args_parse_from_flags() {

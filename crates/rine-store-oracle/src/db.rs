@@ -20,7 +20,7 @@ use std::{
 use async_trait::async_trait;
 use oracledb::ToDbValue;
 use rine_etcd::{
-    backend::{BackendFactory, Event, Revision},
+    backend::{Event, Revision},
     error::{Error, Result},
 };
 use rine_store_executor::{Row, SqlExecutor, SqlValue};
@@ -401,29 +401,14 @@ pub struct OracleConfig {
     pub password: String,
 }
 
-/// Factory that connects with the configured credentials.
-pub struct OracleFactory {
-    config: OracleConfig,
-}
-
-impl OracleFactory {
-    pub fn new(config: OracleConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl BackendFactory for OracleFactory {
-    fn name(&self) -> &'static str {
-        "oracle"
-    }
-
-    fn build(&self) -> anyhow::Result<Arc<dyn rine_etcd::Backend>> {
-        let connect = self.config.connect.clone().ok_or_else(|| {
+impl OracleConfig {
+    /// Connect with the configured credentials as a shared backend.
+    pub fn open_backend(&self) -> anyhow::Result<Arc<dyn rine_etcd::Backend>> {
+        let connect = self.connect.clone().ok_or_else(|| {
             anyhow::anyhow!("oracle backend needs --oracle-connect (or RINE_ORACLE_CONNECT)")
         })?;
-        let mut config =
-            oracledb::Config::default().set_credentials(&self.config.user, &self.config.password);
-        if let Some(dir) = &self.config.wallet_dir {
+        let mut config = oracledb::Config::default().set_credentials(&self.user, &self.password);
+        if let Some(dir) = &self.wallet_dir {
             let dir = dir
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("wallet dir is not UTF-8"))?;

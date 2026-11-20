@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use rine_etcd::Backend as _;
 use rine_etcd::etcdserverpb::{
     Compare, PutRequest, RangeRequest, RequestOp, TxnRequest, WatchCreateRequest, WatchRequest,
     compare::{CompareResult, CompareTarget, TargetUnion},
@@ -17,7 +18,7 @@ use rine_store_sqlite::{SqliteBackend, SqliteDb};
 async fn spawn() -> String {
     let db = SqliteDb::open_in_memory().unwrap();
     let backend = Arc::new(SqliteBackend::new(Arc::new(db)));
-    backend.ensure_schema().await.unwrap();
+    backend.initialize().await.unwrap();
     serve_ephemeral(backend).await
 }
 
@@ -107,8 +108,8 @@ async fn sqlite_watch_sees_cross_instance_commits() {
     let backend_a = backend(&path);
     let backend_b = backend(&path);
     // Both converge on the same shared schema.
-    backend_a.ensure_schema().await.unwrap();
-    backend_b.ensure_schema().await.unwrap();
+    backend_a.initialize().await.unwrap();
+    backend_b.initialize().await.unwrap();
     let ep_a = serve_ephemeral(backend_a).await;
     let ep_b = serve_ephemeral(backend_b).await;
 

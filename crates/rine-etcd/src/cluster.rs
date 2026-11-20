@@ -63,17 +63,16 @@ impl Maintenance for MaintenanceService {
         _request: tonic::Request<StatusRequest>,
     ) -> Result<tonic::Response<StatusResponse>, tonic::Status> {
         let rev = self.backend.current_revision().await;
-        let size = self.backend.db_size().await;
         Ok(tonic::Response::new(StatusResponse {
             header: Some(header(rev)),
             version: VERSION.into(),
-            db_size: size,
+            db_size: 0,
             leader: MEMBER_ID,
             raft_index: rev.max(0) as u64,
             raft_term: 0,
             raft_applied_index: rev.max(0) as u64,
             errors: Vec::new(),
-            db_size_in_use: size,
+            db_size_in_use: 0,
             is_learner: false,
         }))
     }

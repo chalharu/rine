@@ -71,7 +71,7 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
     /// transient by definition — someone else is converging the schema — so
     /// the whole pass restarts on `TableMissing` (bounded). Anything else
     /// fails fast.
-    pub async fn ensure_schema(&self) -> Result<()> {
+    async fn ensure_schema(&self) -> Result<()> {
         let mut delay = Duration::from_millis(50);
         for _ in 0..10 {
             match self.ensure_schema_once().await {
@@ -440,7 +440,11 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
     /// validation, writes and `end_unit` always pair up, even if the caller
     /// drops the [`commit`](Backend::commit) future that spawned this.
     async fn commit_inner(&self, reads: ReadSet, events: Vec<Event>) -> Result<Revision> {
-        let _guard = self.writes.lock().await;
+        // The guarded path rides the same unit helper as the lease
+        // read-modify-write cycles; publication follows the commit.
+        // (The helper takes the write lock itself, so the fast path below
+        // holds it directly instead of nesting the same mutex.)
+        let guard = self.writes.clone().lock_owned().await;
         if let [event] = events.as_slice()
             && !event.deleted
             && key_str(&event.key) != "compact_rev_key"
@@ -453,20 +457,14 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
             let _ = self.tx.send(vec![rebase(event.clone(), fresh)]);
             return Ok(fresh);
         }
-        self.exec.begin_unit().await?;
-        match self.commit_guarded(&reads, events).await {
-            Ok((fresh, rebased)) => {
-                self.exec.end_unit(true).await?;
-                if !rebased.is_empty() {
-                    let _ = self.tx.send(rebased);
-                }
-                Ok(fresh)
-            }
-            Err(e) => {
-                let _ = self.exec.end_unit(false).await;
-                Err(e)
-            }
+        drop(guard);
+        let (fresh, rebased) = self
+            .lease_unit(async { self.commit_guarded(&reads, events).await })
+            .await?;
+        if !rebased.is_empty() {
+            let _ = self.tx.send(rebased);
         }
+        Ok(fresh)
     }
 
     /// Run `op` inside the cross-node commit unit, pairing `begin_unit`
@@ -618,10 +616,6 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
         self.current_rev_inner().await.unwrap_or(1)
     }
 
-    async fn compacted_revision(&self) -> Revision {
-        self.compacted_inner().await.unwrap_or(0)
-    }
-
     async fn initialize(&self) -> Result<()> {
         self.ensure_schema().await
     }
@@ -709,16 +703,6 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
             }
         }
         Ok(cur)
-    }
-
-    async fn db_size(&self) -> i64 {
-        self.exec
-            .query_row(D::db_size_sql(), vec![])
-            .await
-            .ok()
-            .flatten()
-            .and_then(|r| r.get_int(0).ok())
-            .unwrap_or(0)
     }
 
     async fn events(&self, from: Revision, to: Revision) -> Result<Vec<Event>> {
@@ -888,12 +872,6 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
     }
 }
 
-impl<E: SqlExecutor, D: Dialect> std::fmt::Debug for SqlBackend<E, D> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SqlBackend")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -942,9 +920,6 @@ mod tests {
             ""
         }
         fn set_compact_rev_insert_sql() -> &'static str {
-            ""
-        }
-        fn db_size_sql() -> &'static str {
             ""
         }
         fn create_leases_table_sql() -> &'static str {
@@ -1086,7 +1061,7 @@ mod tests {
         let exec = Arc::new(RacyExec::new(1));
         let backend = SqlBackend::<RacyExec, TestDialect>::new(exec.clone());
         backend
-            .ensure_schema()
+            .initialize()
             .await
             .expect("must converge after concurrent DROP");
         assert!(
@@ -1101,7 +1076,7 @@ mod tests {
     async fn ensure_schema_still_aborts_without_ddl_privilege() {
         let exec = Arc::new(DenyExec);
         let backend = SqlBackend::<DenyExec, TestDialect>::new(exec.clone());
-        let err = backend.ensure_schema().await.unwrap_err();
+        let err = backend.initialize().await.unwrap_err();
         assert!(
             err.to_string().contains("insufficient privileges"),
             "{err:?}"
@@ -1117,7 +1092,7 @@ mod tests {
         let exec = Arc::new(RacyExec::new(0));
         exec.probe_drops.store(1, Ordering::SeqCst);
         let backend = SqlBackend::<RacyExec, TestDialect>::new(exec.clone());
-        backend.ensure_schema().await.expect("must converge");
+        backend.initialize().await.expect("must converge");
         exec.execute_batch(vec![]).await.unwrap();
         exec.query_all("SELECT 1", vec![]).await.unwrap();
     }
@@ -1128,7 +1103,7 @@ mod tests {
         let mut exec = RacyExec::new(0);
         exec.probe_err = true;
         let backend = SqlBackend::<RacyExec, TestDialect>::new(Arc::new(exec));
-        let err = backend.ensure_schema().await.unwrap_err();
+        let err = backend.initialize().await.unwrap_err();
         assert!(err.to_string().contains("boom"), "{err:?}");
     }
 
@@ -1138,44 +1113,7 @@ mod tests {
         let exec = Arc::new(RacyExec::new(0));
         exec.contention.store(1, Ordering::SeqCst);
         let backend = SqlBackend::<RacyExec, TestDialect>::new(exec);
-        backend.ensure_schema().await.expect("must converge");
-    }
-
-    /// Every dialect hook has a callable body (the schema path only needs
-    /// a few of them; the rest must still link and run).
-    #[test]
-    fn test_dialect_covers_all_hooks() {
-        assert_eq!(TestDialect::create_table_sql(), "CREATE TABLE rine");
-        assert_eq!(
-            TestDialect::create_indexes_sql(),
-            &["CREATE INDEX idx_test"]
-        );
-        assert_eq!(TestDialect::probe_sql(), "PROBE TABLE");
-        assert_eq!(TestDialect::bind(3), "?");
-        let _ = TestDialect::current_revision_sql();
-        let _ = TestDialect::compacted_rev_sql();
-        let _ = TestDialect::events_sql();
-        let _ = TestDialect::live_range_queries(None, &ListOptions::default());
-        let _ = TestDialect::commit_state_sql(1);
-        let _ = TestDialect::set_deleted_by_id_sql();
-        let _ = TestDialect::compact_delete_sql();
-        let _ = TestDialect::set_compact_rev_sql();
-        let _ = TestDialect::set_compact_rev_insert_sql();
-        let _ = TestDialect::db_size_sql();
-        assert_eq!(
-            TestDialect::create_leases_table_sql(),
-            "CREATE TABLE rine_leases"
-        );
-        assert_eq!(TestDialect::leases_probe_sql(), "PROBE LEASES");
-        let _ = TestDialect::lease_max_id_sql();
-        let _ = TestDialect::lease_update_sql();
-        let _ = TestDialect::lease_insert_sql();
-        let _ = TestDialect::lease_select_sql();
-        let _ = TestDialect::lease_keepalive_sql();
-        let _ = TestDialect::lease_delete_sql();
-        let _ = TestDialect::lease_expired_select_sql();
-        let _ = TestDialect::lease_expired_delete_sql();
-        let _ = TestDialect::lease_ids_sql();
+        backend.initialize().await.expect("must converge");
     }
 
     /// The lease key set round-trips through one BLOB column, including

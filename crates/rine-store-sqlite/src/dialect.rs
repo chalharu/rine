@@ -124,10 +124,6 @@ impl Dialect for SqliteDialect {
          VALUES (0, 'compact_rev_key', 0, 0, 0, ?, 0)"
     }
 
-    fn db_size_sql() -> &'static str {
-        "SELECT COALESCE(SUM(LENGTH(name) + LENGTH(value)), 0) FROM rine"
-    }
-
     fn create_leases_table_sql() -> &'static str {
         "CREATE TABLE rine_leases (\
             id INTEGER PRIMARY KEY, \
@@ -164,7 +160,6 @@ mod tests {
             SqliteDialect::lease_update_sql(),
             SqliteDialect::lease_insert_sql(),
             SqliteDialect::lease_select_sql(),
-            SqliteDialect::lease_keepalive_sql(),
             SqliteDialect::lease_delete_sql(),
             SqliteDialect::lease_expired_select_sql(),
             SqliteDialect::lease_expired_delete_sql(),
