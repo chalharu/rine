@@ -12,7 +12,7 @@ use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use rine_etcd::{
-    backend::{Backend, ReadSet},
+    backend::{Backend, ListOptions, ReadSet},
     error::Error,
 };
 use rine_store_conformance::{crud, history_compact_events, kv_create, kv_get, kv_update};
@@ -74,6 +74,35 @@ async fn live_backend_crud_and_compact() {
     // --- CRUD + history + compact (shared conformance suite) ---
     crud(&backend, "live").await;
     history_compact_events(&backend, "live").await;
+
+    let first = Bytes::from_static(b"/live-range/a");
+    let second = Bytes::from_static(b"/live-range/b");
+    kv_create(&backend, first.clone(), Bytes::from_static(b"value"), 0)
+        .await
+        .unwrap();
+    let revision = kv_create(&backend, second, Bytes::from_static(b"second"), 0)
+        .await
+        .unwrap();
+    let (header, rows, count) = backend
+        .list(
+            b"/live-range/",
+            Some(b"/live-range0"),
+            ListOptions {
+                limit: 1,
+                keys_only: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!((header, rows.len(), count), (revision, 1, 2));
+    assert_eq!(rows[0].key, first);
+    assert!(rows[0].value.is_empty());
+    let (header, rows, count) = backend
+        .list(b"/live-range/missing", None, ListOptions::default())
+        .await
+        .unwrap();
+    assert_eq!((header, rows.len(), count), (revision, 0, 0));
 
     assert!(backend.db_size().await >= 0);
 }

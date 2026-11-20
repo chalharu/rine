@@ -43,6 +43,10 @@ while the server is running.
 On Linux/musl, the `rine` binary uses mimalloc to reduce allocation overhead
 under concurrent gRPC traffic. Other targets keep their system allocator.
 
+Oracle fetches the latest range and its revision/count in one statement.
+Writes still serialize across nodes through Oracle and wait for commit;
+deploy Rine close to the database to reduce the remaining round-trip cost.
+
 With an Oracle wallet (`tnsnames.ora` + `ewallet.pem`) and a TNS alias:
 
 ```sh

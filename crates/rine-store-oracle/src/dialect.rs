@@ -113,35 +113,74 @@ impl Dialect for OracleDialect {
          VALUES (0, 'compact_rev_key', 0, 0, 0, :1, 0)"
     }
 
-    /// Latest-range pushdown, mirroring the SQLite fast path: `LIMIT ?` becomes
-    /// `FETCH FIRST n ROWS ONLY`, `NULL` stands in for the value column when
-    /// only keys are requested.
-    fn live_range_queries(
-        end: Option<&[u8]>,
-        opts: &ListOptions,
-    ) -> Option<(Option<String>, Option<String>)> {
+    fn live_range_sql(end: Option<&[u8]>, opts: &ListOptions) -> Option<String> {
         let (predicate, limit_bind) = match end {
             None | Some([]) => ("name = :1", ":2"),
             Some([0]) => ("name >= :1", ":2"),
             Some(_) => ("name >= :1 AND name < :2", ":3"),
         };
         let filter = format!("{predicate} AND deleted = 0 AND name <> 'compact_rev_key'");
-        let rows = (!opts.count_only).then(|| {
-            let cols = if opts.keys_only {
-                "id, name, created, deleted, create_revision, prev_revision, lease, version, NULL"
+        let revision = Self::current_revision_sql();
+        if opts.count_only {
+            return Some(format!(
+                "SELECT GREATEST(NVL(({revision}), 1), 1), \
+                 (SELECT COUNT(*) FROM rine WHERE {filter}), NULL FROM dual"
+            ));
+        }
+        let cols = if opts.keys_only {
+            "id, name, created, deleted, create_revision, prev_revision, lease, version, NULL AS value"
+        } else {
+            Self::cols()
+        };
+        let (limit, total) = if opts.limit > 0 {
+            let total = if matches!(end, None | Some([])) {
+                ""
             } else {
-                Self::cols()
+                ", COUNT(*) OVER () AS total"
             };
-            let limit = if opts.limit > 0 {
-                format!(" FETCH FIRST {limit_bind} ROWS ONLY")
-            } else {
-                String::new()
-            };
-            format!("SELECT {cols} FROM rine WHERE {filter} ORDER BY name, id{limit}")
-        });
-        let count = (opts.count_only || (opts.limit > 0 && !matches!(end, None | Some([]))))
-            .then(|| format!("SELECT COUNT(*) FROM rine WHERE {filter}"));
-        Some((rows, count))
+            (
+                format!(" ORDER BY name, id FETCH FIRST {limit_bind} ROWS ONLY"),
+                total,
+            )
+        } else {
+            (String::new(), "")
+        };
+        let count = if total.is_empty() {
+            "NULL"
+        } else {
+            "NVL(r.total, 0)"
+        };
+        let projection = Self::cols()
+            .split(", ")
+            .map(|c| format!("r.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "SELECT GREATEST(NVL(({revision}), 1), 1), {count}, {projection} FROM dual \
+             LEFT JOIN (SELECT {cols}{total} FROM rine WHERE {filter}{limit}) r ON 1=1 \
+             ORDER BY r.name, r.id"
+        ))
+    }
+
+    fn commit_state_sql(names: usize) -> Option<String> {
+        if names > 1000 {
+            return None;
+        }
+        let meta = "SELECT created, id FROM rine ORDER BY id DESC FETCH FIRST 1 ROWS ONLY";
+        let header = "GREATEST(NVL(m.created, 1), 1), GREATEST(NVL(m.id, 1), 1)";
+        if names == 0 {
+            return Some(format!(
+                "SELECT {header}, NULL FROM dual LEFT JOIN ({meta}) m ON 1=1"
+            ));
+        }
+        let binds = (1..=names).map(Self::bind).collect::<Vec<_>>().join(", ");
+        Some(format!(
+            "SELECT {header}, k.name, k.key_id, k.live_revision FROM dual \
+             LEFT JOIN ({meta}) m ON 1=1 \
+             LEFT JOIN (SELECT name, NVL(MAX(CASE WHEN deleted = 0 THEN id END), MAX(id)) AS key_id, \
+                  MAX(CASE WHEN deleted = 0 THEN created END) AS live_revision \
+                  FROM rine WHERE name IN ({binds}) GROUP BY name) k ON 1=1"
+        ))
     }
 
     fn db_size_sql() -> &'static str {

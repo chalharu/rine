@@ -27,12 +27,8 @@ use rine_store_executor::{Row, SqlExecutor, SqlValue};
 
 /// Live Oracle connection. `Clone` shares the same underlying session.
 ///
-/// Reads bypass the driver's statement cache (`exclude_from_cache`).
-/// rine synchronizes multiple nodes through the database's ACID
-/// guarantees, so every read must reflect committed state; serving reads
-/// from a client-side cache risks stale results. Writes keep using the
-/// cache: they always reach the server and surface hard errors, never
-/// stale results.
+/// Bypass the driver's cursor cache on reads so a DROP/CREATE performed by
+/// another node cannot leave this session with an invalid cursor.
 #[derive(Clone, Debug)]
 pub struct OracleDb {
     conn: Arc<Mutex<oracledb::Connection>>,
@@ -168,7 +164,11 @@ fn query_all_on(
     sql: &str,
     params: &[SqlValue],
 ) -> Result<Vec<Row>, oracledb::Error> {
-    let stmt = conn.statement(sql)?.exclude_from_cache().build()?;
+    let stmt = conn
+        .statement(sql)?
+        .exclude_from_cache()
+        .prefetch_rows(64)
+        .build()?;
     let cursor = with_binds(params, |refs| stmt.query(refs))?;
     let mut out = Vec::new();
     for row in cursor {

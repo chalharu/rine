@@ -251,6 +251,34 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         opts: &ListOptions,
     ) -> Result<(Revision, Vec<KeyValue>, i64)> {
         if opts.revision <= 0
+            && let Some(sql) = D::live_range_sql(range_end, opts)
+        {
+            let mut params = vec![SqlValue::Str(key_str(prefix))];
+            if let Some(end) = range_end.filter(|end| !end.is_empty() && *end != [0]) {
+                params.push(SqlValue::Str(key_str(end)));
+            }
+            if opts.limit > 0 && !opts.count_only {
+                params.push(SqlValue::Int(opts.limit));
+            }
+            let rows = self.exec.query_all(&sql, params).await?;
+            let meta = rows
+                .first()
+                .ok_or_else(|| Error::Backend("missing range metadata".into()))?;
+            let revision = meta.get_int(0)?;
+            let mut kvs = Vec::new();
+            for row in &rows {
+                if !row.is_null(2) {
+                    kvs.push(row_to_kv_at(row, 2)?);
+                }
+            }
+            let total = if meta.is_null(1) {
+                kvs.len() as i64
+            } else {
+                meta.get_int(1)?
+            };
+            return Ok((revision, kvs, total));
+        }
+        if opts.revision <= 0
             && let Some((rows_sql, count_sql)) = D::live_range_queries(range_end, opts)
         {
             return self
@@ -334,87 +362,139 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
             .copied()
             .filter(|key| !written.contains(*key))
             .collect();
-        // One trip for all guard-only reads plus the revision assignment.
-        // The newest physical row carries the highest logical revision:
-        // revisions are assigned strictly increasing, so ordering by id and
-        // taking the first row is an indexed lookup, unlike MAX() which would
-        // scan the whole table on every commit.
-        let mut batch: Vec<(String, Vec<SqlValue>)> = Vec::new();
-        if !guard_only.is_empty() {
-            batch.push((
-                D::live_by_names_sql(guard_only.len()),
-                guard_only
-                    .iter()
-                    .map(|key| SqlValue::Str(key_str(key)))
-                    .collect(),
-            ));
-        }
-        batch.push((D::current_revision_sql(), vec![]));
-        let mut results = self.exec.query_batch(batch).await?.into_iter();
-        if !guard_only.is_empty() {
-            let rows = results
-                .next()
-                .ok_or_else(|| Error::Backend("missing guard read".into()))?;
-            let mut live: HashMap<Vec<u8>, Revision> = HashMap::new();
+        let names: Vec<_> = expected
+            .keys()
+            .copied()
+            .chain(written.iter().copied())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(key_str)
+            .collect();
+        let optimized = if let Some(sql) = D::commit_state_sql(names.len()) {
+            let params = names.into_iter().map(SqlValue::Str).collect();
+            let rows = self.exec.query_all(&sql, params).await?;
+            let meta = rows
+                .first()
+                .ok_or_else(|| Error::Backend("missing commit metadata".into()))?;
+            let mut state = HashMap::new();
             for row in &rows {
-                let kv = row_to_kv(row)?;
-                live.entry(kv.key.to_vec()).or_insert(kv.mod_revision);
+                if !row.is_null(2) {
+                    let live = if row.is_null(4) {
+                        None
+                    } else {
+                        Some(row.get_int(4)?)
+                    };
+                    state.insert(row.get_str(2)?, (row.get_int(3)?, live));
+                }
             }
-            for key in &guard_only {
-                if live.get(*key).copied() != expected[key] {
+            for (key, rev) in &expected {
+                if state.get(&key_str(key)).and_then(|(_, live)| *live) != *rev {
                     return Err(Error::Conflict);
                 }
             }
-        }
-        let fresh = match results.next().as_ref().and_then(|rows| rows.first()) {
-            Some(r) if !r.is_null(0) => r.get_int(0)?.max(1),
-            _ => 1,
-        } + 1;
+            Some((meta.get_int(0)? + 1, meta.get_int(1)?, state))
+        } else {
+            None
+        };
+        // The newest physical row carries the highest logical revision.
+        let (fresh, mut id, latest) = if let Some(state) = optimized {
+            state
+        } else {
+            let mut batch: Vec<(String, Vec<SqlValue>)> = Vec::new();
+            if !guard_only.is_empty() {
+                batch.push((
+                    D::live_by_names_sql(guard_only.len()),
+                    guard_only
+                        .iter()
+                        .map(|key| SqlValue::Str(key_str(key)))
+                        .collect(),
+                ));
+            }
+            batch.push((D::current_revision_sql(), vec![]));
+            let mut results = self.exec.query_batch(batch).await?.into_iter();
+            if !guard_only.is_empty() {
+                let rows = results
+                    .next()
+                    .ok_or_else(|| Error::Backend("missing guard read".into()))?;
+                let mut live: HashMap<Vec<u8>, Revision> = HashMap::new();
+                for row in &rows {
+                    let kv = row_to_kv(row)?;
+                    live.entry(kv.key.to_vec()).or_insert(kv.mod_revision);
+                }
+                for key in &guard_only {
+                    if live.get(*key).copied() != expected[key] {
+                        return Err(Error::Conflict);
+                    }
+                }
+            }
+            let fresh = match results.next().as_ref().and_then(|rows| rows.first()) {
+                Some(r) if !r.is_null(0) => r.get_int(0)?.max(1),
+                _ => 1,
+            } + 1;
+            if events.is_empty() {
+                for range in &reads.ranges {
+                    self.check_range(range).await?;
+                }
+                return Ok((fresh - 1, events));
+            }
+            // One batch for every written key's live row and latest id plus the
+            // id assignment, no matter how many keys the commit carries.
+            let mut names: Vec<String> = Vec::new();
+            {
+                let mut seen_names: HashSet<&[u8]> = HashSet::new();
+                for event in &events {
+                    if seen_names.insert(event.key.as_ref()) {
+                        names.push(key_str(&event.key));
+                    }
+                }
+            }
+            let name_params: Vec<SqlValue> =
+                names.iter().map(|n| SqlValue::Str(n.clone())).collect();
+            let mut results = self
+                .exec
+                .query_batch(vec![
+                    (D::live_by_names_sql(names.len()), name_params.clone()),
+                    (D::latest_ids_by_names_sql(names.len()), name_params),
+                    (D::last_row_id_sql().into(), vec![]),
+                ])
+                .await?
+                .into_iter();
+            let mut live: HashMap<String, Row> = HashMap::new();
+            for row in results
+                .next()
+                .ok_or_else(|| Error::Backend("missing live rows".into()))?
+            {
+                live.entry(row.get_str(1)?).or_insert(row);
+            }
+            let mut latest = HashMap::new();
+            for row in results
+                .next()
+                .ok_or_else(|| Error::Backend("missing latest ids".into()))?
+            {
+                latest.insert(row.get_str(0)?, (row.get_int(1)?, None));
+            }
+            let id = match results.next().as_ref().and_then(|rows| rows.first()) {
+                Some(row) if !row.is_null(0) => row.get_int(0)?.max(1),
+                _ => 1,
+            };
+            for (name, row) in live {
+                latest.insert(name, (row.get_int(0)?, Some(row.get_int(2)?)));
+            }
+            for event in &events {
+                if let Some(expected) = expected.get(event.key.as_ref())
+                    && latest.get(&key_str(&event.key)).and_then(|(_, live)| *live) != *expected
+                {
+                    return Err(Error::Conflict);
+                }
+            }
+            (fresh, id, latest)
+        };
         for range in &reads.ranges {
             self.check_range(range).await?;
         }
         if events.is_empty() {
             return Ok((fresh - 1, events));
         }
-        // One batch for every written key's live row and latest id plus the
-        // id assignment, no matter how many keys the commit carries.
-        let mut names: Vec<String> = Vec::new();
-        {
-            let mut seen_names: HashSet<&[u8]> = HashSet::new();
-            for event in &events {
-                if seen_names.insert(event.key.as_ref()) {
-                    names.push(key_str(&event.key));
-                }
-            }
-        }
-        let name_params: Vec<SqlValue> = names.iter().map(|n| SqlValue::Str(n.clone())).collect();
-        let mut results = self
-            .exec
-            .query_batch(vec![
-                (D::live_by_names_sql(names.len()), name_params.clone()),
-                (D::latest_ids_by_names_sql(names.len()), name_params),
-                (D::last_row_id_sql().into(), vec![]),
-            ])
-            .await?
-            .into_iter();
-        let mut live: HashMap<String, Row> = HashMap::new();
-        for row in results
-            .next()
-            .ok_or_else(|| Error::Backend("missing live rows".into()))?
-        {
-            live.entry(row.get_str(1)?).or_insert(row);
-        }
-        let mut latest: HashMap<String, i64> = HashMap::new();
-        for row in results
-            .next()
-            .ok_or_else(|| Error::Backend("missing latest ids".into()))?
-        {
-            latest.insert(row.get_str(0)?, row.get_int(1)?);
-        }
-        let mut id = match results.next().as_ref().and_then(|rows| rows.first()) {
-            Some(row) if !row.is_null(0) => row.get_int(0)?.max(1),
-            _ => 1,
-        };
         let mut statements = Vec::new();
         for event in &events {
             let name = key_str(&event.key);
@@ -423,21 +503,7 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
                     "key is reserved for compaction metadata".into(),
                 ));
             }
-            // The batched snapshot doubles as the guard validation for keys
-            // this batch also writes: same lock, same state, no extra query.
-            let live_row = live.get(&name);
-            if let Some(expected) = expected.get(event.key.as_ref()) {
-                let current = live_row
-                    .map(|row| row_to_kv(row).map(|kv| kv.mod_revision))
-                    .transpose()?;
-                if current != *expected {
-                    return Err(Error::Conflict);
-                }
-            }
-            let previous = match live_row {
-                Some(row) => row.get_int(0)?,
-                None => latest.get(&name).copied().unwrap_or(0),
-            };
+            let previous = latest.get(&name).map_or(0, |(id, _)| *id);
             id += 1;
             if event.prev_kv.is_some() {
                 statements.push((
@@ -518,13 +584,17 @@ fn key_str(key: &[u8]) -> String {
 }
 
 fn row_to_kv(row: &Row) -> Result<KeyValue> {
+    row_to_kv_at(row, 0)
+}
+
+fn row_to_kv_at(row: &Row, offset: usize) -> Result<KeyValue> {
     Ok(KeyValue {
-        key: Bytes::from(row.get_str(1)?.into_bytes()),
-        value: Bytes::from(row.get_bytes(8)?),
-        create_revision: row.get_int(4)?,
-        mod_revision: row.get_int(2)?,
-        version: row.get_int(7)?,
-        lease: row.get_int(6)?,
+        key: Bytes::from(row.get_str(offset + 1)?.into_bytes()),
+        value: Bytes::from(row.get_bytes(offset + 8)?),
+        create_revision: row.get_int(offset + 4)?,
+        mod_revision: row.get_int(offset + 2)?,
+        version: row.get_int(offset + 7)?,
+        lease: row.get_int(offset + 6)?,
     })
 }
 
@@ -574,11 +644,10 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
         opts: ListOptions,
     ) -> Result<(Revision, Vec<KeyValue>, i64)> {
         if opts.revision <= 0
-            && let Some((rows_sql, count_sql)) = D::live_range_queries(range_end, &opts)
+            && (D::live_range_sql(range_end, &opts).is_some()
+                || D::live_range_queries(range_end, &opts).is_some())
         {
-            return self
-                .list_live(prefix, range_end, &opts, rows_sql, count_sql)
-                .await;
+            return self.list_inner(prefix, range_end, &opts).await;
         }
         let _guard = self.writes.lock().await;
         self.list_inner(prefix, range_end, &opts).await

@@ -98,6 +98,19 @@ pub trait Dialect: Send + Sync + 'static {
         None
     }
 
+    /// Optional single-statement latest read. Columns are revision, total
+    /// (NULL if derived from the returned rows), then `cols()`. An empty
+    /// result still carries metadata, with a NULL id.
+    fn live_range_sql(_end: Option<&[u8]>, _opts: &ListOptions) -> Option<String> {
+        None
+    }
+
+    /// Optional commit lookup: current revision, highest physical id, key,
+    /// latest physical id for that key, and its live revision (or NULL).
+    fn commit_state_sql(_names: usize) -> Option<String> {
+        None
+    }
+
     /// Delete marks the live row deleted and appends a tombstone revision.
     fn set_deleted_by_id_sql() -> &'static str;
 
