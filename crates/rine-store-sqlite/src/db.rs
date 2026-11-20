@@ -21,31 +21,63 @@ use rusqlite::{ToSql, types::ToSqlOutput};
 use tokio::sync::Mutex;
 
 /// Live SQLite connection. `Clone` shares the same underlying connection.
-#[derive(Clone, Debug)]
 pub struct SqliteDb {
     conn: Arc<Mutex<rusqlite::Connection>>,
     in_unit: Arc<AtomicBool>,
+    /// Serializes transaction scopes on the shared connection: an open
+    /// unit and an implicit per-batch transaction must never overlap, or
+    /// the second BEGIN fails with "cannot start a transaction within a
+    /// transaction". Held across `begin_unit`..`end_unit` (via `unit_guard`)
+    /// and across each implicit-transaction batch. Statement-level ops are
+    /// already exclusive through `conn`; only scopes need this.
+    tx: Arc<tokio::sync::Mutex<()>>,
+    /// The open unit's hold on `tx` (`begin_unit` sets it, `end_unit`
+    /// releases it). Separate calls, so the guard lives here instead of
+    /// on the stack.
+    unit_guard: Arc<std::sync::Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>,
+}
+
+impl Clone for SqliteDb {
+    fn clone(&self) -> Self {
+        Self {
+            conn: self.conn.clone(),
+            in_unit: self.in_unit.clone(),
+            tx: self.tx.clone(),
+            unit_guard: self.unit_guard.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for SqliteDb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteDb")
+            .field("in_unit", &self.in_unit.load(Ordering::SeqCst))
+            .finish_non_exhaustive()
+    }
 }
 
 impl SqliteDb {
+    fn new(conn: rusqlite::Connection) -> Self {
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+            in_unit: Arc::new(AtomicBool::new(false)),
+            tx: Arc::new(tokio::sync::Mutex::new(())),
+            unit_guard: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
     /// Open (or create) a SQLite database file.
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let conn = rusqlite::Connection::open(path)?;
         Self::tune(&conn)?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            in_unit: Arc::new(AtomicBool::new(false)),
-        })
+        Ok(Self::new(conn))
     }
 
     /// Open a private in-memory database (tests).
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = rusqlite::Connection::open_in_memory()?;
         Self::tune(&conn)?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            in_unit: Arc::new(AtomicBool::new(false)),
-        })
+        Ok(Self::new(conn))
     }
 
     /// WAL for multi-process visibility, `FULL` sync per commit, and a busy
@@ -181,11 +213,15 @@ impl SqlExecutor for SqliteDb {
     async fn execute_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
         // Inside a commit unit the connection already holds BEGIN IMMEDIATE;
         // run the statements directly instead of nesting a second transaction.
-        let unit = self.in_unit.load(Ordering::SeqCst);
+        if self.in_unit.load(Ordering::SeqCst) {
+            return self
+                .run_blocking(move |conn| apply_batch(conn, statements))
+                .await;
+        }
+        // Implicit transaction: claim the scope first, so a rival unit
+        // cannot open between our BEGIN and COMMIT.
+        let _scope = self.tx.clone().lock_owned().await;
         self.run_blocking(move |conn| {
-            if unit {
-                return apply_batch(conn, statements);
-            }
             let tx = conn.unchecked_transaction()?;
             apply_batch(&tx, statements)?;
             tx.commit()
@@ -235,6 +271,9 @@ impl SqlExecutor for SqliteDb {
                 })
                 .await;
         }
+        // Implicit read transaction: claim the scope first, so a rival unit
+        // cannot open between our BEGIN and COMMIT.
+        let _scope = self.tx.clone().lock_owned().await;
         self.run_blocking(move |conn| {
             let tx = conn.unchecked_transaction()?;
             let out = statements
@@ -250,17 +289,32 @@ impl SqlExecutor for SqliteDb {
     /// Serialize writers across processes: `BEGIN IMMEDIATE` takes the
     /// RESERVED lock up front (waiting up to the busy timeout), so validation
     /// reads and the following writes run atomically. Readers keep working.
+    ///
+    /// The `tx` scope is claimed before BEGIN and released by `end_unit`,
+    /// so an implicit per-batch transaction can never slip in between and
+    /// trip on a nested BEGIN.
     async fn begin_unit(&self) -> Result<()> {
-        self.run_blocking(|conn| conn.execute_batch("BEGIN IMMEDIATE"))
-            .await?;
-        self.in_unit.store(true, Ordering::SeqCst);
-        Ok(())
+        let guard = self.tx.clone().lock_owned().await;
+        let r = self
+            .run_blocking(|conn| conn.execute_batch("BEGIN IMMEDIATE"))
+            .await;
+        match r {
+            Ok(()) => {
+                *self.unit_guard.lock().unwrap() = Some(guard);
+                self.in_unit.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            // The guard drops here: the scope is released on failure.
+            Err(e) => Err(e),
+        }
     }
 
     async fn end_unit(&self, commit: bool) -> Result<()> {
         let sql = if commit { "COMMIT" } else { "ROLLBACK" };
         let r = self.run_blocking(move |conn| conn.execute_batch(sql)).await;
         self.in_unit.store(false, Ordering::SeqCst);
+        // Release the scope after the transaction is closed.
+        self.unit_guard.lock().unwrap().take();
         r
     }
 }

@@ -472,8 +472,11 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
     /// Run `op` inside the cross-node commit unit, pairing `begin_unit`
     /// with `end_unit` on every path (mirrors `commit_inner`). Lease
     /// read-modify-write cycles ride the same writer serialization as
-    /// commits, so rival nodes never interleave them.
+    /// commits, so rival nodes never interleave them. The writes mutex is
+    /// held throughout: units share one connection (SQLite) or one table
+    /// lock (Oracle), so two open units at once fail or interleave.
     async fn lease_unit<T>(&self, op: impl Future<Output = Result<T>>) -> Result<T> {
+        let _guard = self.writes.lock().await;
         self.exec.begin_unit().await?;
         match op.await {
             Ok(value) => {
