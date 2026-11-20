@@ -8,7 +8,9 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use rine_etcd::{
-    backend::{Backend, Event, KeyValue, ListOptions, ObservedRange, ReadSet, Revision},
+    backend::{
+        BROADCAST_CAP, Backend, Event, KeyValue, ListOptions, ObservedRange, ReadSet, Revision,
+    },
     error::{Error, Result},
 };
 use tokio::sync::{Mutex, broadcast};
@@ -44,7 +46,7 @@ impl<E: SqlExecutor, D: Dialect> Clone for SqlBackend<E, D> {
 
 impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
     pub fn new(exec: Arc<E>) -> Self {
-        let (tx, _) = broadcast::channel(1024);
+        let (tx, _) = broadcast::channel(BROADCAST_CAP);
         Self {
             exec,
             tx,
@@ -96,21 +98,12 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         Ok(())
     }
 
-    /// DDL statements that fully provision the schema, for operators who
-    /// pre-create objects with a privileged user.
-    pub fn schema_statements() -> Vec<&'static str> {
-        std::iter::once(D::create_table_sql())
-            .chain(D::create_indexes_sql().iter().copied())
-            .chain(D::ensure_indexes_sql().iter().copied())
-            .collect()
-    }
-
     /// Run the DDL. Each statement tolerates a concurrent creator
     /// (already-exists) and retries a transient lock conflict with a
     /// concurrent writer (e.g. `CREATE INDEX` racing DML on a fresh database),
     /// so simultaneous startups on any number of nodes converge.
     /// Migrations are out of scope for now.
-    pub async fn create_schema(&self) -> Result<()> {
+    async fn create_schema(&self) -> Result<()> {
         for stmt in
             std::iter::once(D::create_table_sql()).chain(D::create_indexes_sql().iter().copied())
         {
@@ -155,9 +148,29 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
     }
 
     async fn check_rev(&self, rev: Revision) -> Result<Revision> {
-        let cur = self.current_rev_inner().await?;
+        // Both watermarks in one trip (a single blocking call on Oracle).
+        let mut rows = self
+            .exec
+            .query_batch(vec![
+                (D::current_revision_sql(), vec![]),
+                (D::compacted_rev_sql().into(), vec![]),
+            ])
+            .await?
+            .into_iter();
+        let cur = rows
+            .next()
+            .and_then(|rows| rows.into_iter().next())
+            .map(|r| r.get_int(0))
+            .transpose()?
+            .unwrap_or(1)
+            .max(1);
         if rev > 0 {
-            let c = self.compacted_inner().await?;
+            let c = rows
+                .next()
+                .and_then(|rows| rows.into_iter().next())
+                .map(|r| r.get_int(0))
+                .transpose()?
+                .unwrap_or(0);
             if rev < c {
                 return Err(Error::Compacted {
                     requested: rev,

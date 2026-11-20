@@ -16,8 +16,8 @@ use crate::{
     error::{Error, status_err},
     etcdserverpb::{
         CompactionRequest, CompactionResponse, Compare, DeleteRangeRequest, DeleteRangeResponse,
-        PutRequest, PutResponse, RangeRequest, RangeResponse, RequestOp, ResponseHeader,
-        ResponseOp, TxnRequest, TxnResponse,
+        PutRequest, PutResponse, RangeRequest, RangeResponse, RequestOp, ResponseOp, TxnRequest,
+        TxnResponse,
         kv_server::Kv,
         range_request::{SortOrder, SortTarget},
         response_op::Response,
@@ -72,25 +72,6 @@ impl WriteBatch {
         kvs: &[KeyValue],
         count: i64,
     ) {
-        let descriptor = (key, end, opts.limit, opts.keys_only, opts.count_only);
-        let dup = self.reads.ranges.iter().any(|r| {
-            (
-                r.prefix.as_ref(),
-                r.range_end.as_deref(),
-                r.opts.limit,
-                r.opts.keys_only,
-                r.opts.count_only,
-            ) == (
-                descriptor.0,
-                descriptor.1,
-                descriptor.2,
-                descriptor.3,
-                descriptor.4,
-            )
-        });
-        if dup {
-            return;
-        }
         self.reads.ranges.push(ObservedRange {
             prefix: Bytes::copy_from_slice(key),
             range_end: end.map(Bytes::copy_from_slice),
@@ -117,10 +98,6 @@ impl KvService {
             leases,
             writes,
         }
-    }
-
-    fn header(&self, revision: i64) -> ResponseHeader {
-        header(revision)
     }
 
     // ---- core handlers (shared by unary RPCs and Txn branches) ----
@@ -289,7 +266,7 @@ impl KvService {
             };
             let (rev, kvs, count) = self.fetch(&req.key, end, opts, &mut batch).await?;
             return Ok(RangeResponse {
-                header: Some(self.header(rev)),
+                header: Some(header(rev)),
                 kvs: kvs.into_iter().map(to_proto_kv).collect(),
                 more: req.limit > 0 && count > req.limit,
                 count,
@@ -323,7 +300,7 @@ impl KvService {
         };
 
         Ok(RangeResponse {
-            header: Some(self.header(rev)),
+            header: Some(header(rev)),
             kvs: if req.count_only {
                 Vec::new()
             } else {
@@ -344,18 +321,11 @@ impl KvService {
                 "etcdserver: key is not provided",
             ));
         }
+        // Predecessor fetch, deliberately *not* recorded in the read set:
+        // the commit revalidates written keys against its batched snapshot.
         let (_, rows, _) = self
-            .backend
-            .list(
-                &req.key,
-                None,
-                ListOptions {
-                    revision: 0,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(status_err)?;
+            .fetch(&req.key, None, ListOptions::default(), &mut None)
+            .await?;
         let prev = rows.into_iter().next();
 
         let (value, lease) = match (req.ignore_value, req.ignore_lease) {
@@ -399,7 +369,7 @@ impl KvService {
             prev_kv: prev.clone(),
         })?;
         Ok(PutResponse {
-            header: Some(self.header(rev)),
+            header: Some(header(rev)),
             prev_kv: if req.prev_kv {
                 prev.map(to_proto_kv)
             } else {
@@ -433,7 +403,7 @@ impl KvService {
             }
         }
         Ok(DeleteRangeResponse {
-            header: Some(self.header(batch.revision())),
+            header: Some(header(batch.revision())),
             deleted: kvs.len() as i64,
             prev_kvs,
         })
@@ -453,40 +423,45 @@ impl KvService {
             tonic::Status::invalid_argument("etcdserver: compare target_union missing")
         })?;
 
-        // Gather one subject per key the compare covers.
-        let mut subjects: Vec<CompareSubject> = Vec::new();
+        // Every covered key must satisfy the comparison. A missing key only
+        // counts as zeros for non-value targets (etcd: no value to compare).
         let (_, kvs) = self.list(&c.key, &c.range_end, 0, Some(batch)).await?;
-        if kvs.is_empty() {
-            if target == CompareTarget::Value {
+        let check = |kv: Option<&KeyValue>| -> Result<bool, tonic::Status> {
+            if kv.is_none() && target == CompareTarget::Value {
                 return Ok(false);
             }
-            subjects.push(CompareSubject::absent());
-        }
-        subjects.extend(kvs.into_iter().map(CompareSubject::of));
-
-        // All subjects must satisfy the comparison.
-        for subject in &subjects {
             let ord = match (&target, union) {
-                (CompareTarget::Version, TargetUnion::Version(v)) => subject.version.cmp(v),
-                (CompareTarget::Create, TargetUnion::CreateRevision(v)) => subject.create.cmp(v),
-                (CompareTarget::Mod, TargetUnion::ModRevision(v)) => subject.mod_rev.cmp(v),
-                (CompareTarget::Value, TargetUnion::Value(v)) => {
-                    subject.value.as_slice().cmp(v.as_slice())
+                (CompareTarget::Version, TargetUnion::Version(v)) => {
+                    kv.map_or(0, |kv| kv.version).cmp(v)
                 }
-                (CompareTarget::Lease, TargetUnion::Lease(v)) => subject.lease.cmp(v),
+                (CompareTarget::Create, TargetUnion::CreateRevision(v)) => {
+                    kv.map_or(0, |kv| kv.create_revision).cmp(v)
+                }
+                (CompareTarget::Mod, TargetUnion::ModRevision(v)) => {
+                    kv.map_or(0, |kv| kv.mod_revision).cmp(v)
+                }
+                (CompareTarget::Value, TargetUnion::Value(v)) => {
+                    kv.map_or(&[][..], |kv| kv.value.as_ref()).cmp(v.as_slice())
+                }
+                (CompareTarget::Lease, TargetUnion::Lease(v)) => kv.map_or(0, |kv| kv.lease).cmp(v),
                 _ => {
                     return Err(tonic::Status::invalid_argument(
                         "etcdserver: compare target/type mismatch",
                     ));
                 }
             };
-            let ok = match result {
+            Ok(match result {
                 CompareResult::Equal => ord.is_eq(),
                 CompareResult::Greater => ord.is_gt(),
                 CompareResult::Less => ord.is_lt(),
                 CompareResult::NotEqual => !ord.is_eq(),
-            };
-            if !ok {
+            })
+        };
+        if kvs.is_empty() {
+            return check(None);
+        }
+        for kv in &kvs {
+            if !check(Some(kv))? {
                 return Ok(false);
             }
         }
@@ -556,42 +531,11 @@ impl KvService {
                 responses.push(self.apply_op(op, depth, batch).await?);
             }
             Ok(TxnResponse {
-                header: Some(self.header(batch.revision())),
+                header: Some(header(batch.revision())),
                 succeeded: ok,
                 responses,
             })
         })
-    }
-}
-
-/// One key a `Compare` evaluates: etcd compares every covered key.
-struct CompareSubject {
-    version: i64,
-    create: i64,
-    mod_rev: i64,
-    value: Vec<u8>,
-    lease: i64,
-}
-
-impl CompareSubject {
-    fn of(kv: KeyValue) -> Self {
-        Self {
-            version: kv.version,
-            create: kv.create_revision,
-            mod_rev: kv.mod_revision,
-            value: kv.value.to_vec(),
-            lease: kv.lease,
-        }
-    }
-
-    fn absent() -> Self {
-        Self {
-            version: 0,
-            create: 0,
-            mod_rev: 0,
-            value: Vec::new(),
-            lease: 0,
-        }
     }
 }
 
@@ -697,7 +641,7 @@ impl Kv for KvService {
                     Self::retarget(op, fresh);
                 }
                 Ok(tonic::Response::new(TxnResponse {
-                    header: Some(self.header(fresh)),
+                    header: Some(header(fresh)),
                     succeeded: false,
                     responses,
                 }))
@@ -710,8 +654,11 @@ impl Kv for KvService {
         &self,
         request: tonic::Request<CompactionRequest>,
     ) -> Result<tonic::Response<CompactionResponse>, tonic::Status> {
+        // No write lock: compaction only drops non-live history below the
+        // watermark (live rows are never touched), and the backend serializes
+        // the watermark plus each delete chunk on its own lock, so writers
+        // keep committing between chunks instead of stalling.
         let req = request.into_inner();
-        let _guard = self.writes.lock().await;
         let cur = self.backend.current_revision().await;
         if req.revision <= 0 || req.revision > cur {
             return Err(tonic::Status::out_of_range(
@@ -724,7 +671,7 @@ impl Kv for KvService {
             .await
             .map_err(status_err)?;
         Ok(tonic::Response::new(CompactionResponse {
-            header: Some(self.header(rev)),
+            header: Some(header(rev)),
         }))
     }
 }

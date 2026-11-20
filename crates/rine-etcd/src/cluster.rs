@@ -5,10 +5,10 @@
 use std::sync::Arc;
 
 use crate::{
-    backend::{Backend, CLUSTER_ID, MEMBER_ID, VERSION, header},
+    backend::{Backend, MEMBER_ID, VERSION, header},
     etcdserverpb::{
-        Member, MemberListRequest, MemberListResponse, ResponseHeader, StatusRequest,
-        StatusResponse, cluster_server::Cluster, maintenance_server::Maintenance,
+        Member, MemberListRequest, MemberListResponse, StatusRequest, StatusResponse,
+        cluster_server::Cluster, maintenance_server::Maintenance,
     },
 };
 
@@ -38,12 +38,7 @@ impl Cluster for ClusterService {
     ) -> Result<tonic::Response<MemberListResponse>, tonic::Status> {
         let rev = self.backend.current_revision().await;
         Ok(tonic::Response::new(MemberListResponse {
-            header: Some(ResponseHeader {
-                cluster_id: CLUSTER_ID,
-                member_id: self.member_id,
-                revision: rev,
-                raft_term: 0,
-            }),
+            header: Some(header(rev)),
             members: vec![Member {
                 id: self.member_id,
                 name: self.member_name.clone(),

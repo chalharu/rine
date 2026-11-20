@@ -15,9 +15,8 @@ pub type LeaseId = i64;
 /// storage-level serialization additionally lives in each `Backend`.
 pub type CommitLock = Arc<tokio::sync::Mutex<()>>;
 
-pub fn new_commit_lock() -> CommitLock {
-    Arc::new(tokio::sync::Mutex::new(()))
-}
+/// Capacity of each backend's watch broadcast channel.
+pub const BROADCAST_CAP: usize = 1024;
 
 /// Single-member cluster identity (k8s apiserver health/discovery only).
 pub const CLUSTER_ID: u64 = 0x7269_6e65_0000_0001;

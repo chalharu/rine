@@ -1,5 +1,5 @@
 [package]
-description = "etcd-compatible API server with pluggable backend (HashTable backend included)"
+description = "etcd-compatible API server with pluggable backends (in-memory backend included)"
 edition.workspace = true
 license.workspace = true
 name = "rine-etcd"

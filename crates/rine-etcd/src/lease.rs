@@ -22,13 +22,11 @@ use crate::{
     etcdserverpb::{
         LeaseGrantRequest, LeaseGrantResponse, LeaseKeepAliveRequest, LeaseKeepAliveResponse,
         LeaseLeasesRequest, LeaseLeasesResponse, LeaseRevokeRequest, LeaseRevokeResponse,
-        LeaseStatus, LeaseTimeToLiveRequest, LeaseTimeToLiveResponse, ResponseHeader,
-        lease_server::Lease,
+        LeaseStatus, LeaseTimeToLiveRequest, LeaseTimeToLiveResponse, lease_server::Lease,
     },
 };
 
 struct LeaseEntry {
-    ttl: i64,
     granted_ttl: i64,
     deadline: Instant,
     keys: Vec<Vec<u8>>,
@@ -180,7 +178,6 @@ impl LeaseManager {
         g.insert(
             id,
             LeaseEntry {
-                ttl,
                 granted_ttl: ttl,
                 deadline: Instant::now() + Duration::from_secs(ttl.max(0) as u64),
                 keys: Vec::new(),
@@ -225,8 +222,8 @@ impl LeaseManager {
     pub async fn keepalive(&self, id: i64) -> i64 {
         match self.inner.write().await.get_mut(&id) {
             Some(e) => {
-                e.deadline = Instant::now() + Duration::from_secs(e.ttl.max(0) as u64);
-                e.ttl
+                e.deadline = Instant::now() + Duration::from_secs(e.granted_ttl.max(0) as u64);
+                e.granted_ttl
             }
             None => 0,
         }
@@ -256,10 +253,6 @@ impl LeaseService {
     pub fn new(backend: Arc<dyn Backend>, leases: LeaseManager) -> Self {
         Self { backend, leases }
     }
-
-    fn header(&self, revision: i64) -> ResponseHeader {
-        header(revision)
-    }
 }
 
 #[tonic::async_trait]
@@ -277,7 +270,7 @@ impl Lease for LeaseService {
         let id = self.leases.grant(req.ttl, req.id).await;
         let rev = self.backend.current_revision().await;
         Ok(tonic::Response::new(LeaseGrantResponse {
-            header: Some(self.header(rev)),
+            header: Some(header(rev)),
             id,
             ttl: req.ttl,
             error: String::new(),
@@ -292,7 +285,7 @@ impl Lease for LeaseService {
         self.leases.revoke(req.id).await;
         let rev = self.backend.current_revision().await;
         Ok(tonic::Response::new(LeaseRevokeResponse {
-            header: Some(self.header(rev)),
+            header: Some(header(rev)),
         }))
     }
 
@@ -334,7 +327,7 @@ impl Lease for LeaseService {
                 "etcdserver: requested lease not found",
             )),
             Some((ttl, granted, keys)) => Ok(tonic::Response::new(LeaseTimeToLiveResponse {
-                header: Some(self.header(rev)),
+                header: Some(header(rev)),
                 id: req.id,
                 ttl,
                 granted_ttl: granted,
@@ -350,7 +343,7 @@ impl Lease for LeaseService {
         let rev = self.backend.current_revision().await;
         let ids = self.leases.all_ids().await;
         Ok(tonic::Response::new(LeaseLeasesResponse {
-            header: Some(self.header(rev)),
+            header: Some(header(rev)),
             leases: ids.into_iter().map(|id| LeaseStatus { id }).collect(),
         }))
     }

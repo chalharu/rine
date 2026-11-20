@@ -35,18 +35,15 @@ async fn spawn() -> String {
     });
     // Wait until servable.
     for _ in 0..50 {
-        if KvClient::connect(endpoint.clone()).await.is_ok() {
-            // connect() is lazy; force a call.
-            if let Ok(mut c) = KvClient::connect(endpoint.clone()).await
-                && c.range(RangeRequest {
-                    key: b"x".to_vec(),
-                    ..Default::default()
-                })
-                .await
-                .is_ok()
-            {
-                break;
-            }
+        if let Ok(mut c) = KvClient::connect(endpoint.clone()).await
+            && c.range(RangeRequest {
+                key: b"x".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .is_ok()
+        {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

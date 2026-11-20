@@ -131,6 +131,16 @@ fn as_bind(p: &OwnedParam) -> &dyn ToDbValue {
     }
 }
 
+/// Build owned binds and project them to `&dyn ToDbValue` for one call.
+fn with_binds<T>(
+    params: &[SqlValue],
+    f: impl FnOnce(&[&dyn ToDbValue]) -> Result<T, oracledb::Error>,
+) -> Result<T, oracledb::Error> {
+    let owned: Vec<OwnedParam> = params.iter().map(OwnedParam::from).collect();
+    let refs: Vec<&dyn ToDbValue> = owned.iter().map(as_bind).collect();
+    f(&refs)
+}
+
 fn read_col(row: &oracledb::Row, idx: usize) -> Result<SqlValue, oracledb::Error> {
     let db_type = row.columns()[idx].db_type();
     if *db_type == *oracledb::DB_TYPE_NUMBER {
@@ -158,10 +168,8 @@ fn query_all_on(
     sql: &str,
     params: &[SqlValue],
 ) -> Result<Vec<Row>, oracledb::Error> {
-    let owned: Vec<OwnedParam> = params.iter().map(OwnedParam::from).collect();
-    let refs: Vec<&dyn ToDbValue> = owned.iter().map(as_bind).collect();
     let stmt = conn.statement(sql)?.exclude_from_cache().build()?;
-    let cursor = stmt.query(&refs)?;
+    let cursor = with_binds(params, |refs| stmt.query(refs))?;
     let mut out = Vec::new();
     for row in cursor {
         out.push(read_row(&row?)?);
@@ -174,9 +182,7 @@ fn apply_batch(
     statements: Vec<(String, Vec<SqlValue>)>,
 ) -> std::result::Result<(), oracledb::Error> {
     for (sql, params) in statements {
-        let owned: Vec<_> = params.iter().map(OwnedParam::from).collect();
-        let refs: Vec<_> = owned.iter().map(as_bind).collect();
-        conn.execute(&sql, &refs)?;
+        with_binds(&params, |refs| conn.execute(&sql, refs))?;
     }
     Ok(())
 }
@@ -213,17 +219,17 @@ impl SqlExecutor for OracleDb {
             let sql = sql.to_string();
             return self
                 .run_blocking(move |conn| {
-                    let owned: Vec<OwnedParam> = params.iter().map(OwnedParam::from).collect();
-                    let refs: Vec<&dyn ToDbValue> = owned.iter().map(as_bind).collect();
-                    Ok(conn.execute(&sql, &refs)?.rows_affected())
+                    with_binds(&params, |refs| {
+                        Ok(conn.execute(&sql, refs)?.rows_affected())
+                    })
                 })
                 .await;
         }
         let sql = sql.to_string();
         self.run_blocking(move |conn| {
-            let owned: Vec<OwnedParam> = params.iter().map(OwnedParam::from).collect();
-            let refs: Vec<&dyn ToDbValue> = owned.iter().map(as_bind).collect();
-            let n = conn.execute(&sql, &refs)?.rows_affected();
+            let n = with_binds(&params, |refs| {
+                Ok(conn.execute(&sql, refs)?.rows_affected())
+            })?;
             conn.commit()?;
             Ok(n)
         })
@@ -233,14 +239,12 @@ impl SqlExecutor for OracleDb {
     async fn query_row(&self, sql: &str, params: Vec<SqlValue>) -> Result<Option<Row>> {
         let sql = sql.to_string();
         self.run_blocking(move |conn| {
-            let owned: Vec<OwnedParam> = params.iter().map(OwnedParam::from).collect();
-            let refs: Vec<&dyn ToDbValue> = owned.iter().map(as_bind).collect();
             let stmt = conn.statement(&sql)?.exclude_from_cache().build()?;
-            match stmt.query_row(&refs) {
+            with_binds(&params, |refs| match stmt.query_row(refs) {
                 Ok(row) => read_row(&row).map(Some),
                 Err(e) if is_no_data(&e) => Ok(None),
                 Err(e) => Err(e),
-            }
+            })
         })
         .await
     }

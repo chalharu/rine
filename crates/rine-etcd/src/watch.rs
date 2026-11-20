@@ -20,8 +20,8 @@ use crate::{
     backend::{Backend, Event, header, in_range},
     error::status_err,
     etcdserverpb::{
-        ResponseHeader, WatchCancelRequest, WatchCreateRequest, WatchProgressRequest, WatchRequest,
-        WatchResponse, watch_server::Watch,
+        WatchCancelRequest, WatchCreateRequest, WatchProgressRequest, WatchRequest, WatchResponse,
+        watch_server::Watch,
     },
     kv::to_proto_kv,
     mvccpb,
@@ -105,7 +105,6 @@ impl Watch for WatchService {
         let backend = self.backend.clone();
         let next_id = self.next_id.clone();
         let (tx, rx) = mpsc::channel::<Result<WatchResponse, tonic::Status>>(64);
-        let header = move |revision: i64| header(revision);
 
         tokio::spawn(async move {
             let mut watchers: HashMap<i64, Watcher> = HashMap::new();
@@ -126,7 +125,7 @@ impl Watch for WatchService {
                         use crate::etcdserverpb::watch_request::RequestUnion;
                         match req.request_union {
                             Some(RequestUnion::CreateRequest(c)) => {
-                                handle_create(&backend, &next_id, &header, &tx, &mut watchers, c).await;
+                                handle_create(&backend, &next_id, &tx, &mut watchers, c).await;
                             }
                             Some(RequestUnion::CancelRequest(WatchCancelRequest { watch_id })) => {
                                 watchers.remove(&watch_id);
@@ -214,7 +213,6 @@ fn watch_events(w: &Watcher, events: &[Event]) -> Vec<mvccpb::Event> {
 async fn handle_create(
     backend: &Arc<dyn Backend>,
     next_id: &AtomicI64,
-    header: &impl Fn(i64) -> ResponseHeader,
     tx: &mpsc::Sender<Result<WatchResponse, tonic::Status>>,
     watchers: &mut HashMap<i64, Watcher>,
     c: WatchCreateRequest,

@@ -17,8 +17,8 @@ use tokio::sync::{RwLock, broadcast};
 
 use crate::{
     backend::{
-        Backend, BackendFactory, Event, KeyValue, ListOptions, ObservedRange, ReadSet, Revision,
-        in_range,
+        BROADCAST_CAP, Backend, BackendFactory, Event, KeyValue, ListOptions, ObservedRange,
+        ReadSet, Revision, in_range,
     },
     error::{Error, Result},
 };
@@ -60,7 +60,7 @@ impl Default for MemoryBackend {
 
 impl MemoryBackend {
     pub fn new() -> Self {
-        let (tx, _) = broadcast::channel(1024);
+        let (tx, _) = broadcast::channel(BROADCAST_CAP);
         Self {
             inner: Arc::new(RwLock::new(Inner {
                 rev: 1,
@@ -237,7 +237,7 @@ impl Backend for MemoryBackend {
             rebased.push(event);
         }
         g.rev = fresh;
-        Self::publish(&mut g, &self.tx, rebased.clone());
+        Self::publish(&mut g, &self.tx, rebased);
         Ok(fresh)
     }
 

@@ -55,7 +55,7 @@ impl EtcdServer {
         // rustls 0.23 leaves process-wide provider selection to the
         // application; without this every TLS handshake panics.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let writes = crate::backend::new_commit_lock();
+        let writes: crate::backend::CommitLock = Arc::new(tokio::sync::Mutex::new(()));
         let leases = LeaseManager::new(self.backend.clone(), writes.clone());
         let mut set = tokio::task::JoinSet::new();
         for l in listeners {
