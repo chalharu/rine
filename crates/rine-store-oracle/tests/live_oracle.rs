@@ -57,6 +57,14 @@ async fn connect_retry() -> OracleDb {
     panic!("could not connect to Oracle XE after 60 attempts: {last}");
 }
 
+/// Nanos since the epoch: with the process id, a unique keyspace per run.
+fn run_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
 #[tokio::test]
 async fn live_backend_crud_and_compact() {
     if !live_enabled() {
@@ -72,21 +80,29 @@ async fn live_backend_crud_and_compact() {
     backend.ensure_schema().await.expect("ensure_schema");
 
     // --- CRUD + history + compact (shared conformance suite) ---
-    crud(&backend, "live").await;
-    history_compact_events(&backend, "live").await;
+    // Unique keyspace per run: this binary runs twice per CI job against
+    // the same XE, and the DROP above fails silently when a parallel test
+    // holds locks — so fixed namespaces would collide with leftover live
+    // keys and flake absent-guard creates with Conflict.
+    let ns = format!("live-p{}-{}", std::process::id(), run_nanos());
+    crud(&backend, &ns).await;
+    history_compact_events(&backend, &ns).await;
 
-    let first = Bytes::from_static(b"/live-range/a");
-    let second = Bytes::from_static(b"/live-range/b");
+    let range = format!("{ns}/range");
+    let first = Bytes::from(format!("{range}/a"));
+    let second = Bytes::from(format!("{range}/b"));
     kv_create(&backend, first.clone(), Bytes::from_static(b"value"), 0)
         .await
         .unwrap();
     let revision = kv_create(&backend, second, Bytes::from_static(b"second"), 0)
         .await
         .unwrap();
+    let prefix = format!("{range}/");
+    let end = format!("{range}0");
     let (header, rows, count) = backend
         .list(
-            b"/live-range/",
-            Some(b"/live-range0"),
+            prefix.as_bytes(),
+            Some(end.as_bytes()),
             ListOptions {
                 limit: 1,
                 keys_only: true,
@@ -98,8 +114,9 @@ async fn live_backend_crud_and_compact() {
     assert_eq!((header, rows.len(), count), (revision, 1, 2));
     assert_eq!(rows[0].key, first);
     assert!(rows[0].value.is_empty());
+    let missing = format!("{range}/missing");
     let (header, rows, count) = backend
-        .list(b"/live-range/missing", None, ListOptions::default())
+        .list(missing.as_bytes(), None, ListOptions::default())
         .await
         .unwrap();
     assert_eq!((header, rows.len(), count), (revision, 0, 0));
