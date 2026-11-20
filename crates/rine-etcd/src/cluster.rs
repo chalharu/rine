@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use crate::{
-    backend::Backend,
+    backend::{Backend, CLUSTER_ID, MEMBER_ID, VERSION, header},
     etcdserverpb::{
         Member, MemberListRequest, MemberListResponse, ResponseHeader, StatusRequest,
         StatusResponse, cluster_server::Cluster, maintenance_server::Maintenance,
@@ -23,7 +23,7 @@ impl ClusterService {
     pub fn new(backend: Arc<dyn Backend>, client_url: String) -> Self {
         Self {
             backend,
-            member_id: 0x7269_6e65_0000_0002,
+            member_id: MEMBER_ID,
             member_name: "rine".into(),
             client_url,
         }
@@ -39,7 +39,7 @@ impl Cluster for ClusterService {
         let rev = self.backend.current_revision().await;
         Ok(tonic::Response::new(MemberListResponse {
             header: Some(ResponseHeader {
-                cluster_id: 0x7269_6e65_0000_0001,
+                cluster_id: CLUSTER_ID,
                 member_id: self.member_id,
                 revision: rev,
                 raft_term: 0,
@@ -64,7 +64,7 @@ impl MaintenanceService {
     pub fn new(backend: Arc<dyn Backend>) -> Self {
         Self {
             backend,
-            member_id: 0x7269_6e65_0000_0002,
+            member_id: MEMBER_ID,
         }
     }
 }
@@ -78,13 +78,8 @@ impl Maintenance for MaintenanceService {
         let rev = self.backend.current_revision().await;
         let size = self.backend.db_size().await;
         Ok(tonic::Response::new(StatusResponse {
-            header: Some(ResponseHeader {
-                cluster_id: 0x7269_6e65_0000_0001,
-                member_id: self.member_id,
-                revision: rev,
-                raft_term: 0,
-            }),
-            version: "3.5.0".into(),
+            header: Some(header(rev)),
+            version: VERSION.into(),
             db_size: size,
             leader: self.member_id,
             raft_index: rev.max(0) as u64,

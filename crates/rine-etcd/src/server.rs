@@ -52,15 +52,20 @@ impl EtcdServer {
         if listeners.is_empty() {
             anyhow::bail!("no listen addresses");
         }
-        let leases = LeaseManager::new(self.backend.clone());
+        // rustls 0.23 leaves process-wide provider selection to the
+        // application; without this every TLS handshake panics.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let writes = crate::backend::new_commit_lock();
+        let leases = LeaseManager::new(self.backend.clone(), writes.clone());
         let mut set = tokio::task::JoinSet::new();
         for l in listeners {
-            set.spawn(Self::serve_on(
-                l.addr,
-                l.tls,
-                self.backend.clone(),
-                leases.clone(),
-            ));
+            let (backend, leases, writes) = (self.backend.clone(), leases.clone(), writes.clone());
+            let addr = l.addr;
+            set.spawn(async move {
+                Self::serve_on(l.addr, l.tls, backend, leases, writes)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("listener {addr}: {e:#}"))
+            });
         }
         while let Some(res) = set.join_next().await {
             res??;
@@ -73,10 +78,8 @@ impl EtcdServer {
         tls: Option<TlsIdentity>,
         backend: Arc<dyn Backend>,
         leases: LeaseManager,
+        writes: crate::backend::CommitLock,
     ) -> anyhow::Result<()> {
-        // rustls 0.23 leaves process-wide provider selection to the
-        // application; without this every TLS handshake panics.
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let scheme = if tls.is_some() { "https" } else { "http" };
         let client_url = format!("{scheme}://{addr}");
         tracing::info!(%addr, tls = tls.is_some(), "serving etcd-compatible gRPC");
@@ -94,6 +97,7 @@ impl EtcdServer {
             .add_service(KvServer::new(KvService::new(
                 backend.clone(),
                 leases.clone(),
+                writes,
             )))
             .add_service(WatchServer::new(WatchService::new(backend.clone())))
             .add_service(LeaseServer::new(LeaseService::new(backend.clone(), leases)))

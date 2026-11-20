@@ -17,7 +17,7 @@ use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    backend::{Backend, Event, KeyValue, ListOptions, ReadSet},
+    backend::{Backend, CommitLock, Event, KeyValue, ListOptions, ReadSet, header},
     error::Error,
     etcdserverpb::{
         LeaseGrantRequest, LeaseGrantResponse, LeaseKeepAliveRequest, LeaseKeepAliveResponse,
@@ -35,7 +35,7 @@ struct LeaseEntry {
 }
 
 pub struct LeaseManager {
-    pub(crate) writes: Arc<tokio::sync::Mutex<()>>,
+    writes: CommitLock,
     inner: Arc<RwLock<HashMap<i64, LeaseEntry>>>,
     backend: Arc<dyn Backend>,
     next_id: Arc<AtomicI64>,
@@ -53,39 +53,11 @@ impl Clone for LeaseManager {
 }
 
 impl LeaseManager {
-    /// Delete `key` only while it still belongs to `id`, via a guarded commit.
-    /// Best-effort fallback for a key a batched expiry could not cover.
-    async fn expire_key(backend: &Arc<dyn Backend>, id: i64, key: &[u8]) {
-        let prev = backend
-            .list(key, None, ListOptions::default())
-            .await
-            .ok()
-            .and_then(|(_, rows, _)| rows.into_iter().next())
-            .filter(|kv: &KeyValue| kv.lease == id);
-        let Some(prev) = prev else { return };
-        let revision = backend.current_revision().await + 1;
-        let reads = ReadSet {
-            points: vec![(Bytes::copy_from_slice(key), Some(prev.mod_revision))],
-            ranges: Vec::new(),
-        };
-        let _ = backend
-            .commit(
-                reads,
-                vec![Event {
-                    revision,
-                    key: Bytes::copy_from_slice(key),
-                    deleted: true,
-                    kv: None,
-                    prev_kv: Some(prev),
-                }],
-            )
-            .await;
-    }
-
     /// Delete many expired keys in one guarded commit instead of one commit
     /// per key: a mass expiry (node loss, TTL sync) must not stall all
     /// writers for seconds. Keys that moved under us abort the batch with a
-    /// conflict; those fall back to per-key best effort, as before.
+    /// conflict; those fall back to per-key best effort on the snapshot we
+    /// already hold (no re-list).
     async fn expire_keys(backend: &Arc<dyn Backend>, pairs: Vec<(i64, Vec<u8>)>) {
         if pairs.is_empty() {
             return;
@@ -123,17 +95,35 @@ impl LeaseManager {
         match backend.commit(reads, events).await {
             Ok(_) => {}
             Err(Error::Conflict) => {
-                for (id, key, _) in &live {
-                    Self::expire_key(backend, *id, key).await;
+                // Fall back key by key on the snapshot above, without
+                // re-listing: each delete is still guarded, so a key that
+                // moved again simply conflicts away.
+                for (_, key, prev) in &live {
+                    let reads = ReadSet {
+                        points: vec![(Bytes::copy_from_slice(key), Some(prev.mod_revision))],
+                        ranges: Vec::new(),
+                    };
+                    let _ = backend
+                        .commit(
+                            reads,
+                            vec![Event {
+                                revision: base + 1,
+                                key: Bytes::copy_from_slice(key),
+                                deleted: true,
+                                kv: None,
+                                prev_kv: Some(prev.clone()),
+                            }],
+                        )
+                        .await;
                 }
             }
             Err(_) => {}
         }
     }
 
-    pub fn new(backend: Arc<dyn Backend>) -> Self {
+    pub fn new(backend: Arc<dyn Backend>, writes: CommitLock) -> Self {
         let mgr = Self {
-            writes: Arc::new(tokio::sync::Mutex::new(())),
+            writes,
             inner: Arc::new(RwLock::new(HashMap::new())),
             backend,
             next_id: Arc::new(AtomicI64::new(1)),
@@ -258,27 +248,15 @@ impl LeaseManager {
 pub struct LeaseService {
     backend: Arc<dyn Backend>,
     leases: LeaseManager,
-    cluster_id: u64,
-    member_id: u64,
 }
 
 impl LeaseService {
     pub fn new(backend: Arc<dyn Backend>, leases: LeaseManager) -> Self {
-        Self {
-            backend,
-            leases,
-            cluster_id: 0x7269_6e65_0000_0001,
-            member_id: 0x7269_6e65_0000_0002,
-        }
+        Self { backend, leases }
     }
 
     fn header(&self, revision: i64) -> ResponseHeader {
-        ResponseHeader {
-            cluster_id: self.cluster_id,
-            member_id: self.member_id,
-            revision,
-            raft_term: 0,
-        }
+        header(revision)
     }
 }
 
@@ -326,19 +304,12 @@ impl Lease for LeaseService {
         let leases = self.leases.clone();
         let backend = self.backend.clone();
         let (tx, rx) = mpsc::channel(32);
-        let cluster_id = self.cluster_id;
-        let member_id = self.member_id;
         tokio::spawn(async move {
             while let Ok(Some(req)) = inbound.message().await {
                 let ttl = leases.keepalive(req.id).await;
                 let rev = backend.current_revision().await;
                 let resp = LeaseKeepAliveResponse {
-                    header: Some(ResponseHeader {
-                        cluster_id,
-                        member_id,
-                        revision: rev,
-                        raft_term: 0,
-                    }),
+                    header: Some(header(rev)),
                     id: req.id,
                     ttl,
                 };

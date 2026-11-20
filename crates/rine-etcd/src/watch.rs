@@ -17,7 +17,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    backend::{Backend, Event},
+    backend::{Backend, Event, header, in_range},
+    error::status_err,
     etcdserverpb::{
         ResponseHeader, WatchCancelRequest, WatchCreateRequest, WatchProgressRequest, WatchRequest,
         WatchResponse, watch_server::Watch,
@@ -37,13 +38,12 @@ struct Watcher {
 }
 
 fn matches(w: &Watcher, key: &[u8]) -> bool {
-    if w.range_end.is_empty() {
-        key == w.key.as_slice()
-    } else if w.range_end == [0] {
-        key >= w.key.as_slice()
+    let end = if w.range_end.is_empty() {
+        None
     } else {
-        key >= w.key.as_slice() && key < w.range_end.as_slice()
-    }
+        Some(w.range_end.as_slice())
+    };
+    in_range(key, &w.key, end)
 }
 
 fn to_proto_event(e: &Event, want_prev: bool) -> mvccpb::Event {
@@ -82,8 +82,6 @@ fn to_proto_event(e: &Event, want_prev: bool) -> mvccpb::Event {
 pub struct WatchService {
     backend: Arc<dyn Backend>,
     next_id: Arc<AtomicI64>,
-    cluster_id: u64,
-    member_id: u64,
 }
 
 impl WatchService {
@@ -91,8 +89,6 @@ impl WatchService {
         Self {
             backend,
             next_id: Arc::new(AtomicI64::new(1)),
-            cluster_id: 0x7269_6e65_0000_0001,
-            member_id: 0x7269_6e65_0000_0002,
         }
     }
 }
@@ -108,15 +104,8 @@ impl Watch for WatchService {
         let mut inbound = request.into_inner();
         let backend = self.backend.clone();
         let next_id = self.next_id.clone();
-        let cluster_id = self.cluster_id;
-        let member_id = self.member_id;
         let (tx, rx) = mpsc::channel::<Result<WatchResponse, tonic::Status>>(64);
-        let header = move |revision: i64| ResponseHeader {
-            cluster_id,
-            member_id,
-            revision,
-            raft_term: 0,
-        };
+        let header = move |revision: i64| header(revision);
 
         tokio::spawn(async move {
             let mut watchers: HashMap<i64, Watcher> = HashMap::new();
@@ -289,7 +278,7 @@ async fn handle_create(
                         watch_id: id,
                         canceled: true,
                         compact_revision,
-                        cancel_reason: crate::kv::status_err(error).message().to_owned(),
+                        cancel_reason: status_err(error).message().to_owned(),
                         ..Default::default()
                     }))
                     .await;

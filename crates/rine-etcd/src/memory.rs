@@ -28,8 +28,10 @@ struct Inner {
     compact_rev: Revision,
     kvs: BTreeMap<Bytes, KeyValue>,
     compacted: BTreeMap<Bytes, KeyValue>,
-    /// revision -> events at that revision (Txn may emit several)
-    history: Vec<Vec<Event>>,
+    /// revision -> events at that revision (Txn may emit several).
+    /// Map (not a Vec) so `compact` frees history instead of leaking
+    /// empty slots as the revision grows.
+    history: BTreeMap<Revision, Vec<Event>>,
 }
 
 pub struct MemoryBackend {
@@ -65,14 +67,17 @@ impl MemoryBackend {
                 compact_rev: 0,
                 kvs: BTreeMap::new(),
                 compacted: BTreeMap::new(),
-                history: vec![Vec::new()],
+                history: BTreeMap::new(),
             })),
             tx,
         }
     }
 
     fn publish(g: &mut Inner, tx: &broadcast::Sender<Vec<Event>>, events: Vec<Event>) {
-        g.history[g.rev as usize].extend(events.iter().cloned());
+        g.history
+            .entry(g.rev)
+            .or_default()
+            .extend(events.iter().cloned());
         let _ = tx.send(events);
     }
 
@@ -81,13 +86,11 @@ impl MemoryBackend {
         opts.revision = 0;
         let (_, kvs, count) =
             Self::list_locked(g, &range.prefix, range.range_end.as_deref(), opts)?;
-        if count != range.count
-            || kvs.len() != range.observed.len()
-            || kvs
-                .iter()
-                .zip(range.observed.iter())
-                .any(|(kv, (key, rev))| kv.key.as_ref() != key.as_ref() || kv.mod_revision != *rev)
-        {
+        let snapshot: Vec<(Bytes, Revision)> = kvs
+            .iter()
+            .map(|kv| (kv.key.clone(), kv.mod_revision))
+            .collect();
+        if !range.matches_snapshot(&snapshot, count) {
             return Err(Error::Conflict);
         }
         Ok(())
@@ -129,15 +132,23 @@ impl MemoryBackend {
                     .range::<[u8], _>(bounds)
                     .map(|(k, v)| (k.clone(), v.clone())),
             );
-            for events in &g.history[(g.compact_rev + 1) as usize..=opts.revision as usize] {
-                for event in events
-                    .iter()
-                    .filter(|e| in_range(&e.key, prefix, range_end))
+            // Replay post-compaction history; empty when reading exactly at
+            // the compaction revision (the range would start past its end).
+            if g.compact_rev < opts.revision {
+                for events in g
+                    .history
+                    .range((g.compact_rev + 1)..=opts.revision)
+                    .map(|(_, v)| v)
                 {
-                    if let Some(kv) = &event.kv {
-                        snapshot.insert(event.key.clone(), kv.clone());
-                    } else {
-                        snapshot.remove(event.key.as_ref());
+                    for event in events
+                        .iter()
+                        .filter(|e| in_range(&e.key, prefix, range_end))
+                    {
+                        if let Some(kv) = &event.kv {
+                            snapshot.insert(event.key.clone(), kv.clone());
+                        } else {
+                            snapshot.remove(event.key.as_ref());
+                        }
                     }
                 }
             }
@@ -226,9 +237,6 @@ impl Backend for MemoryBackend {
             rebased.push(event);
         }
         g.rev = fresh;
-        if g.history.len() <= fresh as usize {
-            g.history.resize(fresh as usize + 1, Vec::new());
-        }
         Self::publish(&mut g, &self.tx, rebased.clone());
         Ok(fresh)
     }
@@ -258,8 +266,8 @@ impl Backend for MemoryBackend {
             });
         }
         for r in (g.compact_rev + 1)..=revision {
-            if (r as usize) < g.history.len() {
-                for event in std::mem::take(&mut g.history[r as usize]) {
+            if let Some(events) = g.history.remove(&r) {
+                for event in events {
                     if let Some(kv) = event.kv {
                         g.compacted.insert(event.key, kv);
                     } else {
@@ -290,10 +298,8 @@ impl Backend for MemoryBackend {
         }
         let mut out = Vec::new();
         let hi = to.min(g.rev);
-        for r in from.max(1)..=hi {
-            if let Some(evs) = g.history.get(r as usize) {
-                out.extend(evs.iter().cloned());
-            }
+        for (_, evs) in g.history.range(from.max(1)..=hi) {
+            out.extend(evs.iter().cloned());
         }
         Ok(out)
     }
@@ -307,8 +313,7 @@ impl Backend for MemoryBackend {
 mod tests {
     use super::*;
 
-    /// Test-only single-key writes over `commit` (mirrors the removed
-    /// `create`/`update`/`delete` convenience methods).
+    /// Test-only single-key writes over `commit`.
     async fn put(b: &MemoryBackend, key: &[u8], value: &[u8]) -> Revision {
         let key = Bytes::copy_from_slice(key);
         let revision = b.current_revision().await + 1;
@@ -411,7 +416,7 @@ mod tests {
         let (_, kv) = get(&b, b"a", 0).await;
         assert_eq!(kv.unwrap().value, Bytes::from("1"));
         update(&b, b"a", b"2").await;
-        let (rev, kvs, count) = b.list(b"a", None, ListOptions::default()).await.unwrap();
+        let (_, kvs, count) = b.list(b"a", None, ListOptions::default()).await.unwrap();
         assert_eq!(count, 1);
         assert_eq!(kvs[0].value, Bytes::from("2"));
         // prefix convention checks
@@ -420,7 +425,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(kvs_all.len(), 1);
-        let _ = rev;
         del(&b, b"a").await;
         let (_, kv) = get(&b, b"a", 0).await;
         assert!(kv.is_none());

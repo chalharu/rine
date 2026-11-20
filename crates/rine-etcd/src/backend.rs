@@ -10,7 +10,32 @@ use crate::error::Result;
 pub type Revision = i64;
 pub type LeaseId = i64;
 
-pub(crate) fn in_range(key: &[u8], start: &[u8], end: Option<&[u8]>) -> bool {
+/// Mutual exclusion between user writes and lease expiry/revoke.
+/// Owned by the server and shared by `KvService` and `LeaseManager`;
+/// storage-level serialization additionally lives in each `Backend`.
+pub type CommitLock = Arc<tokio::sync::Mutex<()>>;
+
+pub fn new_commit_lock() -> CommitLock {
+    Arc::new(tokio::sync::Mutex::new(()))
+}
+
+/// Single-member cluster identity (k8s apiserver health/discovery only).
+pub const CLUSTER_ID: u64 = 0x7269_6e65_0000_0001;
+pub const MEMBER_ID: u64 = 0x7269_6e65_0000_0002;
+/// Pinned so k8s apiserver health checks accept `Status.version`.
+pub const VERSION: &str = "3.5.0";
+
+pub fn header(revision: Revision) -> crate::etcdserverpb::ResponseHeader {
+    crate::etcdserverpb::ResponseHeader {
+        cluster_id: CLUSTER_ID,
+        member_id: MEMBER_ID,
+        revision,
+        raft_term: 0,
+    }
+}
+
+/// Etcd range predicate: empty end = single key, `[0]` = `>= key`, else `[key, end)`.
+pub fn in_range(key: &[u8], start: &[u8], end: Option<&[u8]>) -> bool {
     match end {
         None | Some([]) => key == start,
         Some([0]) => key >= start,
@@ -74,6 +99,18 @@ pub struct ObservedRange {
     pub observed: Vec<(Bytes, Revision)>,
     /// Full count before limiting.
     pub count: i64,
+}
+
+impl ObservedRange {
+    /// True when a fresh backend-level read still shows the same snapshot.
+    pub fn matches_snapshot(&self, kvs: &[(Bytes, Revision)], count: i64) -> bool {
+        count == self.count
+            && kvs.len() == self.observed.len()
+            && kvs
+                .iter()
+                .zip(self.observed.iter())
+                .all(|((k, r), (ek, er))| k == ek && r == er)
+    }
 }
 
 #[async_trait]

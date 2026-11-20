@@ -34,22 +34,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Keeps the original error (e.g. [`tokio::task::JoinError`]) as the
 /// [`source`](std::error::Error::source) instead of stringifying it, so
 /// `is_cancelled` / `is_panic` / downcasting still work downstream.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{what}: {error}")]
 struct SpawnFailed {
     what: &'static str,
+    #[source]
     error: Box<dyn std::error::Error + Send + Sync>,
-}
-
-impl std::fmt::Display for SpawnFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.what, self.error)
-    }
-}
-
-impl std::error::Error for SpawnFailed {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&*self.error)
-    }
 }
 
 impl Error {
@@ -60,6 +50,25 @@ impl Error {
             what,
             error: Box::new(error),
         }))
+    }
+}
+
+/// Map storage errors to etcd API statuses. Lives here (not in `kv`) so
+/// `watch` does not depend on `kv` for error text.
+pub fn status_err(e: Error) -> tonic::Status {
+    match e {
+        Error::Compacted { .. } => {
+            tonic::Status::out_of_range("etcdserver: mvcc: required revision has been compacted")
+        }
+        Error::FutureRev { .. } => {
+            tonic::Status::out_of_range("etcdserver: mvcc: required revision is a future revision")
+        }
+        Error::Conflict => tonic::Status::aborted("storage revision changed during transaction"),
+        Error::KeyExists(_) => tonic::Status::already_exists("key already exists"),
+        Error::Backend(s) => tonic::Status::internal(s.to_string()),
+        Error::TableMissing(s) | Error::AlreadyExists(s) | Error::LockContention(s) => {
+            tonic::Status::internal(s)
+        }
     }
 }
 

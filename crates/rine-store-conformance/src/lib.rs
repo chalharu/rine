@@ -1,6 +1,6 @@
 //! Shared conformance suite for [`Backend`](rine_etcd::Backend) implementations.
 //!
-//! Every storage backend (memory, SQLite, Oracle, mocks) upholds the same
+//! Every storage backend (memory, SQLite, Oracle) upholds the same
 //! MVCC contract; these scenarios are generic over the [`Backend`] trait, so
 //! each backend crate only wires construction (plus its backend-specific
 //! behavior) and gets the contract coverage for free. `ns` namespaces all
@@ -137,7 +137,8 @@ pub async fn kv_delete<B: Backend>(b: &B, key: &[u8]) -> Result<(Revision, Optio
 pub async fn crud<B: Backend>(b: &B, ns: &str) {
     let a = key(ns, "a");
     let r1 = kv_create(b, a.clone(), val("1"), 0).await.unwrap();
-    assert!(kv_create(b, a.clone(), val("x"), 0).await.is_err());
+    let err = kv_create(b, a.clone(), val("x"), 0).await.unwrap_err();
+    assert!(matches!(err, Error::Conflict));
     let (_, kv) = kv_get(b, &a, 0).await.unwrap();
     assert_eq!(kv.unwrap().value, val("1"));
     kv_update(b, a.clone(), val("2"), 0, 0).await.unwrap();
