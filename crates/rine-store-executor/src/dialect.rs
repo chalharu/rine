@@ -12,7 +12,10 @@ pub trait Dialect: Send + Sync + 'static {
     fn create_table_sql() -> &'static str;
     fn create_indexes_sql() -> &'static [&'static str];
 
-    /// Idempotent index DDL to apply to new and existing tables.
+    /// Index DDL applied to pre-existing tables (idempotent: re-running
+    /// tolerates an already-existing index). Fresh tables get these from
+    /// `create_indexes_sql`; tables created before an index existed converge
+    /// here instead of failing or running degraded.
     fn ensure_indexes_sql() -> &'static [&'static str] {
         &[]
     }
@@ -107,18 +110,6 @@ pub trait Dialect: Send + Sync + 'static {
     fn set_compact_rev_insert_sql() -> &'static str;
 
     fn db_size_sql() -> &'static str;
-
-    /// Correctness-critical indexes as (probe name, creation DDL) pairs.
-    ///
-    /// The unique backstop index is required for optimistic-concurrency
-    /// safety; without it a concurrent commit could slip through. Startup
-    /// verifies these and creates what is missing, so a DBA-prepared table
-    /// without DDL privileges on our side still works as long as the objects
-    /// exist. Performance-only indexes do not belong here.
-    fn required_indexes() -> &'static [(&'static str, &'static str)];
-
-    /// `SELECT 1`-style probe for one index by name (single bind parameter).
-    fn index_probe_sql() -> String;
 
     /// Revision bookkeeping mirrors rine's `compact_rev_key` row.
     fn compacted_rev_key() -> &'static str {

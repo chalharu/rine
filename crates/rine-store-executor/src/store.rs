@@ -53,28 +53,16 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         }
     }
 
-    /// Bring the schema to the state the backend needs (server startup path),
-    /// creating only what is missing:
-    /// - table absent → create table plus all indexes;
-    /// - table present but a required index absent → create just that index;
-    /// - everything present (e.g. DBA-prepared, no DDL privilege on our
-    ///   side) → do nothing.
-    ///
+    /// Bring the schema to the state the backend needs (server startup path).
     /// A concurrent creator racing us surfaces `AlreadyExists`, which is
     /// tolerated. Classification happens in the driver (`cvt_error`), so the
     /// generic code matches typed variants instead of parsing messages.
     ///
-    /// When creation fails (e.g. insufficient privileges) the schema is
-    /// re-probed: if another node or the DBA converged it meanwhile we
-    /// proceed; otherwise startup aborts with an actionable error naming the
-    /// missing objects instead of running degraded.
-    ///
-    /// A concurrent DROP (parallel live tests sharing one schema, a DBA
-    /// migration) can pull the table from under a single pass, surfacing
-    /// `TableMissing` from an index statement or probe. That is transient by
-    /// definition — someone else is converging the schema — so the whole
-    /// pass restarts on `TableMissing` (bounded). Anything else, including
-    /// the converged-or-explain abort, fails fast.
+    /// A concurrent DROP can pull the table from under a single pass,
+    /// surfacing `TableMissing` from an index statement or probe. That is
+    /// transient by definition — someone else is converging the schema — so
+    /// the whole pass restarts on `TableMissing` (bounded). Anything else
+    /// fails fast.
     pub async fn ensure_schema(&self) -> Result<()> {
         let mut delay = Duration::from_millis(50);
         for _ in 0..10 {
@@ -96,15 +84,20 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
             Err(Error::TableMissing(_)) => self.create_schema().await,
             Err(e) => Err(e),
         }?;
-        for stmt in D::ensure_indexes_sql() {
+        // `create_indexes_sql` covers fresh tables; `ensure_indexes_sql`
+        // converges pre-existing tables missing an index. Re-running either
+        // tolerates a concurrent creator via `AlreadyExists`.
+        for stmt in D::create_indexes_sql()
+            .iter()
+            .chain(D::ensure_indexes_sql().iter())
+        {
             self.create_statement_with_retry(stmt).await?;
         }
-        self.ensure_required_indexes().await
+        Ok(())
     }
 
     /// DDL statements that fully provision the schema, for operators who
-    /// pre-create objects with a privileged user (no DDL privilege needed at
-    /// runtime as long as table plus [`Dialect::required_indexes`] exist).
+    /// pre-create objects with a privileged user.
     pub fn schema_statements() -> Vec<&'static str> {
         std::iter::once(D::create_table_sql())
             .chain(D::create_indexes_sql().iter().copied())
@@ -115,86 +108,15 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
     /// Run the DDL. Each statement tolerates a concurrent creator
     /// (already-exists) and retries a transient lock conflict with a
     /// concurrent writer (e.g. `CREATE INDEX` racing DML on a fresh database),
-    /// so simultaneous startups on any number of nodes converge. If a
-    /// statement still fails (e.g. no DDL privilege), re-probe: a schema
-    /// converged by someone else is accepted, otherwise the error names the
-    /// missing objects so the operator knows what to pre-create.
+    /// so simultaneous startups on any number of nodes converge.
     /// Migrations are out of scope for now.
     pub async fn create_schema(&self) -> Result<()> {
         for stmt in
             std::iter::once(D::create_table_sql()).chain(D::create_indexes_sql().iter().copied())
         {
-            if let Err(e) = self.create_statement_with_retry(stmt).await {
-                return self.converged_or_err(e).await;
-            }
+            self.create_statement_with_retry(stmt).await?;
         }
         Ok(())
-    }
-
-    /// Create required indexes absent from a pre-existing table. Same
-    /// converge-or-explain rule as [`Self::create_schema`].
-    async fn ensure_required_indexes(&self) -> Result<()> {
-        for (name, ddl) in D::required_indexes() {
-            if self.index_present(name).await? {
-                continue;
-            }
-            if let Err(e) = self.create_statement_with_retry(ddl).await {
-                return self.converged_or_err(e).await;
-            }
-        }
-        Ok(())
-    }
-
-    /// True when the required index `name` already exists.
-    async fn index_present(&self, name: &str) -> Result<bool> {
-        Ok(self
-            .exec
-            .query_row(&D::index_probe_sql(), vec![SqlValue::Str(name.to_string())])
-            .await?
-            .is_some())
-    }
-
-    /// After a DDL failure, accept a schema someone else converged and
-    /// otherwise explain exactly what is missing (plus the original error).
-    /// A `TableMissing` failure is passed through untouched: the table
-    /// vanished under us (concurrent DROP), which the [`Self::ensure_schema`]
-    /// retry loop treats as "restart the pass", not as a broken schema.
-    /// (A genuinely absent table with no DDL privilege fails table creation
-    /// with a privilege error, never `TableMissing`, so the actionable abort
-    /// below still fires for that case.)
-    async fn converged_or_err(&self, err: Error) -> Result<()> {
-        if matches!(err, Error::TableMissing(_)) {
-            return Err(err);
-        }
-        let missing = self.missing_objects().await?;
-        if missing.is_empty() {
-            return Ok(());
-        }
-        Err(Error::Backend(
-            format!(
-                "rine schema is incomplete (missing: {}) and automatic creation failed ({err}); \
-             pre-create the table and required indexes with a privileged user, then restart",
-                missing.join(", ")
-            )
-            .into(),
-        ))
-    }
-
-    /// Names of absent objects: the table and/or required index names.
-    /// Best-effort: probe errors here are reported as missing, since the
-    /// caller already holds the original failure.
-    async fn missing_objects(&self) -> Result<Vec<String>> {
-        let mut out = Vec::new();
-        match self.exec.query_row(D::probe_sql(), vec![]).await {
-            Ok(_) => {}
-            Err(_) => return Ok(vec!["table `rine`".into()]),
-        }
-        for (name, _) in D::required_indexes() {
-            if !self.index_present(name).await.unwrap_or(true) {
-                out.push(format!("index `{name}`"));
-            }
-        }
-        Ok(out)
     }
 
     async fn create_statement_with_retry(&self, stmt: &str) -> Result<()> {
@@ -366,13 +288,11 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
                 &observed.opts,
             )
             .await?;
-        if count != observed.count
-            || kvs.len() != observed.observed.len()
-            || kvs
-                .iter()
-                .zip(observed.observed.iter())
-                .any(|(kv, (key, rev))| kv.key.as_ref() != key.as_ref() || kv.mod_revision != *rev)
-        {
+        let snapshot: Vec<(bytes::Bytes, Revision)> = kvs
+            .iter()
+            .map(|kv| (kv.key.clone(), kv.mod_revision))
+            .collect();
+        if !observed.matches_snapshot(&snapshot, count) {
             return Err(Error::Conflict);
         }
         Ok(())
@@ -390,16 +310,17 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         reads: &ReadSet,
         events: Vec<Event>,
     ) -> Result<(Revision, Vec<Event>)> {
-        let written: HashSet<&[u8]> = events.iter().map(|e| e.key.as_ref()).collect();
-        let mut seen: HashSet<&[u8]> = HashSet::new();
-        let mut guard_only: Vec<&[u8]> = Vec::new();
-        for (key, _) in &reads.points {
-            let key: &[u8] = key.as_ref();
-            if written.contains(key) || !seen.insert(key) {
-                continue;
-            }
-            guard_only.push(key);
+        // First observation wins, mirroring the transaction's own recording.
+        let mut expected: HashMap<&[u8], Option<Revision>> = HashMap::new();
+        for (key, rev) in &reads.points {
+            expected.entry(key.as_ref()).or_insert(*rev);
         }
+        let written: HashSet<&[u8]> = events.iter().map(|e| e.key.as_ref()).collect();
+        let guard_only: Vec<&[u8]> = expected
+            .keys()
+            .copied()
+            .filter(|key| !written.contains(*key))
+            .collect();
         // One trip for all guard-only reads plus the revision assignment.
         // The newest physical row carries the highest logical revision:
         // revisions are assigned strictly increasing, so ordering by id and
@@ -426,13 +347,8 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
                 let kv = row_to_kv(row)?;
                 live.entry(kv.key.to_vec()).or_insert(kv.mod_revision);
             }
-            for key in guard_only {
-                let expected = reads
-                    .points
-                    .iter()
-                    .find(|(k, _)| k.as_ref() == key)
-                    .and_then(|(_, rev)| *rev);
-                if live.get(key).copied() != expected {
+            for key in &guard_only {
+                if live.get(*key).copied() != expected[key] {
                     return Err(Error::Conflict);
                 }
             }
@@ -497,16 +413,11 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
             // The batched snapshot doubles as the guard validation for keys
             // this batch also writes: same lock, same state, no extra query.
             let live_row = live.get(&name);
-            if let Some(expected) = reads
-                .points
-                .iter()
-                .find(|(k, _)| k.as_ref() == event.key.as_ref())
-                .map(|(_, rev)| *rev)
-            {
+            if let Some(expected) = expected.get(event.key.as_ref()) {
                 let current = live_row
                     .map(|row| row_to_kv(row).map(|kv| kv.mod_revision))
                     .transpose()?;
-                if current != expected {
+                if current != *expected {
                     return Err(Error::Conflict);
                 }
             }
@@ -801,14 +712,11 @@ mod tests {
         fn create_indexes_sql() -> &'static [&'static str] {
             &[]
         }
+        fn ensure_indexes_sql() -> &'static [&'static str] {
+            &["CREATE INDEX idx_test"]
+        }
         fn probe_sql() -> &'static str {
             "PROBE TABLE"
-        }
-        fn required_indexes() -> &'static [(&'static str, &'static str)] {
-            &[("idx_test", "CREATE INDEX idx_test")]
-        }
-        fn index_probe_sql() -> String {
-            "PROBE INDEX".into()
         }
         fn bind(_index: usize) -> String {
             "?".into()
@@ -933,12 +841,15 @@ mod tests {
         );
     }
 
-    /// A persistent privilege failure must still abort with the actionable
-    /// missing-object error instead of being retried away.
+    /// A persistent privilege failure must still abort instead of being
+    /// retried away.
     #[tokio::test]
     async fn ensure_schema_still_aborts_without_ddl_privilege() {
         let backend = SqlBackend::<DenyExec, TestDialect>::new(Arc::new(DenyExec));
         let err = backend.ensure_schema().await.unwrap_err();
-        assert!(err.to_string().contains("idx_test"), "{err:?}");
+        assert!(
+            err.to_string().contains("insufficient privileges"),
+            "{err:?}"
+        );
     }
 }

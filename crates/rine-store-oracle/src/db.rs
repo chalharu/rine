@@ -169,6 +169,18 @@ fn query_all_on(
     Ok(out)
 }
 
+fn apply_batch(
+    conn: &oracledb::Connection,
+    statements: Vec<(String, Vec<SqlValue>)>,
+) -> std::result::Result<(), oracledb::Error> {
+    for (sql, params) in statements {
+        let owned: Vec<_> = params.iter().map(OwnedParam::from).collect();
+        let refs: Vec<_> = owned.iter().map(as_bind).collect();
+        conn.execute(&sql, &refs)?;
+    }
+    Ok(())
+}
+
 fn is_no_data(e: &oracledb::Error) -> bool {
     e.kind() == &oracledb::ErrorKind::NoDataFound || e.db_error_code() == Some(1403)
 }
@@ -180,23 +192,12 @@ impl SqlExecutor for OracleDb {
             // Inside a commit unit the table lock serializes writers; the
             // unit boundary commits, so statements must not commit one by one.
             return self
-                .run_blocking(move |conn| {
-                    for (sql, params) in statements {
-                        let owned: Vec<_> = params.iter().map(OwnedParam::from).collect();
-                        let refs: Vec<_> = owned.iter().map(as_bind).collect();
-                        conn.execute(&sql, &refs)?;
-                    }
-                    Ok(())
-                })
+                .run_blocking(move |conn| apply_batch(conn, statements))
                 .await;
         }
         self.run_blocking(move |conn| {
             let result = (|| {
-                for (sql, params) in statements {
-                    let owned: Vec<_> = params.iter().map(OwnedParam::from).collect();
-                    let refs: Vec<_> = owned.iter().map(as_bind).collect();
-                    conn.execute(&sql, &refs)?;
-                }
+                apply_batch(conn, statements)?;
                 conn.commit()
             })();
             if result.is_err() {

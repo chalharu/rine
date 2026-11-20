@@ -117,6 +117,17 @@ impl ToSql for Bind<'_> {
     }
 }
 
+fn apply_batch(
+    conn: &rusqlite::Connection,
+    statements: Vec<(String, Vec<SqlValue>)>,
+) -> rusqlite::Result<()> {
+    for (sql, params) in statements {
+        conn.prepare_cached(&sql)?
+            .execute(rusqlite::params_from_iter(params.iter().map(Bind)))?;
+    }
+    Ok(())
+}
+
 fn query(
     conn: &rusqlite::Connection,
     sql: &str,
@@ -173,21 +184,12 @@ impl SqlExecutor for SqliteDb {
             // IMMEDIATE; run the statements directly instead of nesting a
             // second transaction.
             return self
-                .run_blocking(move |conn| {
-                    for (sql, params) in statements {
-                        conn.prepare_cached(&sql)?
-                            .execute(rusqlite::params_from_iter(params.iter().map(Bind)))?;
-                    }
-                    Ok(())
-                })
+                .run_blocking(move |conn| apply_batch(conn, statements))
                 .await;
         }
         self.run_blocking(move |conn| {
             let tx = conn.unchecked_transaction()?;
-            for (sql, params) in statements {
-                tx.prepare_cached(&sql)?
-                    .execute(rusqlite::params_from_iter(params.iter().map(Bind)))?;
-            }
+            apply_batch(&tx, statements)?;
             tx.commit()
         })
         .await

@@ -1,10 +1,7 @@
-//! SQL dialects for `rine` backends.
-//!
 //! [`Dialect`] abstracts the per-database SQL (`:1` vs `?` placeholders,
-//! DDL, a few functions); the MVCC logic in `SqlBackend` is shared. The
-//! strings are covered by unit tests (via `MockExec`) so SQL regressions are
-//! caught without a database; the live XE test in CI covers Oracle against a
-//! real database.
+//! DDL, a few functions); the MVCC logic in `SqlBackend` is shared.
+//! Placeholder style is covered by unit tests below; the live XE test in CI
+//! covers Oracle against a real database.
 
 use rine_etcd::backend::ListOptions;
 use rine_store_executor::Dialect;
@@ -44,6 +41,13 @@ impl Dialect for OracleDialect {
     }
 
     fn create_indexes_sql() -> &'static [&'static str] {
+        CREATE_INDEXES
+    }
+
+    /// Pre-existing tables converge here: every index is re-attempted and a
+    /// concurrent creator's `AlreadyExists` is tolerated, so no index probe
+    /// is needed.
+    fn ensure_indexes_sql() -> &'static [&'static str] {
         CREATE_INDEXES
     }
 
@@ -142,21 +146,6 @@ impl Dialect for OracleDialect {
 
     fn db_size_sql() -> &'static str {
         "SELECT NVL(SUM(LENGTH(name) + NVL(DBMS_LOB.GETLENGTH(value), 0)), 0) FROM rine"
-    }
-
-    fn required_indexes() -> &'static [(&'static str, &'static str)] {
-        // Unquoted identifiers are stored uppercase in `user_indexes`.
-        &[(
-            "RINE_NAME_PREV_REVISION_INDEX",
-            "CREATE UNIQUE INDEX rine_name_prev_revision_index ON rine(name, prev_revision)",
-        )]
-    }
-
-    fn index_probe_sql() -> String {
-        format!(
-            "SELECT 1 FROM user_indexes WHERE index_name = {}",
-            Self::bind(1)
-        )
     }
 }
 
