@@ -52,7 +52,29 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
     /// re-probed: if another node or the DBA converged it meanwhile we
     /// proceed; otherwise startup aborts with an actionable error naming the
     /// missing objects instead of running degraded.
+    ///
+    /// A concurrent DROP (parallel live tests sharing one schema, a DBA
+    /// migration) can pull the table from under a single pass, surfacing
+    /// `TableMissing` from an index statement or probe. That is transient by
+    /// definition — someone else is converging the schema — so the whole
+    /// pass restarts on `TableMissing` (bounded). Anything else, including
+    /// the converged-or-explain abort, fails fast.
     pub async fn ensure_schema(&self) -> Result<()> {
+        let mut delay = Duration::from_millis(50);
+        for _ in 0..10 {
+            match self.ensure_schema_once().await {
+                Ok(()) => return Ok(()),
+                Err(Error::TableMissing(_)) => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(2));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.ensure_schema_once().await
+    }
+
+    async fn ensure_schema_once(&self) -> Result<()> {
         match self.exec.query_row(D::probe_sql(), vec![]).await {
             Ok(_) => Ok(()),
             Err(Error::TableMissing(_)) => self.create_schema().await,
@@ -118,7 +140,16 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
 
     /// After a DDL failure, accept a schema someone else converged and
     /// otherwise explain exactly what is missing (plus the original error).
+    /// A `TableMissing` failure is passed through untouched: the table
+    /// vanished under us (concurrent DROP), which the [`Self::ensure_schema`]
+    /// retry loop treats as "restart the pass", not as a broken schema.
+    /// (A genuinely absent table with no DDL privilege fails table creation
+    /// with a privilege error, never `TableMissing`, so the actionable abort
+    /// below still fires for that case.)
     async fn converged_or_err(&self, err: Error) -> Result<()> {
+        if matches!(err, Error::TableMissing(_)) {
+            return Err(err);
+        }
         let missing = self.missing_objects().await?;
         if missing.is_empty() {
             return Ok(());
@@ -787,5 +818,185 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
 impl<E: SqlExecutor, D: Dialect> std::fmt::Debug for SqlBackend<E, D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SqlBackend")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Minimal dialect: only the schema path is real.
+    struct TestDialect;
+    impl Dialect for TestDialect {
+        fn create_table_sql() -> &'static str {
+            "CREATE TABLE rine"
+        }
+        fn create_indexes_sql() -> &'static [&'static str] {
+            &[]
+        }
+        fn probe_sql() -> &'static str {
+            "PROBE TABLE"
+        }
+        fn required_indexes() -> &'static [(&'static str, &'static str)] {
+            &[("idx_test", "CREATE INDEX idx_test")]
+        }
+        fn index_probe_sql() -> String {
+            "PROBE INDEX".into()
+        }
+        fn bind(_index: usize) -> String {
+            "?".into()
+        }
+        fn first_row() -> &'static str {
+            ""
+        }
+        fn compact_revision_sql() -> &'static str {
+            unimplemented!()
+        }
+        fn compacted_rev_sql() -> &'static str {
+            unimplemented!()
+        }
+        fn live_by_name_sql() -> String {
+            unimplemented!()
+        }
+        fn resolve_id_sql() -> &'static str {
+            unimplemented!()
+        }
+        fn history_by_name_sql() -> String {
+            unimplemented!()
+        }
+        fn events_sql() -> String {
+            unimplemented!()
+        }
+        fn get_sql() -> String {
+            unimplemented!()
+        }
+        fn list_exact_sql() -> String {
+            unimplemented!()
+        }
+        fn list_ge_sql() -> String {
+            unimplemented!()
+        }
+        fn list_range_sql() -> String {
+            unimplemented!()
+        }
+        fn insert_sql() -> &'static str {
+            unimplemented!()
+        }
+        fn mark_deleted_sql() -> &'static str {
+            unimplemented!()
+        }
+        fn set_deleted_by_id_sql() -> &'static str {
+            unimplemented!()
+        }
+        fn set_create_rev_sql() -> &'static str {
+            unimplemented!()
+        }
+        fn compact_delete_sql() -> &'static str {
+            unimplemented!()
+        }
+        fn set_compact_rev_sql() -> &'static str {
+            unimplemented!()
+        }
+        fn set_compact_rev_insert_sql() -> &'static str {
+            unimplemented!()
+        }
+        fn db_size_sql() -> &'static str {
+            unimplemented!()
+        }
+    }
+
+    /// Injects `drops` transient `TableMissing` failures on index creation,
+    /// then converges — a parallel DROP TABLE landing mid-ensure.
+    struct RacyExec {
+        drops: AtomicUsize,
+        ddl_calls: AtomicUsize,
+    }
+
+    impl RacyExec {
+        fn new(drops: usize) -> Self {
+            Self {
+                drops: AtomicUsize::new(drops),
+                ddl_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SqlExecutor for RacyExec {
+        async fn execute(&self, sql: &str, _params: Vec<SqlValue>) -> Result<u64> {
+            self.ddl_calls.fetch_add(1, Ordering::SeqCst);
+            if sql == "CREATE INDEX idx_test" && self.drops.load(Ordering::SeqCst) > 0 {
+                self.drops.fetch_sub(1, Ordering::SeqCst);
+                return Err(Error::TableMissing("table dropped mid-ensure".into()));
+            }
+            Ok(1)
+        }
+        async fn execute_batch(&self, _statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
+            Ok(())
+        }
+        async fn query_row(&self, sql: &str, _params: Vec<SqlValue>) -> Result<Option<Row>> {
+            match sql {
+                "PROBE TABLE" => Ok(Some(Row {
+                    values: vec![SqlValue::Int(1)],
+                })),
+                // Index never present: forces the CREATE INDEX path.
+                _ => Ok(None),
+            }
+        }
+        async fn query_all(&self, _sql: &str, _params: Vec<SqlValue>) -> Result<Vec<Row>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Denies all DDL with a privilege error: DBA-prepared schema missing a
+    /// required index plus no DDL grant must keep failing fast.
+    struct DenyExec;
+
+    #[async_trait]
+    impl SqlExecutor for DenyExec {
+        async fn execute(&self, _sql: &str, _params: Vec<SqlValue>) -> Result<u64> {
+            Err(Error::Backend("ORA-01031: insufficient privileges".into()))
+        }
+        async fn execute_batch(&self, _statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
+            Ok(())
+        }
+        async fn query_row(&self, sql: &str, _params: Vec<SqlValue>) -> Result<Option<Row>> {
+            match sql {
+                "PROBE TABLE" => Ok(Some(Row {
+                    values: vec![SqlValue::Int(1)],
+                })),
+                _ => Ok(None),
+            }
+        }
+        async fn query_all(&self, _sql: &str, _params: Vec<SqlValue>) -> Result<Vec<Row>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Regression test for the CI failure in `live_stale_point_read_is_conflict`:
+    /// a parallel DROP TABLE between probe and CREATE INDEX (ORA-00942) must
+    /// restart the pass and converge, not abort startup.
+    #[tokio::test]
+    async fn ensure_schema_survives_concurrent_drop() {
+        let exec = Arc::new(RacyExec::new(1));
+        let backend = SqlBackend::<RacyExec, TestDialect>::new(exec.clone());
+        backend
+            .ensure_schema()
+            .await
+            .expect("must converge after concurrent DROP");
+        assert!(
+            exec.ddl_calls.load(Ordering::SeqCst) >= 2,
+            "expected a retried CREATE INDEX"
+        );
+    }
+
+    /// A persistent privilege failure must still abort with the actionable
+    /// missing-object error instead of being retried away.
+    #[tokio::test]
+    async fn ensure_schema_still_aborts_without_ddl_privilege() {
+        let backend = SqlBackend::<DenyExec, TestDialect>::new(Arc::new(DenyExec));
+        let err = backend.ensure_schema().await.unwrap_err();
+        assert!(err.to_string().contains("idx_test"), "{err:?}");
     }
 }
