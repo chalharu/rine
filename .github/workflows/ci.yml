@@ -18,9 +18,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2.9.3
-      - name: unit tests
-        run: cargo test --workspace
+      - name: install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: unit tests with coverage
+        run: |
+          mkdir -p coverage
+          cargo llvm-cov --workspace --lcov --output-path coverage/lcov-unit.info
+      - name: upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-unit
+          path: coverage/lcov-unit.info
+          if-no-files-found: error
       - name: clippy
         run: cargo clippy --workspace --tests
 
@@ -53,6 +66,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2.9.3
       - name: wait for Oracle XE (TCP + PDB open)
         run: |
@@ -66,10 +80,24 @@ jobs:
           done
           echo "Oracle XE did not open port 1521 in time"
           exit 1
+      - name: install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
       - name: backend integration test (live XE)
-        run: cargo test -p rine-store-oracle --test live_oracle -- --nocapture
+        run: |
+          mkdir -p coverage
+          cargo llvm-cov --no-report -p rine-store-oracle --test live_oracle -- --nocapture
       - name: full workspace tests against live XE
-        run: cargo test --workspace
+        run: |
+          cargo llvm-cov --no-report --workspace
+          cargo llvm-cov report --lcov --output-path coverage/lcov-oracle.info
+      - name: upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-oracle
+          path: coverage/lcov-oracle.info
+          if-no-files-found: error
 
   sqlite-e2e:
     name: official client e2e (SQLite and upstream etcd)
@@ -218,3 +246,21 @@ jobs:
       - name: rine server log
         if: failure()
         run: cat /tmp/rine.log
+
+  sonarcloud:
+    name: SonarCloud analysis
+    runs-on: ubuntu-latest
+    needs: [unit, oracle-xe]
+    steps:
+      - uses: actions/checkout@v4.4.0
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: coverage
+          merge-multiple: true
+      - name: SonarCloud scan
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
