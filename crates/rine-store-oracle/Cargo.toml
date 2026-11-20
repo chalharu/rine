@@ -21,9 +21,4 @@ tokio.workspace = true
 
 [dev-dependencies]
 rine-store-conformance.workspace = true
-rine-store-oracle = { features = ["mock"], workspace = true }
 tonic.workspace = true
-
-[features]
-default = []
-mock = []

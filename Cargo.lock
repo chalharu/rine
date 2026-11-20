@@ -1666,7 +1666,6 @@ dependencies = [
  "rine-etcd",
  "rine-store-conformance",
  "rine-store-executor",
- "rine-store-oracle",
  "tokio",
  "tonic",
 ]
