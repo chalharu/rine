@@ -44,6 +44,10 @@ impl<E: SqlExecutor, D: Dialect> Clone for SqlBackend<E, D> {
     }
 }
 
+/// Maximum keys per commit-lookup statement (Oracle caps `IN` lists at 1000;
+/// larger batches run the same statement once per chunk and merge).
+const COMMIT_NAMES_PER_QUERY: usize = 1000;
+
 impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
     pub fn new(exec: Arc<E>) -> Self {
         let (tx, _) = broadcast::channel(BROADCAST_CAP);
@@ -187,61 +191,6 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         Ok(cur)
     }
 
-    async fn list_live(
-        &self,
-        start: &[u8],
-        end: Option<&[u8]>,
-        opts: &ListOptions,
-        rows_sql: Option<String>,
-        count_sql: Option<String>,
-    ) -> Result<(Revision, Vec<KeyValue>, i64)> {
-        let mut params = vec![SqlValue::Str(key_str(start))];
-        if let Some(end) = end.filter(|end| !end.is_empty() && *end != [0]) {
-            params.push(SqlValue::Str(key_str(end)));
-        }
-        let has_rows = rows_sql.is_some();
-        let has_count = count_sql.is_some();
-        let mut queries = vec![(D::current_revision_sql(), vec![])];
-        if let Some(sql) = rows_sql {
-            let mut binds = params.clone();
-            if opts.limit > 0 {
-                binds.push(SqlValue::Int(opts.limit));
-            }
-            queries.push((sql, binds));
-        }
-        if let Some(sql) = count_sql {
-            queries.push((sql, params));
-        }
-        let mut results = self.exec.query_batch(queries).await?.into_iter();
-        let cur = results
-            .next()
-            .and_then(|rows| rows.into_iter().next())
-            .map(|r| r.get_int(0))
-            .transpose()?
-            .unwrap_or(1)
-            .max(1);
-        let mut kvs = Vec::new();
-        if has_rows {
-            let rows = results
-                .next()
-                .ok_or_else(|| Error::Backend("missing range result".into()))?;
-            kvs.reserve(rows.len());
-            for r in &rows {
-                kvs.push(row_to_kv(r)?);
-            }
-        }
-        let count = if has_count {
-            results
-                .next()
-                .and_then(|rows| rows.into_iter().next())
-                .ok_or_else(|| Error::Backend("missing range count".into()))?
-                .get_int(0)?
-        } else {
-            kvs.len() as i64
-        };
-        Ok((cur, kvs, count))
-    }
-
     /// Backend-level range/list read without taking the write mutex. Reads the
     /// committed state; inside a commit unit it observes the unit's snapshot.
     async fn list_inner(
@@ -250,9 +199,10 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         range_end: Option<&[u8]>,
         opts: &ListOptions,
     ) -> Result<(Revision, Vec<KeyValue>, i64)> {
-        if opts.revision <= 0
-            && let Some(sql) = D::live_range_sql(range_end, opts)
-        {
+        // Latest reads ride one statement carrying revision/count metadata
+        // plus the rows; the NULL-id row survives empty ranges.
+        if opts.revision <= 0 {
+            let sql = D::live_range_sql(range_end, opts);
             let mut params = vec![SqlValue::Str(key_str(prefix))];
             if let Some(end) = range_end.filter(|end| !end.is_empty() && *end != [0]) {
                 params.push(SqlValue::Str(key_str(end)));
@@ -277,13 +227,6 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
                 meta.get_int(1)?
             };
             return Ok((revision, kvs, total));
-        }
-        if opts.revision <= 0
-            && let Some((rows_sql, count_sql)) = D::live_range_queries(range_end, opts)
-        {
-            return self
-                .list_live(prefix, range_end, opts, rows_sql, count_sql)
-                .await;
         }
         let cur = self.check_rev(opts.revision).await?;
         let (mut sql, mut params) = match range_end {
@@ -342,10 +285,9 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
     /// Validate `reads`, assign `MAX(revision) + 1` to `events`, and write
     /// them. The caller holds the commit unit (cross-node lock) across this.
     ///
-    /// Guard reads on keys this batch also writes are folded into the
-    /// predecessor lookup below instead of costing an extra round trip (the
-    /// k8s compare-and-write-same-key pattern); guard-only keys share one
-    /// batched read with the revision assignment.
+    /// Guard reads (including keys this batch also writes, the k8s
+    /// compare-and-write-same-key pattern) are validated against one batched
+    /// per-key snapshot, so no key costs an extra round trip.
     async fn commit_guarded(
         &self,
         reads: &ReadSet,
@@ -357,12 +299,7 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
             expected.entry(key.as_ref()).or_insert(*rev);
         }
         let written: HashSet<&[u8]> = events.iter().map(|e| e.key.as_ref()).collect();
-        let guard_only: Vec<&[u8]> = expected
-            .keys()
-            .copied()
-            .filter(|key| !written.contains(*key))
-            .collect();
-        let names: Vec<_> = expected
+        let names: Vec<String> = expected
             .keys()
             .copied()
             .chain(written.iter().copied())
@@ -370,13 +307,35 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
             .into_iter()
             .map(key_str)
             .collect();
-        let optimized = if let Some(sql) = D::commit_state_sql(names.len()) {
-            let params = names.into_iter().map(SqlValue::Str).collect();
-            let rows = self.exec.query_all(&sql, params).await?;
+        // One lookup per chunk (empty commits still read the metadata row).
+        // The newest physical row carries the highest logical revision.
+        let no_names: &[String] = &[];
+        let chunks: Vec<&[String]> = {
+            let chunks: Vec<&[String]> = names.chunks(COMMIT_NAMES_PER_QUERY).collect();
+            if chunks.is_empty() {
+                vec![no_names]
+            } else {
+                chunks
+            }
+        };
+        let mut latest = HashMap::new();
+        let (mut fresh, mut id) = (0, 0);
+        for chunk in chunks {
+            let rows = self
+                .exec
+                .query_all(
+                    &D::commit_state_sql(chunk.len()),
+                    chunk
+                        .iter()
+                        .map(|name| SqlValue::Str(name.clone()))
+                        .collect(),
+                )
+                .await?;
             let meta = rows
                 .first()
                 .ok_or_else(|| Error::Backend("missing commit metadata".into()))?;
-            let mut state = HashMap::new();
+            fresh = meta.get_int(0)? + 1;
+            id = meta.get_int(1)?;
             for row in &rows {
                 if !row.is_null(2) {
                     let live = if row.is_null(4) {
@@ -384,111 +343,15 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
                     } else {
                         Some(row.get_int(4)?)
                     };
-                    state.insert(row.get_str(2)?, (row.get_int(3)?, live));
+                    latest.insert(row.get_str(2)?, (row.get_int(3)?, live));
                 }
             }
-            for (key, rev) in &expected {
-                if state.get(&key_str(key)).and_then(|(_, live)| *live) != *rev {
-                    return Err(Error::Conflict);
-                }
+        }
+        for (key, rev) in &expected {
+            if latest.get(&key_str(key)).and_then(|(_, live)| *live) != *rev {
+                return Err(Error::Conflict);
             }
-            Some((meta.get_int(0)? + 1, meta.get_int(1)?, state))
-        } else {
-            None
-        };
-        // The newest physical row carries the highest logical revision.
-        let (fresh, mut id, latest) = if let Some(state) = optimized {
-            state
-        } else {
-            let mut batch: Vec<(String, Vec<SqlValue>)> = Vec::new();
-            if !guard_only.is_empty() {
-                batch.push((
-                    D::live_by_names_sql(guard_only.len()),
-                    guard_only
-                        .iter()
-                        .map(|key| SqlValue::Str(key_str(key)))
-                        .collect(),
-                ));
-            }
-            batch.push((D::current_revision_sql(), vec![]));
-            let mut results = self.exec.query_batch(batch).await?.into_iter();
-            if !guard_only.is_empty() {
-                let rows = results
-                    .next()
-                    .ok_or_else(|| Error::Backend("missing guard read".into()))?;
-                let mut live: HashMap<Vec<u8>, Revision> = HashMap::new();
-                for row in &rows {
-                    let kv = row_to_kv(row)?;
-                    live.entry(kv.key.to_vec()).or_insert(kv.mod_revision);
-                }
-                for key in &guard_only {
-                    if live.get(*key).copied() != expected[key] {
-                        return Err(Error::Conflict);
-                    }
-                }
-            }
-            let fresh = match results.next().as_ref().and_then(|rows| rows.first()) {
-                Some(r) if !r.is_null(0) => r.get_int(0)?.max(1),
-                _ => 1,
-            } + 1;
-            if events.is_empty() {
-                for range in &reads.ranges {
-                    self.check_range(range).await?;
-                }
-                return Ok((fresh - 1, events));
-            }
-            // One batch for every written key's live row and latest id plus the
-            // id assignment, no matter how many keys the commit carries.
-            let mut names: Vec<String> = Vec::new();
-            {
-                let mut seen_names: HashSet<&[u8]> = HashSet::new();
-                for event in &events {
-                    if seen_names.insert(event.key.as_ref()) {
-                        names.push(key_str(&event.key));
-                    }
-                }
-            }
-            let name_params: Vec<SqlValue> =
-                names.iter().map(|n| SqlValue::Str(n.clone())).collect();
-            let mut results = self
-                .exec
-                .query_batch(vec![
-                    (D::live_by_names_sql(names.len()), name_params.clone()),
-                    (D::latest_ids_by_names_sql(names.len()), name_params),
-                    (D::last_row_id_sql().into(), vec![]),
-                ])
-                .await?
-                .into_iter();
-            let mut live: HashMap<String, Row> = HashMap::new();
-            for row in results
-                .next()
-                .ok_or_else(|| Error::Backend("missing live rows".into()))?
-            {
-                live.entry(row.get_str(1)?).or_insert(row);
-            }
-            let mut latest = HashMap::new();
-            for row in results
-                .next()
-                .ok_or_else(|| Error::Backend("missing latest ids".into()))?
-            {
-                latest.insert(row.get_str(0)?, (row.get_int(1)?, None));
-            }
-            let id = match results.next().as_ref().and_then(|rows| rows.first()) {
-                Some(row) if !row.is_null(0) => row.get_int(0)?.max(1),
-                _ => 1,
-            };
-            for (name, row) in live {
-                latest.insert(name, (row.get_int(0)?, Some(row.get_int(2)?)));
-            }
-            for event in &events {
-                if let Some(expected) = expected.get(event.key.as_ref())
-                    && latest.get(&key_str(&event.key)).and_then(|(_, live)| *live) != *expected
-                {
-                    return Err(Error::Conflict);
-                }
-            }
-            (fresh, id, latest)
-        };
+        }
         for range in &reads.ranges {
             self.check_range(range).await?;
         }
@@ -657,10 +520,9 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
         range_end: Option<&[u8]>,
         opts: ListOptions,
     ) -> Result<(Revision, Vec<KeyValue>, i64)> {
-        if opts.revision <= 0
-            && (D::live_range_sql(range_end, &opts).is_some()
-                || D::live_range_queries(range_end, &opts).is_some())
-        {
+        // Latest reads run lock-free on one statement; historical reads take
+        // the write mutex to observe a stable snapshot.
+        if opts.revision <= 0 {
             return self.list_inner(prefix, range_end, &opts).await;
         }
         let _guard = self.writes.lock().await;
@@ -833,6 +695,12 @@ mod tests {
             unimplemented!()
         }
         fn list_range_sql() -> String {
+            unimplemented!()
+        }
+        fn live_range_sql(_end: Option<&[u8]>, _opts: &ListOptions) -> String {
+            unimplemented!()
+        }
+        fn commit_state_sql(_names: usize) -> String {
             unimplemented!()
         }
         fn set_deleted_by_id_sql() -> &'static str {

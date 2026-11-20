@@ -29,9 +29,6 @@ pub trait Dialect: Send + Sync + 'static {
             Self::first_row()
         )
     }
-    fn last_row_id_sql() -> &'static str {
-        "SELECT MAX(id) FROM rine"
-    }
     fn bind(index: usize) -> String;
     fn first_row() -> &'static str;
 
@@ -44,12 +41,6 @@ pub trait Dialect: Send + Sync + 'static {
     fn predecessor_set_sql(n: usize) -> String {
         let binds = (1..=n).map(Self::bind).collect::<Vec<_>>().join(", ");
         format!("SELECT {} FROM rine WHERE id IN ({binds})", Self::cols())
-    }
-
-    /// Latest physical id per key.
-    fn latest_ids_by_names_sql(n: usize) -> String {
-        let binds = (1..=n).map(Self::bind).collect::<Vec<_>>().join(", ");
-        format!("SELECT name, MAX(id) FROM rine WHERE name IN ({binds}) GROUP BY name")
     }
 
     fn snapshot_sql(end: Option<&[u8]>) -> String {
@@ -71,15 +62,6 @@ pub trait Dialect: Send + Sync + 'static {
     }
     fn compacted_rev_sql() -> &'static str;
 
-    /// Latest live rows for several keys at once.
-    fn live_by_names_sql(n: usize) -> String {
-        let binds = (1..=n).map(Self::bind).collect::<Vec<_>>().join(", ");
-        format!(
-            "SELECT {} FROM rine WHERE name IN ({binds}) AND deleted = 0",
-            Self::cols()
-        )
-    }
-
     /// Event log slice for watch replay.
     fn events_sql() -> String;
 
@@ -89,27 +71,14 @@ pub trait Dialect: Send + Sync + 'static {
     fn list_ge_sql() -> String;
     fn list_range_sql() -> String;
 
-    /// Optional latest-range pushdown. When both queries are supplied the
-    /// count must describe the full range, not just the limited result.
-    fn live_range_queries(
-        _end: Option<&[u8]>,
-        _opts: &ListOptions,
-    ) -> Option<(Option<String>, Option<String>)> {
-        None
-    }
-
-    /// Optional single-statement latest read. Columns are revision, total
+    /// Single-statement latest read. Columns are revision, total
     /// (NULL if derived from the returned rows), then `cols()`. An empty
     /// result still carries metadata, with a NULL id.
-    fn live_range_sql(_end: Option<&[u8]>, _opts: &ListOptions) -> Option<String> {
-        None
-    }
+    fn live_range_sql(end: Option<&[u8]>, opts: &ListOptions) -> String;
 
-    /// Optional commit lookup: current revision, highest physical id, key,
+    /// Commit lookup: current revision, highest physical id, key,
     /// latest physical id for that key, and its live revision (or NULL).
-    fn commit_state_sql(_names: usize) -> Option<String> {
-        None
-    }
+    fn commit_state_sql(names: usize) -> String;
 
     /// Delete marks the live row deleted and appends a tombstone revision.
     fn set_deleted_by_id_sql() -> &'static str;

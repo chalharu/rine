@@ -113,7 +113,7 @@ impl Dialect for OracleDialect {
          VALUES (0, 'compact_rev_key', 0, 0, 0, :1, 0)"
     }
 
-    fn live_range_sql(end: Option<&[u8]>, opts: &ListOptions) -> Option<String> {
+    fn live_range_sql(end: Option<&[u8]>, opts: &ListOptions) -> String {
         let (predicate, limit_bind) = match end {
             None | Some([]) => ("name = :1", ":2"),
             Some([0]) => ("name >= :1", ":2"),
@@ -122,10 +122,10 @@ impl Dialect for OracleDialect {
         let filter = format!("{predicate} AND deleted = 0 AND name <> 'compact_rev_key'");
         let revision = Self::current_revision_sql();
         if opts.count_only {
-            return Some(format!(
+            return format!(
                 "SELECT GREATEST(NVL(({revision}), 1), 1), \
                  (SELECT COUNT(*) FROM rine WHERE {filter}), NULL FROM dual"
-            ));
+            );
         }
         let cols = if opts.keys_only {
             "id, name, created, deleted, create_revision, prev_revision, lease, version, NULL AS value"
@@ -155,32 +155,29 @@ impl Dialect for OracleDialect {
             .map(|c| format!("r.{c}"))
             .collect::<Vec<_>>()
             .join(", ");
-        Some(format!(
+        format!(
             "SELECT GREATEST(NVL(({revision}), 1), 1), {count}, {projection} FROM dual \
              LEFT JOIN (SELECT {cols}{total} FROM rine WHERE {filter}{limit}) r ON 1=1 \
              ORDER BY r.name, r.id"
-        ))
+        )
     }
 
-    fn commit_state_sql(names: usize) -> Option<String> {
-        if names > 1000 {
-            return None;
-        }
+    fn commit_state_sql(names: usize) -> String {
+        // Callers chunk names to `COMMIT_NAMES_PER_QUERY`, so no IN-list cap
+        // handling here.
         let meta = "SELECT created, id FROM rine ORDER BY id DESC FETCH FIRST 1 ROWS ONLY";
         let header = "GREATEST(NVL(m.created, 1), 1), GREATEST(NVL(m.id, 1), 1)";
         if names == 0 {
-            return Some(format!(
-                "SELECT {header}, NULL FROM dual LEFT JOIN ({meta}) m ON 1=1"
-            ));
+            return format!("SELECT {header}, NULL FROM dual LEFT JOIN ({meta}) m ON 1=1");
         }
         let binds = (1..=names).map(Self::bind).collect::<Vec<_>>().join(", ");
-        Some(format!(
+        format!(
             "SELECT {header}, k.name, k.key_id, k.live_revision FROM dual \
              LEFT JOIN ({meta}) m ON 1=1 \
              LEFT JOIN (SELECT name, NVL(MAX(CASE WHEN deleted = 0 THEN id END), MAX(id)) AS key_id, \
                   MAX(CASE WHEN deleted = 0 THEN created END) AS live_revision \
                   FROM rine WHERE name IN ({binds}) GROUP BY name) k ON 1=1"
-        ))
+        )
     }
 
     fn db_size_sql() -> &'static str {
@@ -196,7 +193,8 @@ mod tests {
     fn binds_are_oracle_style() {
         let owned = [
             OracleDialect::list_range_sql(),
-            OracleDialect::live_by_names_sql(2),
+            OracleDialect::live_range_sql(None, &ListOptions::default()),
+            OracleDialect::commit_state_sql(2),
             OracleDialect::events_sql(),
         ];
         for sql in owned.iter().map(String::as_str).chain([
