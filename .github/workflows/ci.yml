@@ -269,6 +269,12 @@ jobs:
           pattern: coverage-*
           path: coverage
           merge-multiple: true
+      - name: Split coverage per crate module
+        run: |
+          for info in coverage/lcov-*.info; do
+            sh scripts/lcov-per-crate.sh "$info" "$(basename "$info")"
+          done
+          rm coverage/lcov-*.info
       - name: SonarCloud scan
         uses: SonarSource/sonarqube-scan-action@v8
         env:
