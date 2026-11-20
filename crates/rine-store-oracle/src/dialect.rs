@@ -113,53 +113,38 @@ impl Dialect for OracleDialect {
          VALUES (0, 'compact_rev_key', 0, 0, 0, :1, 0)"
     }
 
-    fn live_range_sql(end: Option<&[u8]>, opts: &ListOptions) -> String {
+    /// Latest read split into rows + count, mirroring SQLite: rows in index
+    /// order with `FETCH FIRST`, count from a covering index. Both run in
+    /// one `query_batch` on one connection.
+    fn live_range_queries(
+        end: Option<&[u8]>,
+        opts: &ListOptions,
+    ) -> (Option<String>, Option<String>) {
         let (predicate, limit_bind) = match end {
             None | Some([]) => ("name = :1", ":2"),
             Some([0]) => ("name >= :1", ":2"),
             Some(_) => ("name >= :1 AND name < :2", ":3"),
         };
         let filter = format!("{predicate} AND deleted = 0 AND name <> 'compact_rev_key'");
-        let revision = Self::current_revision_sql();
-        if opts.count_only {
-            return format!(
-                "SELECT GREATEST(NVL(({revision}), 1), 1), \
-                 (SELECT COUNT(*) FROM rine WHERE {filter}), NULL FROM dual"
-            );
-        }
-        let cols = if opts.keys_only {
-            "id, name, created, deleted, create_revision, prev_revision, lease, version, NULL AS value"
-        } else {
-            Self::cols()
-        };
-        let (limit, total) = if opts.limit > 0 {
-            let total = if matches!(end, None | Some([])) {
-                ""
+        let rows = (!opts.count_only).then(|| {
+            let cols = if opts.keys_only {
+                "id, name, created, deleted, create_revision, prev_revision, lease, version, NULL AS value"
             } else {
-                ", COUNT(*) OVER () AS total"
+                Self::cols()
             };
-            (
-                format!(" ORDER BY name, id FETCH FIRST {limit_bind} ROWS ONLY"),
-                total,
-            )
-        } else {
-            (String::new(), "")
-        };
-        let count = if total.is_empty() {
-            "NULL"
-        } else {
-            "NVL(r.total, 0)"
-        };
-        let projection = Self::cols()
-            .split(", ")
-            .map(|c| format!("r.{c}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "SELECT GREATEST(NVL(({revision}), 1), 1), {count}, {projection} FROM dual \
-             LEFT JOIN (SELECT {cols}{total} FROM rine WHERE {filter}{limit}) r ON 1=1 \
-             ORDER BY r.name, r.id"
-        )
+            let limit = if opts.limit > 0 {
+                format!(" ORDER BY name, id FETCH FIRST {limit_bind} ROWS ONLY")
+            } else {
+                String::new()
+            };
+            // Unlimited ranges keep the covering order without a fetch cap.
+            let order = if limit.is_empty() { " ORDER BY name, id" } else { "" };
+            format!("SELECT {cols} FROM rine WHERE {filter}{order}{limit}")
+        });
+        // Point lookups and unlimited ranges derive the count from the rows.
+        let count = (opts.count_only || (opts.limit > 0 && !matches!(end, None | Some([]))))
+            .then(|| format!("SELECT COUNT(*) FROM rine WHERE {filter}"));
+        (rows, count)
     }
 
     fn commit_state_sql(names: usize) -> String {
@@ -191,11 +176,19 @@ mod tests {
 
     #[test]
     fn binds_are_oracle_style() {
+        let (rows, count) = OracleDialect::live_range_queries(
+            Some(b"x"),
+            &ListOptions {
+                limit: 10,
+                ..Default::default()
+            },
+        );
         let owned = [
             OracleDialect::list_range_sql(),
-            OracleDialect::live_range_sql(None, &ListOptions::default()),
             OracleDialect::commit_state_sql(2),
             OracleDialect::events_sql(),
+            rows.unwrap(),
+            count.unwrap(),
         ];
         for sql in owned.iter().map(String::as_str).chain([
             OracleDialect::set_compact_rev_sql(),

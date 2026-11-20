@@ -87,55 +87,33 @@ impl Dialect for SqliteDialect {
         )
     }
 
-    /// Latest read plus revision/count metadata in one statement, mirroring
-    /// the Oracle fast path: leading revision and total columns, then the kv
-    /// columns (`row_to_kv_at` offset 2). The `(SELECT 1)` row guarantees the
-    /// metadata survives empty ranges with a NULL id.
-    fn live_range_sql(end: Option<&[u8]>, opts: &ListOptions) -> String {
+    /// Latest read split into rows + count so each uses the covering index:
+    /// rows in index order with LIMIT, count without touching values. No
+    /// `COUNT(*) OVER ()` sort over the full range. Both statements run in
+    /// one `query_batch` (one read transaction).
+    fn live_range_queries(
+        end: Option<&[u8]>,
+        opts: &ListOptions,
+    ) -> (Option<String>, Option<String>) {
         let predicate = match end {
             None | Some([]) => "name = ?",
             Some([0]) => "name >= ?",
             Some(_) => "name >= ? AND name < ?",
         };
         let filter = format!("{predicate} AND deleted = 0 AND name <> 'compact_rev_key'");
-        // Uncorrelated scalar: evaluated once. Never NULL (MAX floor of 1).
-        let revision = "MAX(COALESCE((SELECT created FROM rine ORDER BY id DESC LIMIT 1), 1), 1)";
-        if opts.count_only {
-            return format!(
-                "SELECT {revision}, (SELECT COUNT(*) FROM rine WHERE {filter}), \
-                 NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM (SELECT 1)"
-            );
-        }
-        let cols = if opts.keys_only {
-            "id, name, created, deleted, create_revision, prev_revision, lease, version, NULL AS value"
-        } else {
-            Self::cols()
-        };
-        let (limit, total) = if opts.limit > 0 {
-            let total = if matches!(end, None | Some([])) {
-                ""
+        let rows = (!opts.count_only).then(|| {
+            let cols = if opts.keys_only {
+                "id, name, created, deleted, create_revision, prev_revision, lease, version, NULL"
             } else {
-                ", COUNT(*) OVER () AS total"
+                Self::cols()
             };
-            (" ORDER BY name, id LIMIT ?", total)
-        } else {
-            ("", "")
-        };
-        let count = if total.is_empty() {
-            "NULL"
-        } else {
-            "COALESCE(r.total, 0)"
-        };
-        let projection = Self::cols()
-            .split(", ")
-            .map(|c| format!("r.{c}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "SELECT {revision}, {count}, {projection} FROM (SELECT 1) \
-             LEFT JOIN (SELECT {cols}{total} FROM rine WHERE {filter}{limit}) AS r ON 1=1 \
-             ORDER BY r.name, r.id"
-        )
+            let limit = if opts.limit > 0 { " LIMIT ?" } else { "" };
+            format!("SELECT {cols} FROM rine WHERE {filter} ORDER BY name, id{limit}")
+        });
+        // Point lookups and unlimited ranges derive the count from the rows.
+        let count = (opts.count_only || (opts.limit > 0 && !matches!(end, None | Some([]))))
+            .then(|| format!("SELECT COUNT(*) FROM rine WHERE {filter}"));
+        (rows, count)
     }
 
     /// Commit lookup in one statement, mirroring the Oracle fast path:
@@ -186,11 +164,19 @@ mod tests {
 
     #[test]
     fn binds_are_positional_qmark() {
+        let (rows, count) = SqliteDialect::live_range_queries(
+            Some(b"x"),
+            &ListOptions {
+                limit: 10,
+                ..Default::default()
+            },
+        );
         let owned = [
             SqliteDialect::list_range_sql(),
-            SqliteDialect::live_range_sql(None, &ListOptions::default()),
             SqliteDialect::commit_state_sql(2),
             SqliteDialect::events_sql(),
+            rows.unwrap(),
+            count.unwrap(),
         ];
         for sql in owned.iter().map(String::as_str).chain([
             SqliteDialect::set_compact_rev_sql(),

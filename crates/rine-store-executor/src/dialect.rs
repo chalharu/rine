@@ -71,10 +71,18 @@ pub trait Dialect: Send + Sync + 'static {
     fn list_ge_sql() -> String;
     fn list_range_sql() -> String;
 
-    /// Single-statement latest read. Columns are revision, total
-    /// (NULL if derived from the returned rows), then `cols()`. An empty
-    /// result still carries metadata, with a NULL id.
-    fn live_range_sql(end: Option<&[u8]>, opts: &ListOptions) -> String;
+    /// Latest-range pushdown: split value and count retrieval so a limited
+    /// range can serve rows in index order with LIMIT while the count uses
+    /// a covering index (a single-statement `COUNT(*) OVER ()` forces an
+    /// ORDER BY sort over the full range into a temp B-tree). The first
+    /// element is the rows query (`None` for `count_only`), the second the
+    /// full-range count (`None` when the count is derived from the rows:
+    /// point lookups and unlimited ranges). Both run in one `query_batch`,
+    /// i.e. one read transaction.
+    fn live_range_queries(
+        end: Option<&[u8]>,
+        opts: &ListOptions,
+    ) -> (Option<String>, Option<String>);
 
     /// Commit lookup: current revision, highest physical id, key,
     /// latest physical id for that key, and its live revision (or NULL).

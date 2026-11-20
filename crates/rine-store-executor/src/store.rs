@@ -199,32 +199,55 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         range_end: Option<&[u8]>,
         opts: &ListOptions,
     ) -> Result<(Revision, Vec<KeyValue>, i64)> {
-        // Latest reads ride one statement carrying revision/count metadata
-        // plus the rows; the NULL-id row survives empty ranges.
+        // Latest reads ride one read transaction (revision + rows + count
+        // in a single `query_batch`): rows come back in index order with
+        // LIMIT, the count (when needed) from a covering index — no
+        // `COUNT(*) OVER ()` sort over the full range.
         if opts.revision <= 0 {
-            let sql = D::live_range_sql(range_end, opts);
+            let (rows_sql, count_sql) = D::live_range_queries(range_end, opts);
             let mut params = vec![SqlValue::Str(key_str(prefix))];
             if let Some(end) = range_end.filter(|end| !end.is_empty() && *end != [0]) {
                 params.push(SqlValue::Str(key_str(end)));
             }
-            if opts.limit > 0 && !opts.count_only {
-                params.push(SqlValue::Int(opts.limit));
+            let has_rows = rows_sql.is_some();
+            let has_count = count_sql.is_some();
+            let mut queries = vec![(D::current_revision_sql(), vec![])];
+            if let Some(sql) = rows_sql {
+                let mut binds = params.clone();
+                if opts.limit > 0 {
+                    binds.push(SqlValue::Int(opts.limit));
+                }
+                queries.push((sql, binds));
             }
-            let rows = self.exec.query_all(&sql, params).await?;
-            let meta = rows
-                .first()
-                .ok_or_else(|| Error::Backend("missing range metadata".into()))?;
-            let revision = meta.get_int(0)?;
+            if let Some(sql) = count_sql {
+                queries.push((sql, params));
+            }
+            let mut results = self.exec.query_batch(queries).await?.into_iter();
+            let revision = results
+                .next()
+                .and_then(|rows| rows.into_iter().next())
+                .map(|r| r.get_int(0))
+                .transpose()?
+                .unwrap_or(1)
+                .max(1);
             let mut kvs = Vec::new();
-            for row in &rows {
-                if !row.is_null(2) {
-                    kvs.push(row_to_kv_at(row, 2)?);
+            if has_rows {
+                let rows = results
+                    .next()
+                    .ok_or_else(|| Error::Backend("missing range result".into()))?;
+                kvs.reserve(rows.len());
+                for r in &rows {
+                    kvs.push(row_to_kv(r)?);
                 }
             }
-            let total = if meta.is_null(1) {
-                kvs.len() as i64
+            let total = if has_count {
+                results
+                    .next()
+                    .and_then(|rows| rows.into_iter().next())
+                    .ok_or_else(|| Error::Backend("missing range count".into()))?
+                    .get_int(0)?
             } else {
-                meta.get_int(1)?
+                kvs.len() as i64
             };
             return Ok((revision, kvs, total));
         }
@@ -461,17 +484,13 @@ fn key_str(key: &[u8]) -> String {
 }
 
 fn row_to_kv(row: &Row) -> Result<KeyValue> {
-    row_to_kv_at(row, 0)
-}
-
-fn row_to_kv_at(row: &Row, offset: usize) -> Result<KeyValue> {
     Ok(KeyValue {
-        key: Bytes::from(row.get_str(offset + 1)?.into_bytes()),
-        value: Bytes::from(row.get_bytes(offset + 8)?),
-        create_revision: row.get_int(offset + 4)?,
-        mod_revision: row.get_int(offset + 2)?,
-        version: row.get_int(offset + 7)?,
-        lease: row.get_int(offset + 6)?,
+        key: Bytes::from(row.get_str(1)?.into_bytes()),
+        value: Bytes::from(row.get_bytes(8)?),
+        create_revision: row.get_int(4)?,
+        mod_revision: row.get_int(2)?,
+        version: row.get_int(7)?,
+        lease: row.get_int(6)?,
     })
 }
 
@@ -697,7 +716,10 @@ mod tests {
         fn list_range_sql() -> String {
             unimplemented!()
         }
-        fn live_range_sql(_end: Option<&[u8]>, _opts: &ListOptions) -> String {
+        fn live_range_queries(
+            _end: Option<&[u8]>,
+            _opts: &ListOptions,
+        ) -> (Option<String>, Option<String>) {
             unimplemented!()
         }
         fn commit_state_sql(_names: usize) -> String {
