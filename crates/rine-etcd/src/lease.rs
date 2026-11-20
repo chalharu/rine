@@ -12,11 +12,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
 use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    backend::Backend,
+    backend::{Backend, Event, KeyValue, ListOptions, ReadSet},
     etcdserverpb::{
         LeaseGrantRequest, LeaseGrantResponse, LeaseKeepAliveRequest, LeaseKeepAliveResponse,
         LeaseLeasesRequest, LeaseLeasesResponse, LeaseRevokeRequest, LeaseRevokeResponse,
@@ -51,6 +52,34 @@ impl Clone for LeaseManager {
 }
 
 impl LeaseManager {
+    /// Delete `key` only while it still belongs to `id`, via a guarded commit.
+    async fn expire_key(backend: &Arc<dyn Backend>, id: i64, key: &[u8]) {
+        let prev = backend
+            .list(key, None, ListOptions::default())
+            .await
+            .ok()
+            .and_then(|(_, rows, _)| rows.into_iter().next())
+            .filter(|kv: &KeyValue| kv.lease == id);
+        let Some(prev) = prev else { return };
+        let revision = backend.current_revision().await + 1;
+        let reads = ReadSet {
+            points: vec![(Bytes::copy_from_slice(key), Some(prev.mod_revision))],
+            ranges: Vec::new(),
+        };
+        let _ = backend
+            .commit(
+                reads,
+                vec![Event {
+                    revision,
+                    key: Bytes::copy_from_slice(key),
+                    deleted: true,
+                    kv: None,
+                    prev_kv: Some(prev),
+                }],
+            )
+            .await;
+    }
+
     pub fn new(backend: Arc<dyn Backend>) -> Self {
         let mgr = Self {
             writes: Arc::new(tokio::sync::Mutex::new(())),
@@ -83,12 +112,7 @@ impl LeaseManager {
                 };
                 for (id, keys) in expired {
                     for k in keys {
-                        // Only delete while the key still belongs to this lease.
-                        if let Ok((_, Some(kv))) = backend.get(&k, 0).await
-                            && kv.lease == id
-                        {
-                            let _ = backend.delete(&k).await;
-                        }
+                        Self::expire_key(&backend, id, &k).await;
                     }
                 }
             }
@@ -143,11 +167,7 @@ impl LeaseManager {
             .map(|e| e.keys)
             .unwrap_or_default();
         for k in keys {
-            if let Ok((_, Some(kv))) = self.backend.get(&k, 0).await
-                && kv.lease == id
-            {
-                let _ = self.backend.delete(&k).await;
-            }
+            Self::expire_key(&self.backend, id, &k).await;
         }
     }
 

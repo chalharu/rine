@@ -22,8 +22,7 @@ pub trait Dialect: Send + Sync + 'static {
 
     fn current_revision_sql() -> String {
         format!(
-            "SELECT {} FROM rine ORDER BY id DESC {}",
-            Self::logical_revision(),
+            "SELECT created FROM rine ORDER BY id DESC {}",
             Self::first_row()
         )
     }
@@ -32,11 +31,6 @@ pub trait Dialect: Send + Sync + 'static {
     }
     fn bind(index: usize) -> String;
     fn first_row() -> &'static str;
-
-    // Older rows used the physical ID as their revision and left `created` zero.
-    fn logical_revision() -> &'static str {
-        "CASE WHEN created > 0 THEN created ELSE id END"
-    }
 
     fn insert_event_sql() -> String {
         let binds = (1..=9).map(Self::bind).collect::<Vec<_>>().join(", ");
@@ -70,10 +64,9 @@ pub trait Dialect: Send + Sync + 'static {
             ),
         };
         let cols = Self::cols();
-        let logical = Self::logical_revision();
         format!(
             "SELECT {cols} FROM (SELECT {cols}, ROW_NUMBER() OVER (PARTITION BY name ORDER BY id DESC) AS snapshot_rank \
-             FROM rine WHERE {predicate} AND {logical} <= {revision} AND name <> 'compact_rev_key') \
+             FROM rine WHERE {predicate} AND created <= {revision} AND name <> 'compact_rev_key') \
              WHERE snapshot_rank = 1 AND deleted <> 1 ORDER BY name"
         )
     }

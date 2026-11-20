@@ -83,16 +83,6 @@ pub trait Backend: Send + Sync + 'static {
 
     async fn initialize(&self) -> Result<()>;
 
-    async fn get(&self, key: &[u8], revision: Revision) -> Result<(Revision, Option<KeyValue>)>;
-    async fn create(&self, key: Bytes, value: Bytes, lease: LeaseId) -> Result<Revision>;
-    async fn update(
-        &self,
-        key: Bytes,
-        value: Bytes,
-        expected_mod_revision: Revision,
-        lease: LeaseId,
-    ) -> Result<Revision>;
-    async fn delete(&self, key: &[u8]) -> Result<(Revision, Option<KeyValue>)>;
     /// Validate `reads` under the commit lock, then store and publish `events`
     /// at a freshly assigned revision (`MAX(revision) + 1`). Returns that new
     /// revision so callers can rewrite response headers staged at `base + 1`.

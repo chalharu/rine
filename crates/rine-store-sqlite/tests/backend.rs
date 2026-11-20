@@ -7,9 +7,9 @@ use bytes::Bytes;
 use rine_etcd::backend::{Backend, ListOptions};
 use rine_store_conformance::{
     commit_duplicate_events_conflict_atomically, commit_guards_per_key, crud,
-    history_compact_events, watch_stream,
+    history_compact_events, kv_create, kv_delete, kv_get, kv_update, watch_stream,
 };
-use rine_store_executor::{SqlExecutor, SqlValue};
+use rine_store_executor::SqlExecutor;
 use rine_store_sqlite::{SqliteBackend, SqliteDb};
 
 async fn backend() -> SqliteBackend {
@@ -52,51 +52,19 @@ async fn sqlite_ensure_schema_is_idempotent() {
     let b = SqliteBackend::new(Arc::new(db));
     b.ensure_schema().await.unwrap();
     b.ensure_schema().await.unwrap();
-    b.create(Bytes::from("a"), Bytes::from("1"), 0)
+    kv_create(&b, Bytes::from("a"), Bytes::from("1"), 0)
         .await
         .unwrap();
-    let (_, kv) = b.get(b"a", 0).await.unwrap();
+    let (_, kv) = kv_get(&b, b"a", 0).await.unwrap();
     assert_eq!(kv.unwrap().value, Bytes::from("1"));
-}
-
-#[tokio::test]
-async fn sqlite_legacy_row_revisions_remain_readable() {
-    let db = Arc::new(SqliteDb::open_in_memory().unwrap());
-    let b = SqliteBackend::new(db.clone());
-    b.ensure_schema().await.unwrap();
-    db.execute(
-        "INSERT INTO rine (name, created, deleted, create_revision, prev_revision, lease, version, value) \
-         VALUES (?, 0, 0, 1, 0, 0, 1, ?)",
-        vec![
-            SqlValue::Str("legacy".into()),
-            SqlValue::Bytes(b"before".to_vec()),
-        ],
-    )
-    .await
-    .unwrap();
-    let r = b
-        .update(
-            Bytes::from_static(b"legacy"),
-            Bytes::from_static(b"after"),
-            1,
-            0,
-        )
-        .await
-        .unwrap();
-    assert_eq!(r, 2);
-    let old = b.get(b"legacy", 1).await.unwrap().1.unwrap();
-    assert_eq!(old.value, b"before".as_slice());
-    assert_eq!(old.mod_revision, 1);
-    let event = b.events(r, r).await.unwrap().pop().unwrap();
-    assert_eq!(event.prev_kv.unwrap().mod_revision, 1);
-    assert_eq!(event.kv.unwrap().mod_revision, r);
 }
 
 #[tokio::test]
 async fn sqlite_live_range_counts_only_visible_rows_before_limiting() {
     let b = backend().await;
     for key in ["a", "b", "c"] {
-        b.create(
+        kv_create(
+            &b,
             Bytes::from_static(key.as_bytes()),
             Bytes::from_static(b"value"),
             0,
@@ -104,11 +72,16 @@ async fn sqlite_live_range_counts_only_visible_rows_before_limiting() {
         .await
         .unwrap();
     }
-    let (old_revision, _) = b.delete(b"b").await.unwrap();
-    let current = b
-        .update(Bytes::from_static(b"a"), Bytes::from_static(b"new"), 0, 0)
-        .await
-        .unwrap();
+    let (old_revision, _) = kv_delete(&b, b"b").await.unwrap();
+    let current = kv_update(
+        &b,
+        Bytes::from_static(b"a"),
+        Bytes::from_static(b"new"),
+        0,
+        0,
+    )
+    .await
+    .unwrap();
     b.compact(old_revision).await.unwrap();
 
     for revision in [0, old_revision] {
@@ -196,11 +169,11 @@ async fn sqlite_ensure_schema_adds_missing_unique_index() {
         .unwrap();
     assert!(after.is_some());
     // The backend is fully functional on the adopted table.
-    b.create(Bytes::from("a"), Bytes::from("1"), 0)
+    kv_create(&b, Bytes::from("a"), Bytes::from("1"), 0)
         .await
         .unwrap();
     assert!(
-        b.create(Bytes::from("a"), Bytes::from("x"), 0)
+        kv_create(&b, Bytes::from("a"), Bytes::from("x"), 0)
             .await
             .is_err()
     );

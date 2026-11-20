@@ -34,7 +34,6 @@ pub(crate) fn status_err(e: Error) -> tonic::Status {
         Error::FutureRev { .. } => {
             tonic::Status::out_of_range("etcdserver: mvcc: required revision is a future revision")
         }
-        Error::NotSupported(s) => tonic::Status::unimplemented(s),
         Error::Conflict => tonic::Status::aborted("storage revision changed during transaction"),
         Error::KeyExists(_) => tonic::Status::already_exists("key already exists"),
         Error::Backend(s) => tonic::Status::internal(s.to_string()),
@@ -372,7 +371,19 @@ impl KvService {
                 "etcdserver: key is not provided",
             ));
         }
-        let (_, prev) = self.backend.get(&req.key, 0).await.map_err(status_err)?;
+        let (_, rows, _) = self
+            .backend
+            .list(
+                &req.key,
+                None,
+                ListOptions {
+                    revision: 0,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(status_err)?;
+        let prev = rows.into_iter().next();
 
         let (value, lease) = match (req.ignore_value, req.ignore_lease) {
             (true, _) | (_, true) => match &prev {

@@ -6,6 +6,7 @@
 //! caught without a database; the live XE test in CI covers Oracle against a
 //! real database.
 
+use rine_etcd::backend::ListOptions;
 use rine_store_executor::Dialect;
 
 /// Oracle DDL for the `rine` table.
@@ -71,9 +72,8 @@ impl Dialect for OracleDialect {
 
     fn events_sql() -> String {
         format!(
-            "SELECT {COLS} FROM rine WHERE {rev} >= :1 AND {rev} <= :2 AND name <> 'compact_rev_key' ORDER BY id",
+            "SELECT {COLS} FROM rine WHERE created >= :1 AND created <= :2 AND name <> 'compact_rev_key' ORDER BY id",
             COLS = Self::cols(),
-            rev = Self::logical_revision()
         )
     }
 
@@ -103,8 +103,8 @@ impl Dialect for OracleDialect {
     }
 
     fn compact_delete_sql() -> &'static str {
-        "DELETE FROM rine WHERE (CASE WHEN created > 0 THEN created ELSE id END) < :1 AND name <> 'compact_rev_key' \
-         AND id NOT IN (SELECT MAX(id) FROM rine WHERE (CASE WHEN created > 0 THEN created ELSE id END) <= :2 GROUP BY name)"
+        "DELETE FROM rine WHERE created < :1 AND name <> 'compact_rev_key' \
+         AND id NOT IN (SELECT MAX(id) FROM rine WHERE created <= :2 GROUP BY name)"
     }
 
     fn set_compact_rev_sql() -> &'static str {
@@ -114,6 +114,37 @@ impl Dialect for OracleDialect {
     fn set_compact_rev_insert_sql() -> &'static str {
         "INSERT INTO rine (id, name, created, deleted, create_revision, prev_revision, lease) \
          VALUES (0, 'compact_rev_key', 0, 0, 0, :1, 0)"
+    }
+
+    /// Latest-range pushdown, mirroring the SQLite fast path: `LIMIT ?` becomes
+    /// `FETCH FIRST n ROWS ONLY`, `NULL` stands in for the value column when
+    /// only keys are requested.
+    fn live_range_queries(
+        end: Option<&[u8]>,
+        opts: &ListOptions,
+    ) -> Option<(Option<String>, Option<String>)> {
+        let (predicate, limit_bind) = match end {
+            None | Some([]) => ("name = :1", ":2"),
+            Some([0]) => ("name >= :1", ":2"),
+            Some(_) => ("name >= :1 AND name < :2", ":3"),
+        };
+        let filter = format!("{predicate} AND deleted = 0 AND name <> 'compact_rev_key'");
+        let rows = (!opts.count_only).then(|| {
+            let cols = if opts.keys_only {
+                "id, name, created, deleted, create_revision, prev_revision, lease, version, NULL"
+            } else {
+                Self::cols()
+            };
+            let limit = if opts.limit > 0 {
+                format!(" FETCH FIRST {limit_bind} ROWS ONLY")
+            } else {
+                String::new()
+            };
+            format!("SELECT {cols} FROM rine WHERE {filter} ORDER BY name, id{limit}")
+        });
+        let count = (opts.count_only || (opts.limit > 0 && !matches!(end, None | Some([]))))
+            .then(|| format!("SELECT COUNT(*) FROM rine WHERE {filter}"));
+        Some((rows, count))
     }
 
     fn db_size_sql() -> &'static str {

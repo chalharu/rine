@@ -3,7 +3,7 @@ use std::{collections::HashSet, marker::PhantomData, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use bytes::Bytes;
 use rine_etcd::{
-    backend::{Backend, Event, KeyValue, LeaseId, ListOptions, ObservedRange, ReadSet, Revision},
+    backend::{Backend, Event, KeyValue, ListOptions, ObservedRange, ReadSet, Revision},
     error::{Error, Result},
 };
 use tokio::sync::{Mutex, broadcast};
@@ -532,19 +532,10 @@ fn row_to_kv(row: &Row) -> Result<KeyValue> {
         key: Bytes::from(row.get_str(1)?.into_bytes()),
         value: Bytes::from(row.get_bytes(8)?),
         create_revision: row.get_int(4)?,
-        mod_revision: logical_revision(row)?,
+        mod_revision: row.get_int(2)?,
         version: row.get_int(7)?,
         lease: row.get_int(6)?,
     })
-}
-
-fn logical_revision(row: &Row) -> Result<Revision> {
-    let revision = row.get_int(2)?;
-    if revision > 0 {
-        Ok(revision)
-    } else {
-        row.get_int(0)
-    }
 }
 
 fn row_to_event(row: &Row) -> Result<Event> {
@@ -552,7 +543,7 @@ fn row_to_event(row: &Row) -> Result<Event> {
     let deleted = row.get_int(3)? == 1;
     let key = Bytes::from(row.get_str(1)?.into_bytes());
     Ok(Event {
-        revision: logical_revision(row)?,
+        revision: row.get_int(2)?,
         key,
         deleted,
         kv: if deleted { None } else { Some(row_to_kv(row)?) },
@@ -572,130 +563,6 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
 
     async fn initialize(&self) -> Result<()> {
         self.ensure_schema().await
-    }
-
-    async fn get(&self, key: &[u8], revision: Revision) -> Result<(Revision, Option<KeyValue>)> {
-        let (cur, rows, _) = self
-            .list(
-                key,
-                None,
-                ListOptions {
-                    revision,
-                    ..Default::default()
-                },
-            )
-            .await?;
-        Ok((cur, rows.into_iter().next()))
-    }
-
-    async fn create(&self, key: Bytes, value: Bytes, lease: LeaseId) -> Result<Revision> {
-        // Unconditional write: no guard reads, so concurrent commits to other
-        // keys never conflict. A rival create of the same key surfaces as a
-        // unique-constraint conflict; report it as already-exists.
-        let base = self.current_rev_inner().await?;
-        let revision = base + 1;
-        let kv = KeyValue {
-            key: key.clone(),
-            value,
-            create_revision: revision,
-            mod_revision: revision,
-            version: 1,
-            lease,
-        };
-        let dup = key.to_vec();
-        let reads = ReadSet {
-            points: vec![(key.clone(), None)],
-            ranges: Vec::new(),
-        };
-        match self
-            .commit(
-                reads,
-                vec![Event {
-                    revision,
-                    key,
-                    deleted: false,
-                    kv: Some(kv),
-                    prev_kv: None,
-                }],
-            )
-            .await
-        {
-            Ok(fresh) => Ok(fresh),
-            Err(Error::Conflict) => Err(Error::KeyExists(dup)),
-            Err(e) => Err(e),
-        }
-    }
-
-    async fn update(
-        &self,
-        key: Bytes,
-        value: Bytes,
-        expected_mod_revision: Revision,
-        lease: LeaseId,
-    ) -> Result<Revision> {
-        let live = self.live_row(&key).await?;
-        let Some(prev_row) = live else {
-            return Err(Error::KeyExists(key.to_vec()));
-        };
-        let prev = row_to_kv(&prev_row)?;
-        if expected_mod_revision != 0 && prev.mod_revision != expected_mod_revision {
-            return Err(Error::Backend("mod revision mismatch".into()));
-        }
-        let base = self.current_rev_inner().await?;
-        let revision = base + 1;
-        let kv = KeyValue {
-            key: key.clone(),
-            value,
-            create_revision: prev.create_revision,
-            mod_revision: revision,
-            version: prev.version + 1,
-            lease,
-        };
-        // Guard the observed predecessor: only this key can conflict us.
-        let reads = ReadSet {
-            points: vec![(key.clone(), Some(prev.mod_revision))],
-            ranges: Vec::new(),
-        };
-        self.commit(
-            reads,
-            vec![Event {
-                revision,
-                key,
-                deleted: false,
-                kv: Some(kv),
-                prev_kv: Some(prev),
-            }],
-        )
-        .await
-    }
-
-    async fn delete(&self, key: &[u8]) -> Result<(Revision, Option<KeyValue>)> {
-        let prev = match self.live_row(key).await? {
-            Some(r) => Some(row_to_kv(&r)?),
-            None => None,
-        };
-        let Some(prev) = prev else {
-            return Ok((self.current_rev_inner().await?, None));
-        };
-        let base = self.current_rev_inner().await?;
-        let revision = base + 1;
-        let reads = ReadSet {
-            points: vec![(Bytes::copy_from_slice(key), Some(prev.mod_revision))],
-            ranges: Vec::new(),
-        };
-        let fresh = self
-            .commit(
-                reads,
-                vec![Event {
-                    revision,
-                    key: Bytes::copy_from_slice(key),
-                    deleted: true,
-                    kv: None,
-                    prev_kv: Some(prev.clone()),
-                }],
-            )
-            .await?;
-        Ok((fresh, Some(prev)))
     }
 
     async fn commit(&self, reads: ReadSet, events: Vec<Event>) -> Result<Revision> {

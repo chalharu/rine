@@ -14,9 +14,8 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use rine_etcd::{
-    backend::{Backend, Event, KeyValue, LeaseId, ListOptions, ReadSet, Revision},
+    backend::{Backend, Event, KeyValue, ListOptions, ReadSet, Revision},
     error::{Error, Result},
     etcdserverpb::{
         Compare, PutRequest, RangeRequest, RequestOp, TxnRequest,
@@ -54,30 +53,6 @@ impl Backend for FlakyBackend {
 
     async fn initialize(&self) -> Result<()> {
         self.inner.initialize().await
-    }
-
-    async fn get(&self, key: &[u8], revision: Revision) -> Result<(Revision, Option<KeyValue>)> {
-        self.inner.get(key, revision).await
-    }
-
-    async fn create(&self, key: Bytes, value: Bytes, lease: LeaseId) -> Result<Revision> {
-        self.inner.create(key, value, lease).await
-    }
-
-    async fn update(
-        &self,
-        key: Bytes,
-        value: Bytes,
-        expected_mod_revision: Revision,
-        lease: LeaseId,
-    ) -> Result<Revision> {
-        self.inner
-            .update(key, value, expected_mod_revision, lease)
-            .await
-    }
-
-    async fn delete(&self, key: &[u8]) -> Result<(Revision, Option<KeyValue>)> {
-        self.inner.delete(key).await
     }
 
     async fn commit(&self, reads: ReadSet, events: Vec<Event>) -> Result<Revision> {

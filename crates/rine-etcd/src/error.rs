@@ -10,8 +10,6 @@ pub enum Error {
     FutureRev { requested: i64, current: i64 },
     #[error("storage revision changed during transaction")]
     Conflict,
-    #[error("not supported: {0}")]
-    NotSupported(String),
     /// Pass-through for errors the backend does not classify: the original
     /// driver error is boxed verbatim (message, chain and downcastability
     /// preserved), never re-stringified and re-parsed.

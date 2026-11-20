@@ -15,7 +15,7 @@ use rine_etcd::{
     backend::{Backend, ReadSet},
     error::Error,
 };
-use rine_store_conformance::{crud, history_compact_events};
+use rine_store_conformance::{crud, history_compact_events, kv_create, kv_get, kv_update};
 use rine_store_executor::{SqlExecutor as _, SqlValue};
 use rine_store_oracle::{OracleBackend, OracleDb};
 
@@ -160,14 +160,13 @@ async fn live_stale_point_read_is_conflict() {
         .commit(missing.clone(), vec![])
         .await
         .expect("absent guard");
-    backend
-        .create(key.clone(), Bytes::from("v"), 0)
+    kv_create(&backend, key.clone(), Bytes::from("v"), 0)
         .await
         .expect("create");
     let err = backend.commit(missing, vec![]).await.unwrap_err();
     assert!(matches!(err, Error::Conflict));
     // The live row's guard passes, then fails after an update.
-    let (_, kv) = backend.get(&key, 0).await.expect("get");
+    let (_, kv) = kv_get(&backend, &key, 0).await.expect("get");
     let live = ReadSet {
         points: vec![(key.clone(), kv.map(|kv| kv.mod_revision))],
         ranges: Vec::new(),
@@ -176,8 +175,7 @@ async fn live_stale_point_read_is_conflict() {
         .commit(live.clone(), vec![])
         .await
         .expect("live guard");
-    backend
-        .update(key.clone(), Bytes::from("v2"), 0, 0)
+    kv_update(&backend, key.clone(), Bytes::from("v2"), 0, 0)
         .await
         .expect("update");
     let err = backend.commit(live, vec![]).await.unwrap_err();

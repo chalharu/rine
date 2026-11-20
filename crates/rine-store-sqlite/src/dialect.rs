@@ -67,9 +67,8 @@ impl Dialect for SqliteDialect {
 
     fn events_sql() -> String {
         format!(
-            "SELECT {COLS} FROM rine WHERE {rev} >= ? AND {rev} <= ? AND name <> 'compact_rev_key' ORDER BY id",
+            "SELECT {COLS} FROM rine WHERE created >= ? AND created <= ? AND name <> 'compact_rev_key' ORDER BY id",
             COLS = Self::cols(),
-            rev = Self::logical_revision()
         )
     }
 
@@ -123,8 +122,8 @@ impl Dialect for SqliteDialect {
     }
 
     fn compact_delete_sql() -> &'static str {
-        "DELETE FROM rine WHERE (CASE WHEN created > 0 THEN created ELSE id END) < ? AND name <> 'compact_rev_key' \
-         AND id NOT IN (SELECT MAX(id) FROM rine WHERE (CASE WHEN created > 0 THEN created ELSE id END) <= ? GROUP BY name)"
+        "DELETE FROM rine WHERE created < ? AND name <> 'compact_rev_key' \
+         AND id NOT IN (SELECT MAX(id) FROM rine WHERE created <= ? GROUP BY name)"
     }
 
     fn set_compact_rev_sql() -> &'static str {

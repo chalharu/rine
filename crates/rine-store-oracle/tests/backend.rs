@@ -4,10 +4,9 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use rine_etcd::Backend as _;
 use rine_store_conformance::{
     commit_duplicate_events_conflict_atomically, commit_guards_per_key, crud,
-    history_compact_events, watch_stream,
+    history_compact_events, kv_create, watch_stream,
 };
 use rine_store_oracle::{MockExec, OracleBackendMock};
 
@@ -46,7 +45,7 @@ async fn conformance_commit_duplicate_events_conflict_atomically() {
 async fn ensure_schema_is_noop_when_table_exists() {
     let b = backend().await;
     // Still functional afterwards.
-    b.create(Bytes::from("a"), Bytes::from("1"), 0)
+    kv_create(&b, Bytes::from("a"), Bytes::from("1"), 0)
         .await
         .unwrap();
 }

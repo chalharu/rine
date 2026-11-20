@@ -17,8 +17,8 @@ use tokio::sync::{RwLock, broadcast};
 
 use crate::{
     backend::{
-        Backend, BackendFactory, Event, KeyValue, LeaseId, ListOptions, ObservedRange, ReadSet,
-        Revision, in_range,
+        Backend, BackendFactory, Event, KeyValue, ListOptions, ObservedRange, ReadSet, Revision,
+        in_range,
     },
     error::{Error, Result},
 };
@@ -69,15 +69,6 @@ impl MemoryBackend {
             })),
             tx,
         }
-    }
-
-    fn next_rev(inner: &mut Inner) -> Revision {
-        inner.rev += 1;
-        let r = inner.rev;
-        if inner.history.len() <= r as usize {
-            inner.history.resize(r as usize + 1, Vec::new());
-        }
-        r
     }
 
     fn publish(g: &mut Inner, tx: &broadcast::Sender<Vec<Event>>, events: Vec<Event>) {
@@ -204,128 +195,6 @@ impl Backend for MemoryBackend {
         Ok(())
     }
 
-    async fn get(&self, key: &[u8], revision: Revision) -> Result<(Revision, Option<KeyValue>)> {
-        let g = self.inner.read().await;
-        if revision > 0 && revision < g.compact_rev {
-            return Err(Error::Compacted {
-                requested: revision,
-                compacted: g.compact_rev,
-            });
-        }
-        if revision != 0 && revision > g.rev {
-            return Err(Error::FutureRev {
-                requested: revision,
-                current: g.rev,
-            });
-        }
-        if revision <= 0 || revision == g.rev {
-            return Ok((g.rev, g.kvs.get(key).cloned()));
-        }
-        // Historical read: last snapshot at or below the requested revision.
-        let mut cur = g.compacted.get(key).cloned();
-        for r in (g.compact_rev + 1)..=revision {
-            if let Some(evs) = g.history.get(r as usize) {
-                for e in evs {
-                    if e.key.as_ref() == key {
-                        cur = e.kv.clone();
-                    }
-                }
-            }
-        }
-        Ok((g.rev, cur))
-    }
-
-    async fn create(&self, key: Bytes, value: Bytes, lease: LeaseId) -> Result<Revision> {
-        let mut g = self.inner.write().await;
-        if g.kvs.contains_key(key.as_ref()) {
-            return Err(Error::KeyExists(key.to_vec()));
-        }
-        let r = Self::next_rev(&mut g);
-        let kv = KeyValue {
-            key: key.clone(),
-            value,
-            create_revision: r,
-            mod_revision: r,
-            version: 1,
-            lease,
-        };
-        g.kvs.insert(key.clone(), kv.clone());
-        Self::publish(
-            &mut g,
-            &self.tx,
-            vec![Event {
-                revision: r,
-                key,
-                deleted: false,
-                kv: Some(kv),
-                prev_kv: None,
-            }],
-        );
-        Ok(r)
-    }
-
-    async fn update(
-        &self,
-        key: Bytes,
-        value: Bytes,
-        expected_mod_revision: Revision,
-        lease: LeaseId,
-    ) -> Result<Revision> {
-        let mut g = self.inner.write().await;
-        let prev = g.kvs.get(key.as_ref()).cloned();
-        match prev {
-            None => Err(Error::KeyExists(key.to_vec())),
-            Some(p) => {
-                if expected_mod_revision != 0 && p.mod_revision != expected_mod_revision {
-                    return Err(Error::Backend("mod revision mismatch".into()));
-                }
-                let r = Self::next_rev(&mut g);
-                let kv = KeyValue {
-                    key: key.clone(),
-                    value,
-                    create_revision: p.create_revision,
-                    mod_revision: r,
-                    version: p.version + 1,
-                    lease,
-                };
-                g.kvs.insert(key.clone(), kv.clone());
-                Self::publish(
-                    &mut g,
-                    &self.tx,
-                    vec![Event {
-                        revision: r,
-                        key,
-                        deleted: false,
-                        kv: Some(kv),
-                        prev_kv: Some(p),
-                    }],
-                );
-                Ok(r)
-            }
-        }
-    }
-
-    async fn delete(&self, key: &[u8]) -> Result<(Revision, Option<KeyValue>)> {
-        let mut g = self.inner.write().await;
-        let prev = g.kvs.remove(key);
-        if prev.is_none() {
-            return Ok((g.rev, None));
-        }
-        let r = Self::next_rev(&mut g);
-        Self::publish(
-            &mut g,
-            &self.tx,
-            vec![Event {
-                revision: r,
-                key: Bytes::copy_from_slice(key),
-                deleted: true,
-                kv: None,
-                prev_kv: prev.clone(),
-            }],
-        );
-        Ok((r, prev))
-    }
-
     async fn commit(&self, reads: ReadSet, events: Vec<Event>) -> Result<Revision> {
         let mut g = self.inner.write().await;
         for (key, expected) in &reads.points {
@@ -442,19 +311,110 @@ impl Backend for MemoryBackend {
 mod tests {
     use super::*;
 
+    /// Test-only single-key writes over `commit` (mirrors the removed
+    /// `create`/`update`/`delete` convenience methods).
+    async fn put(b: &MemoryBackend, key: &[u8], value: &[u8]) -> Revision {
+        let key = Bytes::copy_from_slice(key);
+        let revision = b.current_revision().await + 1;
+        b.commit(
+            ReadSet {
+                points: vec![(key.clone(), None)],
+                ranges: Vec::new(),
+            },
+            vec![Event {
+                revision,
+                key: key.clone(),
+                deleted: false,
+                kv: Some(KeyValue {
+                    key,
+                    value: Bytes::copy_from_slice(value),
+                    create_revision: revision,
+                    mod_revision: revision,
+                    version: 1,
+                    lease: 0,
+                }),
+                prev_kv: None,
+            }],
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn update(b: &MemoryBackend, key: &[u8], value: &[u8]) -> Revision {
+        let (_, prev) = get(b, key, 0).await;
+        let prev = prev.unwrap();
+        let key = Bytes::copy_from_slice(key);
+        let revision = b.current_revision().await + 1;
+        b.commit(
+            ReadSet {
+                points: vec![(key.clone(), Some(prev.mod_revision))],
+                ranges: Vec::new(),
+            },
+            vec![Event {
+                revision,
+                key: key.clone(),
+                deleted: false,
+                kv: Some(KeyValue {
+                    key,
+                    value: Bytes::copy_from_slice(value),
+                    create_revision: prev.create_revision,
+                    mod_revision: revision,
+                    version: prev.version + 1,
+                    lease: 0,
+                }),
+                prev_kv: Some(prev),
+            }],
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn del(b: &MemoryBackend, key: &[u8]) {
+        let (_, prev) = get(b, key, 0).await;
+        if let Some(prev) = prev {
+            let key = Bytes::copy_from_slice(key);
+            let revision = b.current_revision().await + 1;
+            b.commit(
+                ReadSet {
+                    points: vec![(key.clone(), Some(prev.mod_revision))],
+                    ranges: Vec::new(),
+                },
+                vec![Event {
+                    revision,
+                    key,
+                    deleted: true,
+                    kv: None,
+                    prev_kv: Some(prev),
+                }],
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn get(b: &MemoryBackend, key: &[u8], rev: Revision) -> (Revision, Option<KeyValue>) {
+        let (cur, rows, _) = b
+            .list(
+                key,
+                None,
+                ListOptions {
+                    revision: rev,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        (cur, rows.into_iter().next())
+    }
+
     #[tokio::test]
     async fn crud() {
         let b = MemoryBackend::new();
-        let r1 = b
-            .create(Bytes::from("a"), Bytes::from("1"), 0)
-            .await
-            .unwrap();
+        let r1 = put(&b, b"a", b"1").await;
         assert!(r1 > 1);
-        let (_, kv) = b.get(b"a", 0).await.unwrap();
+        let (_, kv) = get(&b, b"a", 0).await;
         assert_eq!(kv.unwrap().value, Bytes::from("1"));
-        b.update(Bytes::from("a"), Bytes::from("2"), 0, 0)
-            .await
-            .unwrap();
+        update(&b, b"a", b"2").await;
         let (rev, kvs, count) = b.list(b"a", None, ListOptions::default()).await.unwrap();
         assert_eq!(count, 1);
         assert_eq!(kvs[0].value, Bytes::from("2"));
@@ -465,8 +425,8 @@ mod tests {
             .unwrap();
         assert_eq!(kvs_all.len(), 1);
         let _ = rev;
-        b.delete(b"a").await.unwrap();
-        let (_, kv) = b.get(b"a", 0).await.unwrap();
+        del(&b, b"a").await;
+        let (_, kv) = get(&b, b"a", 0).await;
         assert!(kv.is_none());
     }
 
@@ -474,9 +434,7 @@ mod tests {
     async fn ordered_ranges_preserve_etcd_bounds() {
         let b = MemoryBackend::new();
         for key in [b"\xff".as_slice(), b"a\0", b"b", b"a"] {
-            b.create(Bytes::copy_from_slice(key), Bytes::from_static(b"value"), 0)
-                .await
-                .unwrap();
+            put(&b, key, b"value").await;
         }
         for (start, end, expected) in [
             (b"a".as_slice(), None, vec![b"a".as_slice()]),
@@ -496,15 +454,10 @@ mod tests {
     #[tokio::test]
     async fn historical_range_keeps_order_and_count_with_limit() {
         let b = MemoryBackend::new();
-        b.create(Bytes::from_static(b"a"), Bytes::from_static(b"old"), 0)
-            .await
-            .unwrap();
-        let point = b
-            .create(Bytes::from_static(b"b"), Bytes::from_static(b"other"), 0)
-            .await
-            .unwrap();
+        put(&b, b"a", b"old").await;
+        let point = put(&b, b"b", b"other").await;
         b.compact(point).await.unwrap();
-        b.delete(b"a").await.unwrap();
+        del(&b, b"a").await;
         let (_, kvs, count) = b
             .list(
                 b"a",
@@ -527,17 +480,23 @@ mod tests {
     #[tokio::test]
     async fn history_and_compact() {
         let b = MemoryBackend::new();
-        b.create(Bytes::from("k"), Bytes::from("v1"), 0)
-            .await
-            .unwrap();
-        let r2 = b
-            .update(Bytes::from("k"), Bytes::from("v2"), 0, 0)
-            .await
-            .unwrap();
-        let (_, kv) = b.get(b"k", r2 - 1).await.unwrap();
+        put(&b, b"k", b"v1").await;
+        let r2 = update(&b, b"k", b"v2").await;
+        let (_, kv) = get(&b, b"k", r2 - 1).await;
         assert_eq!(kv.unwrap().value, Bytes::from("v1"));
         b.compact(r2).await.unwrap();
-        assert!(b.get(b"k", r2 - 1).await.is_err());
+        assert!(
+            b.list(
+                b"k",
+                None,
+                ListOptions {
+                    revision: r2 - 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .is_err()
+        );
         assert!(b.events(r2 - 1, r2).await.is_err());
     }
 }

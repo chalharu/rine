@@ -27,11 +27,7 @@ struct MockRow {
 
 impl MockRow {
     fn revision(&self) -> i64 {
-        if self.created > 0 {
-            self.created
-        } else {
-            self.id
-        }
+        self.created
     }
 
     fn to_row(&self) -> Row {
@@ -52,6 +48,14 @@ impl MockRow {
             ],
         }
     }
+}
+
+/// Predicate shape of an Oracle live-range pushdown query.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LivePredicate {
+    Exact,
+    Prefix,
+    Range,
 }
 
 /// In-memory executor matching `OracleBackend`'s SQL. Not for production.
@@ -168,6 +172,60 @@ impl MockExec {
             return Ok(0);
         }
         panic!("mock execute: unknown sql {sql}");
+    }
+
+    /// Oracle live-range pushdown shape (see `OracleDialect::live_range_queries`):
+    /// rows queries carry the `compact_rev_key` exclusion plus an optional
+    /// `FETCH FIRST` cap; count queries are `SELECT COUNT(*)`. Windowed
+    /// snapshot queries share the exclusion literal and are excluded here.
+    fn live_range_predicate(sql: &str) -> Option<LivePredicate> {
+        if !sql.contains("name <> 'compact_rev_key'") || sql.contains("snapshot_rank") {
+            return None;
+        }
+        if sql.contains("name < :2") {
+            Some(LivePredicate::Range)
+        } else if sql.contains("name = :1") {
+            Some(LivePredicate::Exact)
+        } else if sql.contains("name >= :1") {
+            Some(LivePredicate::Prefix)
+        } else {
+            None
+        }
+    }
+
+    /// Latest-visible rows for one live-range query, in `(name, id)` order.
+    fn filter_live(
+        rows: &[MockRow],
+        pred: LivePredicate,
+        params: &[SqlValue],
+        keys_only: bool,
+    ) -> Vec<Row> {
+        let prefix = Self::str_param(params, 0);
+        let mut out: Vec<&MockRow> = rows
+            .iter()
+            .filter(|r| {
+                r.name != OracleDialect::compacted_rev_key()
+                    && r.deleted == 0
+                    && match pred {
+                        LivePredicate::Exact => r.name == prefix,
+                        LivePredicate::Prefix => r.name.as_str() >= prefix.as_str(),
+                        LivePredicate::Range => {
+                            let end = Self::str_param(params, 1);
+                            r.name.as_str() >= prefix.as_str() && r.name.as_str() < end.as_str()
+                        }
+                    }
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.name, a.id).cmp(&(&b.name, b.id)));
+        out.into_iter()
+            .map(|r| {
+                let mut row = MockRow::to_row(r);
+                if keys_only {
+                    row.values[8] = SqlValue::Null;
+                }
+                row
+            })
+            .collect()
     }
 }
 
@@ -292,6 +350,23 @@ impl SqlExecutor for MockExec {
                 .collect();
             out.sort_by_key(|r| r.id);
             return Ok(out.into_iter().map(MockRow::to_row).collect());
+        }
+        if sql.starts_with("SELECT COUNT(*) FROM rine WHERE")
+            && let Some(pred) = Self::live_range_predicate(sql)
+        {
+            let count = Self::filter_live(&rows, pred, &params, false).len() as i64;
+            return Ok(vec![Row {
+                values: vec![SqlValue::Int(count)],
+            }]);
+        }
+        if let Some(pred) = Self::live_range_predicate(sql) {
+            let keys_only = sql.contains(", NULL");
+            let mut out = Self::filter_live(&rows, pred, &params, keys_only);
+            if sql.contains("FETCH FIRST") {
+                let limit = Self::int_param(&params, params.len() - 1).max(0) as usize;
+                out.truncate(limit);
+            }
+            return Ok(out);
         }
         let historical = sql == OracleDialect::snapshot_sql(None)
             || sql == OracleDialect::snapshot_sql(Some(&[0]))
