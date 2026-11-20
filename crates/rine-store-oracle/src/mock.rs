@@ -252,7 +252,7 @@ impl SqlExecutor for MockExec {
         Ok(())
     }
 
-    async fn query_row(&self, sql: &str, params: Vec<SqlValue>) -> Result<Option<Row>> {
+    async fn query_row(&self, sql: &str, _params: Vec<SqlValue>) -> Result<Option<Row>> {
         let rows = self.rows.lock().await;
         if sql == OracleDialect::probe_sql() {
             // Mock table always exists.
@@ -277,21 +277,6 @@ impl SqlExecutor for MockExec {
                 values: vec![SqlValue::Int(id)],
             }));
         }
-        if sql == OracleDialect::latest_by_name_sql() {
-            let name = Self::str_param(&params, 0);
-            return Ok(rows
-                .iter()
-                .filter(|r| r.name == name)
-                .map(|r| r.id)
-                .max()
-                .map(|id| Row {
-                    values: vec![SqlValue::Int(id)],
-                }));
-        }
-        if sql == OracleDialect::predecessor_sql() {
-            let id = Self::int_param(&params, 0);
-            return Ok(rows.iter().find(|r| r.id == id).map(MockRow::to_row));
-        }
         if sql == OracleDialect::compacted_rev_sql() {
             return Ok(rows
                 .iter()
@@ -299,13 +284,6 @@ impl SqlExecutor for MockExec {
                 .map(|r| Row {
                     values: vec![SqlValue::Int(r.prev_revision)],
                 }));
-        }
-        if sql == OracleDialect::live_by_name_sql() {
-            let name = Self::str_param(&params, 0);
-            return Ok(rows
-                .iter()
-                .find(|r| r.name == name && r.deleted == 0)
-                .map(MockRow::to_row));
         }
         if sql == OracleDialect::db_size_sql() {
             let sum: i64 = rows
@@ -322,11 +300,12 @@ impl SqlExecutor for MockExec {
     }
 
     async fn query_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<Vec<Vec<Row>>> {
-        // Guard reads are single-row lookups; route them through `query_row`.
+        // Single-row revision lookups route through `query_row`; everything
+        // else (including multi-row IN-list batches) through `query_all`.
         let mut out = Vec::with_capacity(statements.len());
         for (sql, params) in statements {
-            if sql == OracleDialect::live_by_name_sql()
-                || sql == OracleDialect::current_revision_sql()
+            if sql == OracleDialect::current_revision_sql()
+                || sql == OracleDialect::last_row_id_sql()
             {
                 out.push(self.query_row(&sql, params).await?.into_iter().collect());
             } else {
@@ -338,6 +317,45 @@ impl SqlExecutor for MockExec {
 
     async fn query_all(&self, sql: &str, params: Vec<SqlValue>) -> Result<Vec<Row>> {
         let rows = self.rows.lock().await;
+        let cols_prefix = format!("SELECT {} FROM rine WHERE ", OracleDialect::cols());
+        if sql.starts_with(&format!("{cols_prefix}name IN (")) && sql.ends_with(" AND deleted = 0")
+        {
+            let mut out: Vec<&MockRow> = rows
+                .iter()
+                .filter(|r| {
+                    r.deleted == 0
+                        && params
+                            .iter()
+                            .any(|p| matches!(p, SqlValue::Str(s) if *s == r.name))
+                })
+                .collect();
+            out.sort_by(|a, b| (&a.name, a.id).cmp(&(&b.name, b.id)));
+            return Ok(out.into_iter().map(MockRow::to_row).collect());
+        }
+        if sql.starts_with("SELECT name, MAX(id) FROM rine WHERE name IN (") {
+            let mut out = Vec::new();
+            for param in &params {
+                if let SqlValue::Str(name) = param
+                    && let Some(max) = rows.iter().filter(|r| &r.name == name).map(|r| r.id).max()
+                {
+                    out.push(Row {
+                        values: vec![SqlValue::Str(name.clone()), SqlValue::Int(max)],
+                    });
+                }
+            }
+            return Ok(out);
+        }
+        if sql.starts_with(&format!("{cols_prefix}id IN (")) {
+            let mut out = Vec::new();
+            for param in &params {
+                if let SqlValue::Int(id) = param
+                    && let Some(r) = rows.iter().find(|r| r.id == *id)
+                {
+                    out.push(MockRow::to_row(r));
+                }
+            }
+            return Ok(out);
+        }
         if sql == OracleDialect::events_sql() {
             let (from, to) = (Self::int_param(&params, 0), Self::int_param(&params, 1));
             let mut out: Vec<&MockRow> = rows

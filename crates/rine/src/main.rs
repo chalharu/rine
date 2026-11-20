@@ -4,6 +4,8 @@ use anyhow::Result;
 use clap::Parser;
 use rine_etcd::backend::BackendFactory;
 
+mod listen;
+
 // On Linux/musl the system allocator limited concurrent gRPC throughput.
 #[cfg(all(target_os = "linux", target_env = "musl"))]
 #[global_allocator]
@@ -85,9 +87,9 @@ async fn main() -> Result<()> {
     let backend = factory.build()?;
     backend.initialize().await?;
 
-    // Transport setup (URL parsing, TLS validation) lives with the server
-    // code; `main` only maps CLI flags onto it.
-    let listeners = rine_etcd::server::ListenConfig {
+    // Transport setup (URL parsing, TLS validation) lives with the binary;
+    // the server library only consumes addresses plus loaded identity bytes.
+    let listeners = listen::ListenConfig {
         listen: args.listen,
         listen_client_urls: args.listen_client_urls,
         cert_file: args.cert_file,

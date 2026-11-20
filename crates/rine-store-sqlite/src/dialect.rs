@@ -58,13 +58,6 @@ impl Dialect for SqliteDialect {
         "SELECT prev_revision FROM rine WHERE name = 'compact_rev_key'"
     }
 
-    fn live_by_name_sql() -> String {
-        format!(
-            "SELECT {COLS} FROM rine WHERE name = ? AND deleted = 0",
-            COLS = Self::cols()
-        )
-    }
-
     fn events_sql() -> String {
         format!(
             "SELECT {COLS} FROM rine WHERE created >= ? AND created <= ? AND name <> 'compact_rev_key' ORDER BY id",
@@ -159,7 +152,7 @@ mod tests {
     fn binds_are_positional_qmark() {
         let owned = [
             SqliteDialect::list_range_sql(),
-            SqliteDialect::live_by_name_sql(),
+            SqliteDialect::live_by_names_sql(2),
             SqliteDialect::events_sql(),
         ];
         for sql in owned.iter().map(String::as_str).chain([

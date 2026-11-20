@@ -88,12 +88,9 @@ pub trait Backend: Send + Sync + 'static {
     /// revision so callers can rewrite response headers staged at `base + 1`.
     /// A moved read is an optimistic-concurrency conflict, never a backend
     /// error. An empty `events` batch still validates `reads` and returns the
-    /// current revision.
+    /// current revision. Dropping the returned future can never leave storage
+    /// or watch publication incomplete.
     async fn commit(&self, reads: ReadSet, events: Vec<Event>) -> Result<Revision>;
-    /// Dropping `commit` can never leave storage or watch publication incomplete.
-    fn commit_is_cancel_safe(&self) -> bool {
-        false
-    }
 
     /// Return keys in ascending key order and the full count before limiting.
     async fn list(

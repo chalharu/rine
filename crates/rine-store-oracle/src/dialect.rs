@@ -63,13 +63,6 @@ impl Dialect for OracleDialect {
         "SELECT prev_revision FROM rine WHERE name = 'compact_rev_key'"
     }
 
-    fn live_by_name_sql() -> String {
-        format!(
-            "SELECT {COLS} FROM rine WHERE name = :1 AND deleted = 0",
-            COLS = Self::cols()
-        )
-    }
-
     fn events_sql() -> String {
         format!(
             "SELECT {COLS} FROM rine WHERE created >= :1 AND created <= :2 AND name <> 'compact_rev_key' ORDER BY id",
@@ -175,7 +168,7 @@ mod tests {
     fn binds_are_oracle_style() {
         let owned = [
             OracleDialect::list_range_sql(),
-            OracleDialect::live_by_name_sql(),
+            OracleDialect::live_by_names_sql(2),
             OracleDialect::events_sql(),
         ];
         for sql in owned.iter().map(String::as_str).chain([

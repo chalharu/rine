@@ -37,20 +37,16 @@ pub trait Dialect: Send + Sync + 'static {
         format!("INSERT INTO rine ({}) VALUES ({binds})", Self::cols())
     }
 
-    fn predecessor_sql() -> String {
-        format!(
-            "SELECT {} FROM rine WHERE id = {}",
-            Self::cols(),
-            Self::bind(1)
-        )
+    /// Predecessor rows for several ids at once.
+    fn predecessor_set_sql(n: usize) -> String {
+        let binds = (1..=n).map(Self::bind).collect::<Vec<_>>().join(", ");
+        format!("SELECT {} FROM rine WHERE id IN ({binds})", Self::cols())
     }
 
-    fn latest_by_name_sql() -> String {
-        format!(
-            "SELECT id FROM rine WHERE name = {} ORDER BY id DESC {}",
-            Self::bind(1),
-            Self::first_row()
-        )
+    /// Latest physical id per key.
+    fn latest_ids_by_names_sql(n: usize) -> String {
+        let binds = (1..=n).map(Self::bind).collect::<Vec<_>>().join(", ");
+        format!("SELECT name, MAX(id) FROM rine WHERE name IN ({binds}) GROUP BY name")
     }
 
     fn snapshot_sql(end: Option<&[u8]>) -> String {
@@ -72,8 +68,14 @@ pub trait Dialect: Send + Sync + 'static {
     }
     fn compacted_rev_sql() -> &'static str;
 
-    /// Latest live row for one key.
-    fn live_by_name_sql() -> String;
+    /// Latest live rows for several keys at once.
+    fn live_by_names_sql(n: usize) -> String {
+        let binds = (1..=n).map(Self::bind).collect::<Vec<_>>().join(", ");
+        format!(
+            "SELECT {} FROM rine WHERE name IN ({binds}) AND deleted = 0",
+            Self::cols()
+        )
+    }
 
     /// Event log slice for watch replay.
     fn events_sql() -> String;

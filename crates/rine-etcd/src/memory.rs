@@ -233,10 +233,6 @@ impl Backend for MemoryBackend {
         Ok(fresh)
     }
 
-    fn commit_is_cancel_safe(&self) -> bool {
-        true
-    }
-
     async fn list(
         &self,
         prefix: &[u8],

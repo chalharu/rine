@@ -1609,6 +1609,7 @@ dependencies = [
  "rine-store-oracle",
  "rine-store-sqlite",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 

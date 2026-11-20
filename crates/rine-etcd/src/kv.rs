@@ -166,7 +166,9 @@ impl KvService {
                 (old != new).then(|| (event.key.clone(), old, new))
             })
             .collect();
-        if changes.is_empty() && self.backend.commit_is_cancel_safe() {
+        if changes.is_empty() {
+            // No lease bookkeeping to protect; `Backend::commit` is
+            // cancel-safe, so a direct call is fine.
             let _guard = guard;
             return self.backend.commit(batch.reads, batch.events).await;
         }

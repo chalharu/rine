@@ -1,4 +1,9 @@
-use std::{collections::HashSet, marker::PhantomData, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    marker::PhantomData,
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -22,8 +27,19 @@ use crate::{
 pub struct SqlBackend<E: SqlExecutor, D: Dialect> {
     exec: Arc<E>,
     tx: broadcast::Sender<Vec<Event>>,
-    writes: Mutex<()>,
+    writes: Arc<Mutex<()>>,
     _dialect: PhantomData<D>,
+}
+
+impl<E: SqlExecutor, D: Dialect> Clone for SqlBackend<E, D> {
+    fn clone(&self) -> Self {
+        Self {
+            exec: self.exec.clone(),
+            tx: self.tx.clone(),
+            writes: self.writes.clone(),
+            _dialect: PhantomData,
+        }
+    }
 }
 
 impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
@@ -32,7 +48,7 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         Self {
             exec,
             tx,
-            writes: Mutex::new(()),
+            writes: Arc::new(Mutex::new(())),
             _dialect: PhantomData,
         }
     }
@@ -236,12 +252,6 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         Ok(cur)
     }
 
-    async fn live_row(&self, key: &[u8]) -> Result<Option<Row>> {
-        self.exec
-            .query_row(&D::live_by_name_sql(), vec![SqlValue::Str(key_str(key))])
-            .await
-    }
-
     async fn list_live(
         &self,
         start: &[u8],
@@ -395,28 +405,36 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         // revisions are assigned strictly increasing, so ordering by id and
         // taking the first row is an indexed lookup, unlike MAX() which would
         // scan the whole table on every commit.
-        let mut batch: Vec<(String, Vec<SqlValue>)> = guard_only
-            .iter()
-            .map(|key| (D::live_by_name_sql(), vec![SqlValue::Str(key_str(key))]))
-            .collect();
+        let mut batch: Vec<(String, Vec<SqlValue>)> = Vec::new();
+        if !guard_only.is_empty() {
+            batch.push((
+                D::live_by_names_sql(guard_only.len()),
+                guard_only
+                    .iter()
+                    .map(|key| SqlValue::Str(key_str(key)))
+                    .collect(),
+            ));
+        }
         batch.push((D::current_revision_sql(), vec![]));
         let mut results = self.exec.query_batch(batch).await?.into_iter();
-        for key in guard_only {
-            let expected = reads
-                .points
-                .iter()
-                .find(|(k, _)| k.as_ref() == key)
-                .and_then(|(_, rev)| *rev);
+        if !guard_only.is_empty() {
             let rows = results
                 .next()
                 .ok_or_else(|| Error::Backend("missing guard read".into()))?;
-            let current = rows
-                .into_iter()
-                .next()
-                .map(|row| row_to_kv(&row).map(|kv| kv.mod_revision))
-                .transpose()?;
-            if current != expected {
-                return Err(Error::Conflict);
+            let mut live: HashMap<Vec<u8>, Revision> = HashMap::new();
+            for row in &rows {
+                let kv = row_to_kv(row)?;
+                live.entry(kv.key.to_vec()).or_insert(kv.mod_revision);
+            }
+            for key in guard_only {
+                let expected = reads
+                    .points
+                    .iter()
+                    .find(|(k, _)| k.as_ref() == key)
+                    .and_then(|(_, rev)| *rev);
+                if live.get(key).copied() != expected {
+                    return Err(Error::Conflict);
+                }
             }
         }
         let fresh = match results.next().as_ref().and_then(|rows| rows.first()) {
@@ -429,8 +447,42 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
         if events.is_empty() {
             return Ok((fresh - 1, events));
         }
-        let last = self.exec.query_row(D::last_row_id_sql(), vec![]).await?;
-        let mut id = match last {
+        // One batch for every written key's live row and latest id plus the
+        // id assignment, no matter how many keys the commit carries.
+        let mut names: Vec<String> = Vec::new();
+        {
+            let mut seen_names: HashSet<&[u8]> = HashSet::new();
+            for event in &events {
+                if seen_names.insert(event.key.as_ref()) {
+                    names.push(key_str(&event.key));
+                }
+            }
+        }
+        let name_params: Vec<SqlValue> = names.iter().map(|n| SqlValue::Str(n.clone())).collect();
+        let mut results = self
+            .exec
+            .query_batch(vec![
+                (D::live_by_names_sql(names.len()), name_params.clone()),
+                (D::latest_ids_by_names_sql(names.len()), name_params),
+                (D::last_row_id_sql().into(), vec![]),
+            ])
+            .await?
+            .into_iter();
+        let mut live: HashMap<String, Row> = HashMap::new();
+        for row in results
+            .next()
+            .ok_or_else(|| Error::Backend("missing live rows".into()))?
+        {
+            live.entry(row.get_str(1)?).or_insert(row);
+        }
+        let mut latest: HashMap<String, i64> = HashMap::new();
+        for row in results
+            .next()
+            .ok_or_else(|| Error::Backend("missing latest ids".into()))?
+        {
+            latest.insert(row.get_str(0)?, row.get_int(1)?);
+        }
+        let mut id = match results.next().as_ref().and_then(|rows| rows.first()) {
             Some(row) if !row.is_null(0) => row.get_int(0)?.max(1),
             _ => 1,
         };
@@ -442,32 +494,25 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
                     "key is reserved for compaction metadata".into(),
                 ));
             }
-            // The predecessor lookup doubles as the guard validation for keys
+            // The batched snapshot doubles as the guard validation for keys
             // this batch also writes: same lock, same state, no extra query.
-            let live = self.live_row(&event.key).await?;
+            let live_row = live.get(&name);
             if let Some(expected) = reads
                 .points
                 .iter()
                 .find(|(k, _)| k.as_ref() == event.key.as_ref())
                 .map(|(_, rev)| *rev)
             {
-                let current = live
-                    .as_ref()
+                let current = live_row
                     .map(|row| row_to_kv(row).map(|kv| kv.mod_revision))
                     .transpose()?;
                 if current != expected {
                     return Err(Error::Conflict);
                 }
             }
-            let previous = match live {
+            let previous = match live_row {
                 Some(row) => row.get_int(0)?,
-                None => self
-                    .exec
-                    .query_row(&D::latest_by_name_sql(), vec![SqlValue::Str(name.clone())])
-                    .await?
-                    .map(|row| row.get_int(0))
-                    .transpose()?
-                    .unwrap_or(0),
+                None => latest.get(&name).copied().unwrap_or(0),
             };
             id += 1;
             if event.prev_kv.is_some() {
@@ -521,6 +566,27 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
             .collect();
         Ok((fresh, rebased))
     }
+
+    /// Run one commit unit to completion: the writes lock, `begin_unit`,
+    /// validation, writes and `end_unit` always pair up, even if the caller
+    /// drops the [`commit`](Backend::commit) future that spawned this.
+    async fn commit_inner(&self, reads: ReadSet, events: Vec<Event>) -> Result<Revision> {
+        let _guard = self.writes.lock().await;
+        self.exec.begin_unit().await?;
+        match self.commit_guarded(&reads, events).await {
+            Ok((fresh, rebased)) => {
+                self.exec.end_unit(true).await?;
+                if !rebased.is_empty() {
+                    let _ = self.tx.send(rebased);
+                }
+                Ok(fresh)
+            }
+            Err(e) => {
+                let _ = self.exec.end_unit(false).await;
+                Err(e)
+            }
+        }
+    }
 }
 
 fn key_str(key: &[u8]) -> String {
@@ -566,21 +632,15 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
     }
 
     async fn commit(&self, reads: ReadSet, events: Vec<Event>) -> Result<Revision> {
-        let _guard = self.writes.lock().await;
-        self.exec.begin_unit().await?;
-        match self.commit_guarded(&reads, events).await {
-            Ok((fresh, rebased)) => {
-                self.exec.end_unit(true).await?;
-                if !rebased.is_empty() {
-                    let _ = self.tx.send(rebased);
-                }
-                Ok(fresh)
-            }
-            Err(e) => {
-                let _ = self.exec.end_unit(false).await;
-                Err(e)
-            }
-        }
+        // Run the commit unit detached: dropping this future (e.g. a
+        // cancelled RPC) never leaves the database transaction open — the
+        // unit always runs to completion with `end_unit` pairing
+        // `begin_unit`. `commit` is therefore cancel-safe; callers must not
+        // add their own spawn for that purpose.
+        let this = self.clone();
+        tokio::spawn(async move { this.commit_inner(reads, events).await })
+            .await
+            .map_err(|error| Error::task("commit task failed", error))?
     }
 
     async fn list(
@@ -659,18 +719,33 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
                 vec![SqlValue::Int(from), SqlValue::Int(to)],
             )
             .await?;
+        // One batched predecessor lookup instead of one query per event.
+        let parents: Vec<i64> = rows
+            .iter()
+            .map(|r| r.get_int(5))
+            .collect::<Result<Vec<_>>>()?;
+        let mut prev_map: HashMap<i64, Row> = HashMap::new();
+        if !parents.is_empty() {
+            for row in self
+                .exec
+                .query_all(
+                    &D::predecessor_set_sql(parents.len()),
+                    parents.iter().map(|id| SqlValue::Int(*id)).collect(),
+                )
+                .await?
+            {
+                prev_map.insert(row.get_int(0)?, row);
+            }
+        }
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
             let mut ev = row_to_event(r)?;
             let parent = r.get_int(5)?;
             if parent > 0
-                && let Some(prev) = self
-                    .exec
-                    .query_row(&D::predecessor_sql(), vec![SqlValue::Int(parent)])
-                    .await?
+                && let Some(prev) = prev_map.get(&parent)
                 && prev.get_int(3)? != 1
             {
-                ev.prev_kv = Some(row_to_kv(&prev)?);
+                ev.prev_kv = Some(row_to_kv(prev)?);
             }
             out.push(ev);
         }
@@ -718,9 +793,6 @@ mod tests {
             ""
         }
         fn compacted_rev_sql() -> &'static str {
-            unimplemented!()
-        }
-        fn live_by_name_sql() -> String {
             unimplemented!()
         }
         fn events_sql() -> String {

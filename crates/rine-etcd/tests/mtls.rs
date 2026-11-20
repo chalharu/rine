@@ -7,9 +7,9 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use rine_etcd::{
     etcdserverpb::{PutRequest, RangeRequest, kv_client::KvClient},
-    server::{EtcdServer, ListenAddr},
+    server::{EtcdServer, ListenAddr, TlsIdentity},
 };
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity, ServerTlsConfig};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 
 struct Pki {
     ca_pem: String,
@@ -67,28 +67,22 @@ fn test_pki() -> Pki {
     }
 }
 
-fn server_tls(pki: &Pki, client_auth: bool) -> ServerTlsConfig {
-    let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(
-        &pki.server_cert_pem,
-        &pki.server_key_pem,
-    ));
-    if client_auth {
-        tls = tls.client_ca_root(Certificate::from_pem(&pki.ca_pem));
+fn server_identity(pki: &Pki, client_auth: bool) -> TlsIdentity {
+    TlsIdentity {
+        cert: pki.server_cert_pem.as_bytes().to_vec(),
+        key: pki.server_key_pem.as_bytes().to_vec(),
+        client_ca: client_auth.then(|| pki.ca_pem.as_bytes().to_vec()),
     }
-    tls
 }
 
-async fn spawn(tls: ServerTlsConfig) -> SocketAddr {
+async fn spawn(tls: Option<TlsIdentity>) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
     let backend = Arc::new(rine_etcd::MemoryBackend::new());
     tokio::spawn(async move {
         EtcdServer::new(backend)
-            .serve_many(vec![ListenAddr {
-                addr,
-                tls: Some(tls),
-            }])
+            .serve_many(vec![ListenAddr { addr, tls }])
             .await
             .unwrap();
     });
@@ -139,7 +133,7 @@ async fn put_get(addr: SocketAddr, tls: ClientTlsConfig) -> anyhow::Result<Vec<u
 #[tokio::test]
 async fn mtls_client_with_certificate_succeeds() {
     let pki = test_pki();
-    let addr = spawn(server_tls(&pki, true)).await;
+    let addr = spawn(Some(server_identity(&pki, true))).await;
     let value = put_get(addr, client_tls(&pki, true)).await.unwrap();
     assert_eq!(value, b"v".to_vec());
 }
@@ -147,14 +141,14 @@ async fn mtls_client_with_certificate_succeeds() {
 #[tokio::test]
 async fn mtls_client_without_certificate_fails() {
     let pki = test_pki();
-    let addr = spawn(server_tls(&pki, true)).await;
+    let addr = spawn(Some(server_identity(&pki, true))).await;
     assert!(put_get(addr, client_tls(&pki, false)).await.is_err());
 }
 
 #[tokio::test]
 async fn tls_without_client_auth_accepts_ca_only_client() {
     let pki = test_pki();
-    let addr = spawn(server_tls(&pki, false)).await;
+    let addr = spawn(Some(server_identity(&pki, false))).await;
     let value = put_get(addr, client_tls(&pki, false)).await.unwrap();
     assert_eq!(value, b"v".to_vec());
 }
@@ -173,7 +167,7 @@ async fn mixed_plaintext_and_mtls_share_one_backend() {
     let pki = test_pki();
     let plain = free_port().await;
     let tls_addr = free_port().await;
-    let tls_cfg = server_tls(&pki, true);
+    let tls_cfg = server_identity(&pki, true);
     let backend = Arc::new(rine_etcd::MemoryBackend::new());
     tokio::spawn(async move {
         EtcdServer::new(backend)
