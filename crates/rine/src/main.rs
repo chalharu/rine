@@ -51,6 +51,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load `.env` first so `RINE_*` / `--*_FILE`-style env bindings below
+    // (declared via clap `env`) also pick up file-based configuration.
+    let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
