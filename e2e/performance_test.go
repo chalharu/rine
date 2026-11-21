@@ -213,13 +213,28 @@ func (f *perfFixture) leaseExpiryPhase() {
 		ctx := t.Context()
 		grant, err := f.c.Grant(ctx, 2)
 		noError(t, err)
-		deadline := time.Now().Add(2 * time.Second)
+		// Keep the lease alive while the 300 setup puts run: on slow
+		// disks the sequential puts alone can outlast the 2s TTL, which
+		// would fail the puts instead of measuring the drain.
+		keepCtx, stopKeepAlive := context.WithCancel(ctx)
+		keepCh, err := f.c.KeepAlive(keepCtx, grant.ID)
+		noError(t, err)
+		keepDone := make(chan struct{})
+		go func() {
+			defer close(keepDone)
+			for range keepCh {
+			}
+		}()
 		const leased = 300
 		for i := range leased {
 			if _, err := f.c.Put(ctx, f.p+"l/"+strconv.Itoa(i), f.value, clientv3.WithLease(grant.ID)); err != nil {
+				stopKeepAlive()
 				t.Fatal(err)
 			}
 		}
+		stopKeepAlive()
+		<-keepDone
+		deadline := time.Now().Add(2 * time.Second)
 		if d := time.Until(deadline); d > 0 {
 			time.Sleep(d)
 		}
