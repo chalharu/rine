@@ -1,8 +1,8 @@
-use std::{net::SocketAddr, path::PathBuf};
-
 use anyhow::Result;
 use clap::Parser;
 use rine_etcd::backend::BackendFactory;
+
+use crate::listen::ListenConfig;
 
 mod listen;
 
@@ -18,13 +18,8 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
     about = "etcd-compatible KV store with pluggable backends"
 )]
 struct Args {
-    #[arg(long, default_value = "127.0.0.1:2379", env = "RINE_LISTEN")]
-    listen: SocketAddr,
-    /// Client listen URLs, comma-separated (etcd --listen-client-urls style).
-    /// Each entry is http(s)://host:port; https:// entries serve TLS while
-    /// http:// entries stay plaintext. Takes precedence over --listen.
-    #[arg(long, env = "RINE_LISTEN_CLIENT_URLS")]
-    listen_client_urls: Option<String>,
+    #[command(flatten)]
+    listen: ListenConfig,
     #[arg(long, default_value = "memory", env = "RINE_BACKEND")]
     backend: String,
     /// SQLite options (used with `--backend sqlite`).
@@ -35,18 +30,6 @@ struct Args {
     #[cfg(feature = "oracle")]
     #[command(flatten)]
     oracle: rine_store_oracle::OracleConfig,
-    /// PEM-encoded server certificate chain (enables TLS).
-    #[arg(long, env = "RINE_CERT_FILE")]
-    cert_file: Option<PathBuf>,
-    /// PEM-encoded server private key (enables TLS).
-    #[arg(long, env = "RINE_KEY_FILE")]
-    key_file: Option<PathBuf>,
-    /// Require clients to present a certificate signed by --trusted-ca-file.
-    #[arg(long, env = "RINE_CLIENT_CERT_AUTH", default_value_t = false)]
-    client_cert_auth: bool,
-    /// PEM-encoded CA certificate used to verify client certificates.
-    #[arg(long, env = "RINE_TRUSTED_CA_FILE")]
-    trusted_ca_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -69,16 +52,7 @@ async fn main() -> Result<()> {
 
     // Transport setup (URL parsing, TLS validation) lives with the binary;
     // the server library only consumes addresses plus loaded identity bytes.
-    let listeners = listen::ListenConfig {
-        listen: args.listen,
-        listen_client_urls: args.listen_client_urls,
-        cert_file: args.cert_file,
-        key_file: args.key_file,
-        client_cert_auth: args.client_cert_auth,
-        trusted_ca_file: args.trusted_ca_file,
-    }
-    .into_listeners()
-    .await?;
+    let listeners = args.listen.into_listeners().await?;
     rine_etcd::server::EtcdServer::new(backend)
         .serve_many(listeners)
         .await?;
@@ -167,7 +141,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(args.backend, "sqlite");
-        assert_eq!(args.listen, "127.0.0.1:2380".parse().unwrap());
+        assert_eq!(args.listen.listen, "127.0.0.1:2380".parse().unwrap());
         let defaults = Args::try_parse_from(["rine"]).unwrap();
         assert_eq!(defaults.backend, "memory");
     }

@@ -314,14 +314,6 @@ pub struct SqliteConfig {
     pub path: PathBuf,
 }
 
-impl SqliteConfig {
-    /// Open the configured SQLite file as a shared backend.
-    pub fn open_backend(&self) -> rusqlite::Result<Arc<dyn rine_etcd::Backend>> {
-        let db = SqliteDb::open(&self.path)?;
-        Ok(Arc::new(crate::SqliteBackend::new(Arc::new(db))))
-    }
-}
-
 /// Factory that opens the configured SQLite file.
 pub struct SqliteFactory {
     config: SqliteConfig,
@@ -339,6 +331,7 @@ impl BackendFactory for SqliteFactory {
     }
 
     fn build(&self) -> anyhow::Result<Arc<dyn rine_etcd::Backend>> {
-        self.config.open_backend().map_err(anyhow::Error::from)
+        let db = SqliteDb::open(&self.config.path)?;
+        Ok(Arc::new(crate::SqliteBackend::new(Arc::new(db))))
     }
 }

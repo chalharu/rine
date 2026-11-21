@@ -401,25 +401,6 @@ pub struct OracleConfig {
     pub password: String,
 }
 
-impl OracleConfig {
-    /// Connect with the configured credentials as a shared backend.
-    pub fn open_backend(&self) -> anyhow::Result<Arc<dyn rine_etcd::Backend>> {
-        let connect = self.connect.clone().ok_or_else(|| {
-            anyhow::anyhow!("oracle backend needs --oracle-connect (or RINE_ORACLE_CONNECT)")
-        })?;
-        let mut config = oracledb::Config::default().set_credentials(&self.user, &self.password);
-        if let Some(dir) = &self.wallet_dir {
-            let dir = dir
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("wallet dir is not UTF-8"))?;
-            config = config.set_config_dir(dir).set_wallet_location(dir);
-        }
-        let config = config.set_connect_string(&connect)?;
-        let db = OracleDb::connect_with_config(config)?;
-        Ok(Arc::new(crate::OracleBackend::new(Arc::new(db))))
-    }
-}
-
 /// Factory that connects with the configured credentials.
 pub struct OracleFactory {
     config: OracleConfig,
@@ -437,6 +418,19 @@ impl BackendFactory for OracleFactory {
     }
 
     fn build(&self) -> anyhow::Result<Arc<dyn rine_etcd::Backend>> {
-        self.config.open_backend()
+        let connect = self.config.connect.clone().ok_or_else(|| {
+            anyhow::anyhow!("oracle backend needs --oracle-connect (or RINE_ORACLE_CONNECT)")
+        })?;
+        let mut config =
+            oracledb::Config::default().set_credentials(&self.config.user, &self.config.password);
+        if let Some(dir) = &self.config.wallet_dir {
+            let dir = dir
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("wallet dir is not UTF-8"))?;
+            config = config.set_config_dir(dir).set_wallet_location(dir);
+        }
+        let config = config.set_connect_string(&connect)?;
+        let db = OracleDb::connect_with_config(config)?;
+        Ok(Arc::new(crate::OracleBackend::new(Arc::new(db))))
     }
 }

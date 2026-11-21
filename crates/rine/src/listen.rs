@@ -11,20 +11,30 @@ use std::{net::SocketAddr, path::PathBuf};
 use rine_etcd::server::{ListenAddr, TlsIdentity};
 
 /// How the server should listen: etcd-style client URLs plus the TLS
-/// identity. The binary fills this from CLI flags; [`into_listeners`](Self::into_listeners)
-/// resolves it to concrete listeners.
+/// identity. CLI-shaped (a `clap::Args` derive flattened into the binary's
+/// `Args`); [`into_listeners`](Self::into_listeners) resolves it to
+/// concrete listeners.
+#[derive(clap::Args, Clone, Debug)]
 pub struct ListenConfig {
     /// `--listen` fallback when no client URLs are given.
+    #[arg(long, default_value = "127.0.0.1:2379", env = "RINE_LISTEN")]
     pub listen: SocketAddr,
-    /// `--listen-client-urls` value (comma-separated), if any.
+    /// Client listen URLs, comma-separated (etcd --listen-client-urls style).
+    /// Each entry is http(s)://host:port; https:// entries serve TLS while
+    /// http:// entries stay plaintext. Takes precedence over --listen.
+    #[arg(long, env = "RINE_LISTEN_CLIENT_URLS")]
     pub listen_client_urls: Option<String>,
-    /// `--cert-file`: PEM server certificate chain.
+    /// PEM-encoded server certificate chain (enables TLS).
+    #[arg(long, env = "RINE_CERT_FILE")]
     pub cert_file: Option<PathBuf>,
-    /// `--key-file`: PEM server private key.
+    /// PEM-encoded server private key (enables TLS).
+    #[arg(long, env = "RINE_KEY_FILE")]
     pub key_file: Option<PathBuf>,
-    /// `--client-cert-auth`: require client certificates.
+    /// Require clients to present a certificate signed by --trusted-ca-file.
+    #[arg(long, env = "RINE_CLIENT_CERT_AUTH", default_value_t = false)]
     pub client_cert_auth: bool,
-    /// `--trusted-ca-file`: PEM CA used to verify client certificates.
+    /// PEM-encoded CA certificate used to verify client certificates.
+    #[arg(long, env = "RINE_TRUSTED_CA_FILE")]
     pub trusted_ca_file: Option<PathBuf>,
 }
 
