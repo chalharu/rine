@@ -2,6 +2,9 @@
 //!
 //! Supported services: KV (Range/Put/DeleteRange/Txn/Compact), Watch,
 //! Lease, Maintenance::Status, Cluster::MemberList.
+//! Maintenance::Snapshot is registered but intentionally unsupported
+//! (UNIMPLEMENTED with an explanatory message): rine never stores bbolt
+//! images, so backups are backend-native.
 
 pub mod backend;
 pub mod cluster;

@@ -7,8 +7,8 @@ use std::sync::Arc;
 use crate::{
     backend::{Backend, MEMBER_ID, VERSION, header},
     etcdserverpb::{
-        Member, MemberListRequest, MemberListResponse, StatusRequest, StatusResponse,
-        cluster_server::Cluster, maintenance_server::Maintenance,
+        Member, MemberListRequest, MemberListResponse, SnapshotRequest, SnapshotResponse,
+        StatusRequest, StatusResponse, cluster_server::Cluster, maintenance_server::Maintenance,
     },
 };
 
@@ -58,6 +58,9 @@ impl MaintenanceService {
 
 #[tonic::async_trait]
 impl Maintenance for MaintenanceService {
+    type SnapshotStream =
+        tokio_stream::wrappers::ReceiverStream<Result<SnapshotResponse, tonic::Status>>;
+
     async fn status(
         &self,
         _request: tonic::Request<StatusRequest>,
@@ -76,5 +79,39 @@ impl Maintenance for MaintenanceService {
             db_size_in_use: size,
             is_learner: false,
         }))
+    }
+
+    /// Snapshot is intentionally unsupported: rine stores data in SQLite /
+    /// Oracle / memory, never in bbolt, so no byte stream here could satisfy
+    /// `snapshot status` / `snapshot restore`. Registered explicitly so the
+    /// client fails fast with this message instead of an empty
+    /// unknown-service UNIMPLEMENTED.
+    async fn snapshot(
+        &self,
+        _request: tonic::Request<SnapshotRequest>,
+    ) -> Result<tonic::Response<Self::SnapshotStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "rine: snapshot save is not supported; back up the backend directly \
+             (SQLite: copy the database file; Oracle: RMAN or Data Pump)",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MemoryBackend;
+
+    #[tokio::test]
+    async fn snapshot_fails_fast_with_guidance() {
+        let svc = MaintenanceService::new(Arc::new(MemoryBackend::new()));
+        let err = svc
+            .snapshot(tonic::Request::new(SnapshotRequest {}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        let msg = err.message();
+        assert!(msg.contains("snapshot save is not supported"), "{msg}");
+        assert!(msg.contains("SQLite"), "{msg}");
     }
 }
