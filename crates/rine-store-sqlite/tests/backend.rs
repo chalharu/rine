@@ -47,6 +47,16 @@ async fn conformance_commit_duplicate_events_conflict_atomically() {
 }
 
 #[tokio::test]
+async fn sqlite_db_size_tracks_file_growth() {
+    // Page accounting must hold at least the bytes just stored.
+    let b = backend().await;
+    kv_create(&b, Bytes::from("big"), Bytes::from(vec![7u8; 1 << 20]), 0)
+        .await
+        .unwrap();
+    assert!(b.db_size().await >= (1 << 20));
+}
+
+#[tokio::test]
 async fn sqlite_ensure_schema_is_idempotent() {
     let db = SqliteDb::open_in_memory().unwrap();
     let b = SqliteBackend::new(Arc::new(db));

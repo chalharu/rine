@@ -131,8 +131,13 @@ impl Dialect for OracleDialect {
         )
     }
 
+    /// Allocated segment bytes for our tables, indexes, and LOB storage:
+    /// one data-dictionary lookup, O(1) in table size. `LIKE 'RINE%'`
+    /// covers the `rine`/`rine_leases` tables plus their indexes; out-of-line
+    /// BLOB bytes live in system-named LOB segments resolved via `user_lobs`.
     fn db_size_sql() -> &'static str {
-        "SELECT NVL(SUM(LENGTH(name) + NVL(DBMS_LOB.GETLENGTH(value), 0)), 0) FROM rine"
+        "SELECT NVL(SUM(s.bytes), 0) FROM user_segments s WHERE s.segment_name LIKE 'RINE%' \
+          OR s.segment_name IN (SELECT l.segment_name FROM user_lobs l WHERE l.table_name LIKE 'RINE%')"
     }
 
     fn create_leases_table_sql() -> &'static str {

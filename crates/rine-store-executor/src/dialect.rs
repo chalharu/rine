@@ -101,10 +101,10 @@ pub trait Dialect: Send + Sync + 'static {
     /// ... followed by insert-if-missing (for dialects without `MERGE`).
     fn set_compact_rev_insert_sql() -> &'static str;
 
-    /// Approximate live data size in bytes (keys plus values): backs
-    /// `Maintenance::status` (`db_size`), which etcd clients and operators
-    /// read for capacity planning. A covering-index aggregate, not an exact
-    /// file size — but never a hardcoded zero.
+    /// Approximate database size in bytes for `Maintenance::status`.
+    /// Etcd itself reports the backend file size, so dialects do the same
+    /// with an O(1) engine-local query (page accounting / segment bytes)
+    /// instead of scanning the table per status call. Never a hardcoded zero.
     fn db_size_sql() -> &'static str;
 
     /// DDL for the durable lease table: one row per lease

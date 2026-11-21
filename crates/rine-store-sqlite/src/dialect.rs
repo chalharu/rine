@@ -124,8 +124,11 @@ impl Dialect for SqliteDialect {
          VALUES (0, 'compact_rev_key', 0, 0, 0, ?, 0)"
     }
 
+    /// Database file size in bytes: page accounting is O(1) no matter how
+    /// large the table grows, unlike a SUM over every row. Includes
+    /// freelist space, exactly like etcd's own backend-size reporting.
     fn db_size_sql() -> &'static str {
-        "SELECT COALESCE(SUM(LENGTH(name) + LENGTH(value)), 0) FROM rine"
+        "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()"
     }
 
     fn create_leases_table_sql() -> &'static str {

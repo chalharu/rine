@@ -92,6 +92,19 @@ async fn live_backend_crud_and_compact() {
     crud(&backend, &ns).await;
     history_compact_events(&backend, &ns).await;
 
+    // Segment accounting must hold at least the bytes just stored (a 1MiB
+    // value exercises the out-of-line LOB segment branch). Global to the
+    // schema by design, so parallel runs can only add to it.
+    kv_create(
+        &backend,
+        Bytes::from(format!("{ns}/big")),
+        Bytes::from(vec![7u8; 1 << 20]),
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(backend.db_size().await >= (1 << 20));
+
     let range = format!("{ns}/range");
     let first = Bytes::from(format!("{range}/a"));
     let second = Bytes::from(format!("{range}/b"));
