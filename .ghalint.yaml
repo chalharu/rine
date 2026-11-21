@@ -1,0 +1,21 @@
+# ghalint excludes the lockfile-covered SHA policy here because linter-service
+# runs `ghalint run` in an isolated temp repo with only the workflow file
+# plus this config -- it never copies .github/workflows/actions.lock.
+# Locally the same steps are green via the lockfile; in that sandbox the
+# policy cannot see the pins, so every tag-based `uses:` fails 008.
+# The pins themselves stay owned by the official `gh actions-lock` tool.
+excludes:
+  - policy_name: action_ref_should_be_full_length_commit_sha
+    action_name: actions/checkout
+  - policy_name: action_ref_should_be_full_length_commit_sha
+    action_name: dtolnay/rust-toolchain
+  - policy_name: action_ref_should_be_full_length_commit_sha
+    action_name: Swatinem/rust-cache
+  - policy_name: action_ref_should_be_full_length_commit_sha
+    action_name: taiki-e/install-action
+  - policy_name: action_ref_should_be_full_length_commit_sha
+    action_name: actions/upload-artifact
+  - policy_name: action_ref_should_be_full_length_commit_sha
+    action_name: actions/download-artifact
+  - policy_name: action_ref_should_be_full_length_commit_sha
+    action_name: SonarSource/sonarqube-scan-action

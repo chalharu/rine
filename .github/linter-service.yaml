@@ -1,0 +1,12 @@
+global:
+  exclude_paths: []
+linters:
+  cargo-coupling:
+    # The backend trait is depended on by every storage and service module
+    # by design (single extension point); B-grade decoupling would mean
+    # splitting the core abstraction for the metric's sake.
+    min_grade: C
+  cargo-symbol-length:
+    # Only monomorphized tonic/hyper/tokio server generics exceed the
+    # threshold; no project-authored symbol is affected.
+    disabled: true

@@ -1,0 +1,24 @@
+[package]
+description = "Oracle DB backend for rine-etcd (official oracledb driver)"
+edition.workspace = true
+license.workspace = true
+name = "rine-store-oracle"
+version.workspace = true
+
+[lib]
+name = "rine_store_oracle"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+clap.workspace = true
+oracledb.workspace = true
+rine-etcd.workspace = true
+rine-store-executor.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rine-store-conformance.workspace = true
+tonic.workspace = true
