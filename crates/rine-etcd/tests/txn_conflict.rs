@@ -68,6 +68,10 @@ impl Backend for FlakyBackend {
         self.inner.compact(revision).await
     }
 
+    async fn db_size(&self) -> i64 {
+        self.inner.db_size().await
+    }
+
     async fn events(&self, from: Revision, to: Revision) -> Result<Vec<Event>> {
         self.inner.events(from, to).await
     }

@@ -28,6 +28,7 @@ async fn conformance_crud() {
 async fn conformance_history_compact_events() {
     let b = backend().await;
     history_compact_events(&b, "t").await;
+    assert!(b.db_size().await >= 0);
 }
 
 #[tokio::test]

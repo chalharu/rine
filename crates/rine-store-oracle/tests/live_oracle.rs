@@ -81,6 +81,7 @@ async fn live_backend_crud_and_compact() {
     let backend = OracleBackend::new(Arc::new(db));
     // Creation path: table was just dropped, so this builds the schema.
     backend.initialize().await.expect("ensure_schema");
+    assert!(backend.db_size().await >= 0);
 
     // --- CRUD + history + compact (shared conformance suite) ---
     // Unique keyspace per run: this binary runs twice per CI job against

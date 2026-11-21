@@ -131,6 +131,10 @@ impl Dialect for OracleDialect {
         )
     }
 
+    fn db_size_sql() -> &'static str {
+        "SELECT NVL(SUM(LENGTH(name) + NVL(DBMS_LOB.GETLENGTH(value), 0)), 0) FROM rine"
+    }
+
     fn create_leases_table_sql() -> &'static str {
         "CREATE TABLE rine_leases (\
             id NUMBER PRIMARY KEY, \

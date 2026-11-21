@@ -124,6 +124,10 @@ impl Dialect for SqliteDialect {
          VALUES (0, 'compact_rev_key', 0, 0, 0, ?, 0)"
     }
 
+    fn db_size_sql() -> &'static str {
+        "SELECT COALESCE(SUM(LENGTH(name) + LENGTH(value)), 0) FROM rine"
+    }
+
     fn create_leases_table_sql() -> &'static str {
         "CREATE TABLE rine_leases (\
             id INTEGER PRIMARY KEY, \

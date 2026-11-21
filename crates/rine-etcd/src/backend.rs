@@ -154,6 +154,7 @@ pub trait Backend: Send + Sync + 'static {
         opts: ListOptions,
     ) -> Result<(Revision, Vec<KeyValue>, i64)>;
     async fn compact(&self, revision: Revision) -> Result<Revision>;
+    async fn db_size(&self) -> i64;
 
     /// Events in [from, to] for watch replay.
     /// Returns `Error::Compacted` when `from` is at or below the compaction watermark.

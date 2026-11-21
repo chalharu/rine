@@ -297,6 +297,14 @@ impl Backend for MemoryBackend {
         Ok(g.rev)
     }
 
+    async fn db_size(&self) -> i64 {
+        let g = self.inner.read().await;
+        g.kvs
+            .iter()
+            .map(|(k, v)| (k.len() + v.value.len()) as i64)
+            .sum()
+    }
+
     async fn events(&self, from: Revision, to: Revision) -> Result<Vec<Event>> {
         let g = self.inner.read().await;
         if from <= g.compact_rev {
@@ -598,7 +606,7 @@ mod coverage_tests {
         let b = MemoryBackend::new();
         b.initialize().await.unwrap();
         let d = MemoryBackend::default();
-        let _ = d.current_revision().await;
+        assert_eq!(d.db_size().await, 0);
     }
 
     #[tokio::test]
@@ -642,6 +650,7 @@ mod coverage_tests {
             .await
             .unwrap();
         assert!(rows.is_empty() && count == 1);
+        assert!(b.db_size().await > 0);
     }
 
     #[tokio::test]

@@ -101,6 +101,12 @@ pub trait Dialect: Send + Sync + 'static {
     /// ... followed by insert-if-missing (for dialects without `MERGE`).
     fn set_compact_rev_insert_sql() -> &'static str;
 
+    /// Approximate live data size in bytes (keys plus values): backs
+    /// `Maintenance::status` (`db_size`), which etcd clients and operators
+    /// read for capacity planning. A covering-index aggregate, not an exact
+    /// file size — but never a hardcoded zero.
+    fn db_size_sql() -> &'static str;
+
     /// DDL for the durable lease table: one row per lease
     /// (`id`, granted TTL seconds, wall-clock expiry millis, attached keys).
     fn create_leases_table_sql() -> &'static str;

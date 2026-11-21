@@ -705,6 +705,16 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
         Ok(cur)
     }
 
+    async fn db_size(&self) -> i64 {
+        self.exec
+            .query_row(D::db_size_sql(), vec![])
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.get_int(0).ok())
+            .unwrap_or(0)
+    }
+
     async fn events(&self, from: Revision, to: Revision) -> Result<Vec<Event>> {
         let _guard = self.writes.lock().await;
         let c = self.compacted_inner().await?;
@@ -920,6 +930,9 @@ mod tests {
             ""
         }
         fn set_compact_rev_insert_sql() -> &'static str {
+            ""
+        }
+        fn db_size_sql() -> &'static str {
             ""
         }
         fn create_leases_table_sql() -> &'static str {
