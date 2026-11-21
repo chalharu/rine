@@ -20,6 +20,9 @@ async-trait = "=0.1.92"
 bytes = "=1.12.2"
 clap = { features = ["derive", "env"], version = "=4.6.8" }
 dotenvy = "=0.15.7"
+hyper = { features = ["server", "http1"], version = "=1.12.0" }
+http-body-util = "=0.1.5"
+hyper-util = { features = ["tokio"], version = "=0.1.21" }
 mimalloc = { features = [
   "local_dynamic_tls",
   "override",
@@ -27,6 +30,7 @@ mimalloc = { features = [
   "v2",
 ], version = "=0.1.52" }
 oracledb = "=26.0.0-beta.6"
+prometheus = { features = ["process"], version = "=0.14.0" }
 prost = "=0.14.6"
 protoc-bin-vendored = "=3.3.0"
 rcgen = "=0.14.10"
@@ -39,7 +43,9 @@ rusqlite = { features = ["bundled"], version = "=0.43.0" }
 rustls = { features = ["ring", "std", "tls12"], version = "=0.23.46" }
 thiserror = "=2.0.21"
 tokio = { features = ["full"], version = "=1.54.1" }
+tokio-rustls = { default-features = false, features = ["ring", "tls12"], version = "=0.26.6" }
 tokio-stream = { features = ["sync"], version = "=0.1.19" }
+tonic-health = "=0.14.9"
 tonic = { features = ["tls-ring", "transport"], version = "=0.14.9" }
 tonic-prost = "=0.14.9"
 tonic-prost-build = "=0.14.9"

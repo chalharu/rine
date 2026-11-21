@@ -7,8 +7,9 @@ use std::sync::Arc;
 use crate::{
     backend::{Backend, MEMBER_ID, VERSION, header},
     etcdserverpb::{
-        Member, MemberListRequest, MemberListResponse, SnapshotRequest, SnapshotResponse,
-        StatusRequest, StatusResponse, cluster_server::Cluster, maintenance_server::Maintenance,
+        AlarmRequest, AlarmResponse, Member, MemberListRequest, MemberListResponse,
+        SnapshotRequest, SnapshotResponse, StatusRequest, StatusResponse,
+        alarm_request::AlarmAction, cluster_server::Cluster, maintenance_server::Maintenance,
     },
 };
 
@@ -81,6 +82,25 @@ impl Maintenance for MaintenanceService {
         }))
     }
 
+    /// Alarm is a read-only stub: rine runs no quota or corruption watcher,
+    /// so GET always reports an empty list (which is also what
+    /// `endpoint health` needs). Raising or clearing alarms is rejected.
+    async fn alarm(
+        &self,
+        request: tonic::Request<AlarmRequest>,
+    ) -> Result<tonic::Response<AlarmResponse>, tonic::Status> {
+        let req = request.into_inner();
+        if req.action != AlarmAction::Get as i32 {
+            return Err(tonic::Status::invalid_argument(
+                "rine: alarms cannot be raised or cleared",
+            ));
+        }
+        Ok(tonic::Response::new(AlarmResponse {
+            header: Some(header(self.backend.current_revision().await)),
+            alarms: Vec::new(),
+        }))
+    }
+
     /// Snapshot is intentionally unsupported: rine stores data in SQLite /
     /// Oracle / memory, never in bbolt, so no byte stream here could satisfy
     /// `snapshot status` / `snapshot restore`. Registered explicitly so the
@@ -101,6 +121,31 @@ impl Maintenance for MaintenanceService {
 mod tests {
     use super::*;
     use crate::MemoryBackend;
+
+    #[tokio::test]
+    async fn alarm_get_is_empty_and_mutations_rejected() {
+        use crate::etcdserverpb::AlarmRequest;
+        let svc = MaintenanceService::new(Arc::new(MemoryBackend::new()));
+        let ok = svc
+            .alarm(tonic::Request::new(AlarmRequest {
+                action: AlarmAction::Get as i32,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(ok.alarms.is_empty());
+        for action in [AlarmAction::Activate, AlarmAction::Deactivate] {
+            let err = svc
+                .alarm(tonic::Request::new(AlarmRequest {
+                    action: action as i32,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+    }
 
     #[tokio::test]
     async fn snapshot_fails_fast_with_guidance() {

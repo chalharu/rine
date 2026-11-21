@@ -153,6 +153,42 @@ async fn tls_without_client_auth_accepts_ca_only_client() {
     assert_eq!(value, b"v".to_vec());
 }
 
+/// The same TLS listener also answers plain-HTTPS monitoring routes:
+/// ALPN `http/1.1` (or no ALPN) goes to the HTTP handler, not gRPC.
+#[tokio::test]
+async fn tls_listener_serves_https_health_and_metrics() {
+    use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject as _};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let pki = test_pki();
+    let addr = spawn(Some(server_identity(&pki, false))).await;
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add_parsable_certificates(
+        CertificateDer::pem_slice_iter(pki.ca_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+    );
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut tls = connector
+        .connect(ServerName::try_from("localhost").unwrap().to_owned(), tcp)
+        .await
+        .unwrap();
+    tls.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut raw = Vec::new();
+    tls.read_to_end(&mut raw).await.unwrap();
+    let raw = String::from_utf8(raw).unwrap();
+    assert!(raw.contains("200 OK"), "{raw}");
+    assert!(raw.contains("etcd_server_has_leader 1"), "{raw}");
+}
+
 /// Reserve a likely-free port. The bind is dropped before the server
 /// rebinds, so a rival process can steal it in between (TOCTOU): callers
 /// retry the whole bind on `AddrInUse` instead of failing the test.

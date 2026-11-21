@@ -429,5 +429,16 @@ func TestExtendedConformance(t *testing.T) {
 			equal(t, "future Range gRPC code", status.Code(err), codes.OutOfRange)
 			equal(t, "future Range etcd error", rpctypes.Error(err), rpctypes.ErrFutureRev)
 		})
+		t.Run("EndpointHealth", func(t *testing.T) {
+			// Mirrors `etcdctl endpoint health`: a readable key plus an
+			// empty alarm list means healthy.
+			key := p + "health"
+			put(t, ctx, c, key, "ok")
+			equal(t, "health key readable", get(t, ctx, c, key).Count, int64(1))
+			rawM := etcdserverpb.NewMaintenanceClient(c.ActiveConnection())
+			alarms, err := rawM.Alarm(ctx, &etcdserverpb.AlarmRequest{})
+			noError(t, err)
+			equal(t, "active alarm count", len(alarms.Alarms), 0)
+		})
 	})
 }

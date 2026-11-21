@@ -37,6 +37,9 @@ service Maintenance {
   // of unknown-service. rine snapshots are backend-native (SQLite file
   // copy, Oracle RMAN/Data Pump), never bbolt images.
   rpc Snapshot(SnapshotRequest) returns (stream SnapshotResponse);
+  // GET returns the (always empty) alarm list so `endpoint health` passes.
+  // There is no alarm subsystem: ACTIVATE/DEACTIVATE are rejected.
+  rpc Alarm(AlarmRequest) returns (AlarmResponse);
 }
 
 message ResponseHeader {
@@ -309,4 +312,31 @@ message SnapshotResponse {
   ResponseHeader header = 1;
   uint64 remaining_bytes = 2;
   bytes blob = 3;
+}
+
+enum AlarmType {
+  NONE = 0;
+  NOSPACE = 1;
+  CORRUPT = 2;
+}
+
+message AlarmRequest {
+  enum AlarmAction {
+    GET = 0;
+    ACTIVATE = 1;
+    DEACTIVATE = 2;
+  }
+  AlarmAction action = 1;
+  uint64 memberID = 2;
+  AlarmType alarm = 3;
+}
+
+message AlarmMember {
+  uint64 memberID = 1;
+  AlarmType alarm = 2;
+}
+
+message AlarmResponse {
+  ResponseHeader header = 1;
+  repeated AlarmMember alarms = 2;
 }

@@ -1,12 +1,17 @@
 //! gRPC server wiring.
 //!
-//! Transport *mechanism* lives here: applying a [`TlsIdentity`] to tonic,
-//! serving plaintext and TLS listeners on one shared backend. Transport
-//! *configuration* (flag parsing, file reads, URL interpretation) lives with
-//! the binary (`rine/src/listen.rs`); this module only consumes an address
-//! plus already-loaded identity bytes.
+//! Transport *mechanism* lives here: applying a [`TlsIdentity`] to rustls,
+//! serving plaintext and TLS listeners on one shared backend, and routing
+//! each accepted connection: HTTP/2 preface (or TLS ALPN `h2`) goes to the
+//! gRPC router, anything else (GET /health, /version, /metrics) to the
+//! plain-HTTP handler. Transport *configuration* (flag parsing, file reads,
+//! URL interpretation) lives with the binary (`rine/src/listen.rs`); this
+//! module only consumes an address plus already-loaded identity bytes.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
+
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::{
     backend::Backend,
@@ -15,6 +20,7 @@ use crate::{
         cluster_server::ClusterServer, kv_server::KvServer, lease_server::LeaseServer,
         maintenance_server::MaintenanceServer, watch_server::WatchServer,
     },
+    http::HttpState,
     kv::KvService,
     lease::{LeaseManager, LeaseService},
     watch::WatchService,
@@ -84,17 +90,21 @@ impl EtcdServer {
         let scheme = if tls.is_some() { "https" } else { "http" };
         let client_url = format!("{scheme}://{addr}");
         tracing::info!(%addr, tls = tls.is_some(), "serving etcd-compatible gRPC");
-        let mut builder = tonic::transport::Server::builder();
-        if let Some(identity) = tls {
-            let mut config = tonic::transport::ServerTlsConfig::new().identity(
-                tonic::transport::Identity::from_pem(identity.cert, identity.key),
-            );
-            if let Some(ca) = identity.client_ca {
-                config = config.client_ca_root(tonic::transport::Certificate::from_pem(ca));
-            }
-            builder = builder.tls_config(config)?;
-        }
-        builder
+        let (health_reporter, health_service) = tonic_health::server::health_reporter();
+        health_reporter.set_serving::<KvServer<KvService>>().await;
+        health_reporter
+            .set_serving::<WatchServer<WatchService>>()
+            .await;
+        health_reporter
+            .set_serving::<LeaseServer<LeaseService>>()
+            .await;
+        health_reporter
+            .set_serving::<ClusterServer<ClusterService>>()
+            .await;
+        health_reporter
+            .set_serving::<MaintenanceServer<MaintenanceService>>()
+            .await;
+        let router = tonic::transport::Server::builder()
             .add_service(KvServer::new(KvService::new(backend.clone(), writes)))
             .add_service(WatchServer::new(WatchService::new(backend.clone())))
             .add_service(LeaseServer::new(LeaseService::new(backend.clone(), leases)))
@@ -102,8 +112,19 @@ impl EtcdServer {
                 backend.clone(),
                 client_url,
             )))
-            .add_service(MaintenanceServer::new(MaintenanceService::new(backend)))
-            .serve(addr)
+            .add_service(MaintenanceServer::new(MaintenanceService::new(
+                backend.clone(),
+            )))
+            .add_service(health_service);
+        let (grpc_tx, grpc_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<Conn, std::io::Error>>();
+        let http = HttpState::new(backend);
+        let listener = TcpListener::bind(addr).await?;
+        tokio::spawn(accept_loop(listener, tls, grpc_tx, http));
+        router
+            .serve_with_incoming(tokio_stream::wrappers::UnboundedReceiverStream::new(
+                grpc_rx,
+            ))
             .await?;
         Ok(())
     }
@@ -141,6 +162,177 @@ pub async fn serve_ephemeral(backend: Arc<dyn Backend>) -> String {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     endpoint
+}
+
+/// One accepted connection, plaintext or already TLS-terminated, feeding
+/// either the gRPC router or the plain-HTTP handler.
+enum Conn {
+    Plain(TcpStream),
+    // Boxed: the TLS stream is ~1KB and every pooled connection would
+    // otherwise pay that size (`large_enum_variant`).
+    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for Conn {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Conn::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            Conn::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Conn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Conn::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            Conn::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Conn::Plain(s) => Pin::new(s).poll_flush(cx),
+            Conn::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Conn::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            Conn::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+impl tonic::transport::server::Connected for Conn {
+    type ConnectInfo = tonic::transport::server::TcpConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        let (local_addr, remote_addr) = match self {
+            Conn::Plain(s) => (s.local_addr().ok(), s.peer_addr().ok()),
+            Conn::Tls(s) => {
+                let inner = &s.get_ref().0;
+                (inner.local_addr().ok(), inner.peer_addr().ok())
+            }
+        };
+        tonic::transport::server::TcpConnectInfo {
+            local_addr,
+            remote_addr,
+        }
+    }
+}
+
+/// True when the socket opens with the HTTP/2 connection preface, i.e. a
+/// gRPC client. Anything else (GET /health, Prometheus scrape) is HTTP/1.1.
+/// Peeking never consumes, so the socket passes on untouched.
+async fn is_grpc(sock: &TcpStream) -> bool {
+    let mut head = [0u8; 4];
+    let mut n = 0;
+    let peek = async {
+        while n < head.len() {
+            let m = sock.peek(&mut head[n..]).await?;
+            if m == 0 {
+                break;
+            }
+            n += m;
+        }
+        Ok::<_, std::io::Error>(())
+    };
+    tokio::time::timeout(Duration::from_secs(5), peek)
+        .await
+        .is_ok()
+        && head == *b"PRI "
+}
+
+fn tls_acceptor(id: &TlsIdentity) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
+    use rustls::{
+        RootCertStore,
+        pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _},
+        server::WebPkiClientVerifier,
+    };
+    let certs = CertificateDer::pem_slice_iter(&id.cert).collect::<Result<Vec<_>, _>>()?;
+    let key = PrivateKeyDer::from_pem_slice(&id.key)?;
+    let builder = rustls::ServerConfig::builder();
+    let builder = match &id.client_ca {
+        Some(pem) => {
+            let cas = CertificateDer::pem_slice_iter(pem).collect::<Result<Vec<_>, _>>()?;
+            let mut roots = RootCertStore::empty();
+            roots.add_parsable_certificates(cas);
+            builder
+                .with_client_cert_verifier(WebPkiClientVerifier::builder(Arc::new(roots)).build()?)
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let mut config = builder.with_single_cert(certs, key)?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Accept forever on one listener, routing gRPC to the tonic router and
+/// plain HTTP to [`HttpState`](crate::http::HttpState). Runs as a task;
+/// accept errors are logged and skipped, never fatal.
+async fn accept_loop(
+    listener: TcpListener,
+    tls: Option<TlsIdentity>,
+    grpc_tx: tokio::sync::mpsc::UnboundedSender<Result<Conn, std::io::Error>>,
+    http: HttpState,
+) {
+    let acceptor = tls.as_ref().map(tls_acceptor);
+    let acceptor = match acceptor {
+        Some(Ok(a)) => Some(a),
+        Some(Err(e)) => {
+            tracing::error!("invalid TLS identity: {e:#}");
+            return;
+        }
+        None => None,
+    };
+    loop {
+        let (sock, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!("accept failed: {e}");
+                continue;
+            }
+        };
+        let (grpc_tx, http) = (grpc_tx.clone(), http.clone());
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            if let Some(acceptor) = acceptor {
+                match acceptor.accept(sock).await {
+                    Ok(tls) => {
+                        let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
+                        if h2 {
+                            let _ = grpc_tx.send(Ok(Conn::Tls(Box::new(tls))));
+                        } else {
+                            http.serve_conn(Conn::Tls(Box::new(tls))).await;
+                        }
+                    }
+                    Err(e) => tracing::warn!("TLS handshake failed: {e}"),
+                }
+                return;
+            }
+            if is_grpc(&sock).await {
+                let _ = grpc_tx.send(Ok(Conn::Plain(sock)));
+            } else {
+                http.serve_conn(Conn::Plain(sock)).await;
+            }
+        });
+    }
 }
 
 #[cfg(test)]
