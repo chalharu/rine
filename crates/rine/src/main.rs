@@ -63,15 +63,15 @@ async fn main() -> Result<()> {
 /// list plus the new crate's own `BackendFactory` impl and CLI config;
 /// `--backend` selection and the unknown-name error follow automatically.
 #[allow(unused_mut)]
-fn build_factories(args: &Args) -> Vec<Box<dyn BackendFactory>> {
+fn build_factories(_args: &Args) -> Vec<Box<dyn BackendFactory>> {
     let mut factories: Vec<Box<dyn BackendFactory>> = vec![Box::new(rine_etcd::MemoryFactory)];
     #[cfg(feature = "sqlite")]
     factories.push(Box::new(rine_store_sqlite::SqliteFactory::new(
-        args.sqlite.clone(),
+        _args.sqlite.clone(),
     )));
     #[cfg(feature = "oracle")]
     factories.push(Box::new(rine_store_oracle::OracleFactory::new(
-        args.oracle.clone(),
+        _args.oracle.clone(),
     )));
     factories
 }
