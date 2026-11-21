@@ -11,7 +11,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use rine_etcd::error::{Error, Result};
+use rine_etcd::{
+    backend::BackendFactory,
+    error::{Error, Result},
+};
 use rine_store_executor::{Row, SqlExecutor, SqlValue};
 use rusqlite::{ToSql, types::ToSqlOutput};
 use tokio::sync::Mutex;
@@ -316,5 +319,26 @@ impl SqliteConfig {
     pub fn open_backend(&self) -> rusqlite::Result<Arc<dyn rine_etcd::Backend>> {
         let db = SqliteDb::open(&self.path)?;
         Ok(Arc::new(crate::SqliteBackend::new(Arc::new(db))))
+    }
+}
+
+/// Factory that opens the configured SQLite file.
+pub struct SqliteFactory {
+    config: SqliteConfig,
+}
+
+impl SqliteFactory {
+    pub fn new(config: SqliteConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl BackendFactory for SqliteFactory {
+    fn name(&self) -> &'static str {
+        "sqlite"
+    }
+
+    fn build(&self) -> anyhow::Result<Arc<dyn rine_etcd::Backend>> {
+        self.config.open_backend().map_err(anyhow::Error::from)
     }
 }

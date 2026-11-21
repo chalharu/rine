@@ -20,8 +20,8 @@ use tokio::sync::{RwLock, broadcast};
 
 use crate::{
     backend::{
-        BROADCAST_CAP, Backend, Event, KeyValue, LeaseId, LeaseState, ListOptions, ObservedRange,
-        ReadSet, Revision, in_range,
+        BROADCAST_CAP, Backend, BackendFactory, Event, KeyValue, LeaseId, LeaseState, ListOptions,
+        ObservedRange, ReadSet, Revision, in_range,
     },
     error::{Error, Result},
 };
@@ -42,6 +42,19 @@ pub struct MemoryBackend {
     leases: Arc<RwLock<HashMap<i64, LeaseState>>>,
     next_lease: Arc<AtomicI64>,
     tx: broadcast::Sender<Vec<Event>>,
+}
+
+/// Factory for the in-process [`MemoryBackend`]; takes no configuration.
+pub struct MemoryFactory;
+
+impl BackendFactory for MemoryFactory {
+    fn name(&self) -> &'static str {
+        "memory"
+    }
+
+    fn build(&self) -> anyhow::Result<Arc<dyn Backend>> {
+        Ok(Arc::new(MemoryBackend::new()))
+    }
 }
 
 /// In-process backend; takes no configuration.
@@ -603,7 +616,9 @@ mod coverage_tests {
 
     #[tokio::test]
     async fn factory_and_default() {
-        let b = MemoryBackend::new();
+        let f = MemoryFactory;
+        assert_eq!(f.name(), "memory");
+        let b = f.build().unwrap();
         b.initialize().await.unwrap();
         let d = MemoryBackend::default();
         assert_eq!(d.db_size().await, 0);

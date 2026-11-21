@@ -190,6 +190,21 @@ pub trait Backend: Send + Sync + 'static {
     async fn lease_ids(&self) -> Result<Vec<LeaseId>>;
 }
 
+/// Construction of one named [`Backend`] implementation.
+///
+/// Each storage crate provides a factory over its own CLI config struct
+/// (a `clap::Args` derive); the server binary registers every compiled-in
+/// factory and selects one via `--backend`. The [`name`](Self::name) is
+/// both the selector and the unknown-backend error text, so flag values
+/// can never drift from the implementations.
+pub trait BackendFactory: Send + Sync {
+    /// Backend identifier used with `--backend`.
+    fn name(&self) -> &'static str;
+    /// Build the backend (open files, connect). Does not provision the
+    /// schema; call [`Backend::initialize`] afterwards.
+    fn build(&self) -> anyhow::Result<Arc<dyn Backend>>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

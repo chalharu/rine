@@ -20,7 +20,7 @@ use std::{
 use async_trait::async_trait;
 use oracledb::ToDbValue;
 use rine_etcd::{
-    backend::{Event, Revision},
+    backend::{BackendFactory, Event, Revision},
     error::{Error, Result},
 };
 use rine_store_executor::{Row, SqlExecutor, SqlValue};
@@ -417,5 +417,26 @@ impl OracleConfig {
         let config = config.set_connect_string(&connect)?;
         let db = OracleDb::connect_with_config(config)?;
         Ok(Arc::new(crate::OracleBackend::new(Arc::new(db))))
+    }
+}
+
+/// Factory that connects with the configured credentials.
+pub struct OracleFactory {
+    config: OracleConfig,
+}
+
+impl OracleFactory {
+    pub fn new(config: OracleConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl BackendFactory for OracleFactory {
+    fn name(&self) -> &'static str {
+        "oracle"
+    }
+
+    fn build(&self) -> anyhow::Result<Arc<dyn rine_etcd::Backend>> {
+        self.config.open_backend()
     }
 }

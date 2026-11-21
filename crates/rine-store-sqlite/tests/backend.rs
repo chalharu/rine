@@ -391,13 +391,16 @@ async fn sqlite_executor_edges_and_lifecycle() {
         .await
         .unwrap_err();
     assert!(matches!(err, rine_etcd::error::Error::TableMissing(_)));
-    // File open plus the config open path.
+    // File open plus the factory path.
     let dir = std::env::temp_dir().join(format!("rine-test-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&dir);
     let file_db = SqliteDb::open(&dir).unwrap();
-    let backend = rine_store_sqlite::SqliteConfig { path: dir.clone() }
-        .open_backend()
-        .unwrap();
+    use rine_etcd::backend::BackendFactory as _;
+    let factory = rine_store_sqlite::SqliteFactory::new(rine_store_sqlite::SqliteConfig {
+        path: dir.clone(),
+    });
+    assert_eq!(factory.name(), "sqlite");
+    let backend = factory.build().unwrap();
     backend.initialize().await.unwrap();
     drop(file_db);
     let _ = std::fs::remove_file(&dir);
