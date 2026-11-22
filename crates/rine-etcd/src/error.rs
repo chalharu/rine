@@ -2,8 +2,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("key exists: {0:?}")]
-    KeyExists(Vec<u8>),
+    #[error("key exists")]
+    KeyExists,
     #[error("revision compacted: requested {requested}, compacted {compacted}")]
     Compacted { requested: i64, compacted: i64 },
     #[error("future revision: requested {requested}, current {current}")]
@@ -64,7 +64,7 @@ pub fn status_err(e: Error) -> tonic::Status {
             tonic::Status::out_of_range("etcdserver: mvcc: required revision is a future revision")
         }
         Error::Conflict => tonic::Status::aborted("storage revision changed during transaction"),
-        Error::KeyExists(_) => tonic::Status::already_exists("key already exists"),
+        Error::KeyExists => tonic::Status::already_exists("key already exists"),
         Error::Backend(s) => tonic::Status::internal(s.to_string()),
         Error::TableMissing(s) | Error::AlreadyExists(s) | Error::LockContention(s) => {
             tonic::Status::internal(s)
@@ -115,7 +115,7 @@ mod status_tests {
         );
         assert_eq!(status_err(Error::Conflict).code(), tonic::Code::Aborted);
         assert_eq!(
-            status_err(Error::KeyExists(vec![1])).code(),
+            status_err(Error::KeyExists).code(),
             tonic::Code::AlreadyExists
         );
         assert_eq!(

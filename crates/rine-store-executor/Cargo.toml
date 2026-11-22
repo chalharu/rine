@@ -14,7 +14,3 @@ async-trait.workspace = true
 bytes.workspace = true
 rine-etcd.workspace = true
 tokio.workspace = true
-
-[dev-dependencies]
-tokio-stream.workspace = true
-tonic.workspace = true

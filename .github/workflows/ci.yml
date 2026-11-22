@@ -19,15 +19,18 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      - uses: actions/checkout@v4.4.0
+      - &checkout
+        uses: actions/checkout@v4.4.0
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2.9.3
-      - name: install cargo-llvm-cov
+      - &rust-cache
+        uses: Swatinem/rust-cache@v2.9.3
+      - &install-llvm-cov
+        name: install cargo-llvm-cov
         uses: taiki-e/install-action@v2.90.6
         with:
           tool: cargo-llvm-cov
@@ -78,14 +81,12 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      - uses: actions/checkout@v4.4.0
-        with:
-          persist-credentials: false
+      - *checkout
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2.9.3
+      - *rust-cache
       - name: wait for Oracle XE (TCP + PDB open)
         run: |
           for i in $(seq 1 60); do
@@ -98,17 +99,11 @@ jobs:
           done
           echo "Oracle XE did not open port 1521 in time"
           exit 1
-      - name: install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.90.6
-        with:
-          tool: cargo-llvm-cov
-      - name: backend integration test (live XE)
-        run: |
-          mkdir -p coverage
-          cargo llvm-cov --no-report -p rine-store-oracle --test live_oracle -- --nocapture
+      - *install-llvm-cov
       - name: full workspace tests against live XE
         run: |
-          cargo llvm-cov --no-report --workspace
+          mkdir -p coverage
+          cargo llvm-cov --no-report --workspace -- --nocapture
           cargo llvm-cov report --lcov --output-path coverage/raw-oracle.info
           sh scripts/lcov-workspace.sh coverage/raw-oracle.info coverage/lcov-oracle.info
           rm coverage/raw-oracle.info
@@ -129,13 +124,11 @@ jobs:
       RINE_SQLITE_PATH: /tmp/rine.db
       RINE_LISTEN: 127.0.0.1:2379
     steps:
-      - uses: actions/checkout@v4.4.0
-        with:
-          persist-credentials: false
+      - *checkout
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@v2.9.3
+      - *rust-cache
       - name: build rine
         run: cargo build --locked -p rine
       - name: start rine on the SQLite backend
@@ -215,13 +208,11 @@ jobs:
       RINE_ORACLE_PASSWORD: RinePass123_
       RINE_LISTEN: 127.0.0.1:2379
     steps:
-      - uses: actions/checkout@v4.4.0
-        with:
-          persist-credentials: false
+      - *checkout
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@v2.9.3
+      - *rust-cache
       - name: wait for Oracle XE (TCP + PDB open)
         run: |
           for i in $(seq 1 60); do
@@ -290,9 +281,22 @@ jobs:
           path: coverage
           merge-multiple: true
       - name: Split coverage per crate module
+        # Sonar's Rust sensor resolves reportPaths against each crate
+        # directory; the workspace root is a virtual manifest, so split.
         run: |
           for info in coverage/lcov-*.info; do
-            sh scripts/lcov-per-crate.sh "$info" "$(basename "$info")"
+            base="$(basename "$info")"
+            for d in crates/*/; do
+              name="${d%/}"; name="${name#crates/}"
+              awk -v prefix="SF:crates/${name}/" '
+                /^SF:/ { keep = index($0, prefix) == 1 }
+                keep {
+                  if (/^SF:/) { $0 = "SF:" substr($0, length(prefix) + 1) }
+                  print
+                }
+                /^end_of_record$/ { keep = 0 }
+              ' "$info" > "crates/${name}/${base}"
+            done
           done
           rm coverage/lcov-*.info
       - name: SonarCloud scan

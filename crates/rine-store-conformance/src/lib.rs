@@ -1,4 +1,6 @@
-//! Shared conformance suite for [`Backend`](rine_etcd::Backend) implementations.
+//! Shared conformance suite for [`Backend`](rine_etcd::backend::Backend)
+//! implementations: CRUD, history/compaction, watch delivery, and commit
+//! guards.
 //!
 //! Every storage backend (memory, SQLite, Oracle) upholds the same
 //! MVCC contract; these scenarios are generic over the [`Backend`] trait, so
@@ -79,7 +81,7 @@ pub async fn kv_update<B: Backend>(
 ) -> Result<Revision> {
     let (_, prev) = kv_get(b, &key, 0).await?;
     let Some(prev) = prev else {
-        return Err(Error::KeyExists(key.to_vec()));
+        return Err(Error::KeyExists);
     };
     if expected_mod_revision != 0 && prev.mod_revision != expected_mod_revision {
         return Err(Error::Backend("mod revision mismatch".into()));

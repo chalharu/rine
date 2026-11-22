@@ -51,10 +51,6 @@ impl Dialect for SqliteDialect {
         "?".into()
     }
 
-    fn compacted_rev_sql() -> &'static str {
-        "SELECT prev_revision FROM rine WHERE name = 'compact_rev_key'"
-    }
-
     fn events_sql() -> String {
         format!(
             "SELECT {COLS} FROM rine WHERE created >= ? AND created <= ? AND name <> 'compact_rev_key' ORDER BY id",

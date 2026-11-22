@@ -84,7 +84,7 @@ impl WriteBatch {
     }
 }
 
-pub struct KvService {
+pub(crate) struct KvService {
     backend: Arc<dyn Backend>,
     writes: CommitLock,
 }

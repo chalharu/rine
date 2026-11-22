@@ -27,6 +27,5 @@ pub mod etcdserverpb {
     tonic::include_proto!("etcdserverpb");
 }
 
-pub use backend::{Backend, BackendFactory, Event, KeyValue, LeaseId, Revision};
-pub use error::{Error, Result};
+pub use backend::Backend;
 pub use memory::{MemoryBackend, MemoryFactory};

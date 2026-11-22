@@ -129,6 +129,20 @@ impl ObservedRange {
                 .zip(self.observed.iter())
                 .all(|((k, r), (ek, er))| k == ek && r == er)
     }
+
+    /// Reject with [`crate::error::Error::Conflict`] when a fresh
+    /// backend-level read no longer shows the recorded snapshot.
+    pub fn revalidate(&self, kvs: &[KeyValue], count: i64) -> Result<()> {
+        let snapshot: Vec<(Bytes, Revision)> = kvs
+            .iter()
+            .map(|kv| (kv.key.clone(), kv.mod_revision))
+            .collect();
+        if self.matches_snapshot(&snapshot, count) {
+            Ok(())
+        } else {
+            Err(crate::error::Error::Conflict)
+        }
+    }
 }
 
 #[async_trait]

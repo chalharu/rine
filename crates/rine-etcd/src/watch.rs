@@ -96,7 +96,7 @@ fn to_proto_event(e: &Event, want_prev: bool) -> mvccpb::Event {
     }
 }
 
-pub struct WatchService {
+pub(crate) struct WatchService {
     backend: Arc<dyn Backend>,
     next_id: Arc<AtomicI64>,
 }

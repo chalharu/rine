@@ -22,7 +22,7 @@ use crate::backend::{Backend, VERSION};
 
 /// Shared state for one listener's HTTP routes.
 #[derive(Clone)]
-pub struct HttpState {
+pub(crate) struct HttpState {
     backend: Arc<dyn Backend>,
     metrics: Arc<Metrics>,
 }

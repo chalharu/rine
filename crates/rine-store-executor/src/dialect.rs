@@ -1,9 +1,7 @@
 //! SQL dialects for `rine` backends.
 //!
 //! [`Dialect`] abstracts the per-database SQL (`:1` vs `?` placeholders,
-//! DDL, a few functions); the MVCC logic in `SqlBackend` is shared. The
-//! strings are covered by unit tests asserting placeholder style, plus the
-//! live XE test in CI covers Oracle against a real database.
+//! DDL, a few functions); the MVCC logic in `SqlBackend` is shared.
 
 use rine_etcd::backend::ListOptions;
 
@@ -57,7 +55,9 @@ pub trait Dialect: Send + Sync + 'static {
              WHERE snapshot_rank = 1 AND deleted <> 1 ORDER BY name"
         )
     }
-    fn compacted_rev_sql() -> &'static str;
+    fn compacted_rev_sql() -> &'static str {
+        "SELECT prev_revision FROM rine WHERE name = 'compact_rev_key'"
+    }
 
     /// Event log slice for watch replay.
     fn events_sql() -> String;

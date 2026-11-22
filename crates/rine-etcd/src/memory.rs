@@ -94,14 +94,7 @@ impl MemoryBackend {
         opts.revision = 0;
         let (_, kvs, count) =
             Self::list_locked(g, &range.prefix, range.range_end.as_deref(), opts)?;
-        let snapshot: Vec<(Bytes, Revision)> = kvs
-            .iter()
-            .map(|kv| (kv.key.clone(), kv.mod_revision))
-            .collect();
-        if !range.matches_snapshot(&snapshot, count) {
-            return Err(Error::Conflict);
-        }
-        Ok(())
+        range.revalidate(&kvs, count)
     }
 
     /// Guard a historical read: reject compacted revisions and reads past

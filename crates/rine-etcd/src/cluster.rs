@@ -13,7 +13,7 @@ use crate::{
     },
 };
 
-pub struct ClusterService {
+pub(crate) struct ClusterService {
     backend: Arc<dyn Backend>,
     client_url: String,
 }
@@ -47,7 +47,7 @@ impl Cluster for ClusterService {
     }
 }
 
-pub struct MaintenanceService {
+pub(crate) struct MaintenanceService {
     backend: Arc<dyn Backend>,
 }
 

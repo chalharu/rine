@@ -12,7 +12,7 @@ use std::{
 
 use async_trait::async_trait;
 use rine_etcd::{
-    backend::BackendFactory,
+    backend::{BackendFactory, Event, Revision},
     error::{Error, Result},
 };
 use rine_store_executor::{Row, SqlExecutor, SqlValue};
@@ -219,6 +219,10 @@ fn read_col(row: &rusqlite::Row, idx: usize) -> Result<SqlValue, rusqlite::Error
 
 #[async_trait]
 impl SqlExecutor for SqliteDb {
+    async fn try_commit_put(&self, _event: &Event) -> Result<Option<Revision>> {
+        Ok(None)
+    }
+
     async fn execute_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
         // Inside a commit unit the connection already holds BEGIN IMMEDIATE;
         // run the statements directly instead of nesting a second transaction.

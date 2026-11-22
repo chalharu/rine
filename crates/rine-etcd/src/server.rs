@@ -27,7 +27,7 @@ use crate::{
 };
 
 pub struct EtcdServer {
-    pub backend: Arc<dyn Backend>,
+    backend: Arc<dyn Backend>,
 }
 
 /// Loaded TLS identity for one `https://` listener: PEM-encoded server

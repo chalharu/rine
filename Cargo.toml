@@ -23,12 +23,6 @@ dotenvy = "=0.15.7"
 http-body-util = "=0.1.5"
 hyper = { features = ["http1", "server"], version = "=1.12.0" }
 hyper-util = { features = ["tokio"], version = "=0.1.21" }
-mimalloc = { features = [
-  "local_dynamic_tls",
-  "override",
-  "secure",
-  "v2",
-], version = "=0.1.52" }
 oracledb = "=26.0.0-beta.6"
 prometheus = { features = ["process"], version = "=0.14.0" }
 prost = "=0.14.6"

@@ -1,6 +1,4 @@
-//! Lease manager + Lease service.
-//!
-//! rine grants dummy leases; here leases are tracked and expired keys are
+//! Lease manager + Lease service: leases are tracked and expired keys are
 //! deleted by a background task, which is what the k8s apiserver relies on.
 
 use std::{
@@ -32,7 +30,7 @@ fn now_ms() -> u64 {
 }
 
 #[derive(Clone)]
-pub struct LeaseManager {
+pub(crate) struct LeaseManager {
     writes: CommitLock,
     backend: Arc<dyn Backend>,
 }
@@ -129,7 +127,7 @@ impl LeaseManager {
     }
 }
 
-pub struct LeaseService {
+pub(crate) struct LeaseService {
     backend: Arc<dyn Backend>,
     leases: LeaseManager,
 }

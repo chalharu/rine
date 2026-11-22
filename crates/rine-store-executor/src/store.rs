@@ -303,14 +303,7 @@ impl<E: SqlExecutor, D: Dialect> SqlBackend<E, D> {
                 &observed.opts,
             )
             .await?;
-        let snapshot: Vec<(bytes::Bytes, Revision)> = kvs
-            .iter()
-            .map(|kv| (kv.key.clone(), kv.mod_revision))
-            .collect();
-        if !observed.matches_snapshot(&snapshot, count) {
-            return Err(Error::Conflict);
-        }
-        Ok(())
+        observed.revalidate(&kvs, count)
     }
 
     /// Validate `reads`, assign `MAX(revision) + 1` to `events`, and write
@@ -943,13 +936,18 @@ mod tests {
         }
     }
 
-    /// Injects `drops` transient `TableMissing` failures on index creation,
-    /// then converges — a parallel DROP TABLE landing mid-ensure.
+    /// One configurable fake for every executor failure mode: `drops`
+    /// injects transient `TableMissing` on index creation (a parallel DROP
+    /// TABLE landing mid-ensure), `deny_ddl` fails all DDL with a privilege
+    /// error, and `short_results` truncates `query_batch` to a fixed number
+    /// of one-row sets (`Some(0)` = no sets at all).
     struct RacyExec {
         drops: AtomicUsize,
         ddl_calls: AtomicUsize,
         probe_drops: AtomicUsize,
         contention: AtomicUsize,
+        deny_ddl: bool,
+        short_results: Option<usize>,
         probe_err: bool,
         fast: bool,
     }
@@ -961,6 +959,8 @@ mod tests {
                 ddl_calls: AtomicUsize::new(0),
                 probe_drops: AtomicUsize::new(0),
                 contention: AtomicUsize::new(0),
+                deny_ddl: false,
+                short_results: None,
                 probe_err: false,
                 fast: false,
             }
@@ -974,6 +974,9 @@ mod tests {
         }
         async fn execute(&self, sql: &str, _params: Vec<SqlValue>) -> Result<u64> {
             self.ddl_calls.fetch_add(1, Ordering::SeqCst);
+            if self.deny_ddl {
+                return Err(Error::Backend("ORA-01031: insufficient privileges".into()));
+            }
             if self.contention.load(Ordering::SeqCst) > 0 {
                 self.contention.fetch_sub(1, Ordering::SeqCst);
                 return Err(Error::LockContention("writer raced DDL".into()));
@@ -1006,69 +1009,35 @@ mod tests {
         async fn query_all(&self, _sql: &str, _params: Vec<SqlValue>) -> Result<Vec<Row>> {
             Ok(Vec::new())
         }
-    }
-
-    /// Short reads: fewer result sets than the latest-range lookup expects.
-    struct ShortExec {
-        results: usize,
-    }
-
-    #[async_trait]
-    impl SqlExecutor for ShortExec {
-        async fn execute(&self, _sql: &str, _params: Vec<SqlValue>) -> Result<u64> {
-            Ok(1)
-        }
-        async fn execute_batch(&self, _statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
-            Ok(())
-        }
-        async fn query_row(&self, _sql: &str, _params: Vec<SqlValue>) -> Result<Option<Row>> {
-            Ok(None)
-        }
-        async fn query_all(&self, _sql: &str, _params: Vec<SqlValue>) -> Result<Vec<Row>> {
-            Ok(Vec::new())
-        }
         async fn query_batch(
             &self,
-            _statements: Vec<(String, Vec<SqlValue>)>,
+            statements: Vec<(String, Vec<SqlValue>)>,
         ) -> Result<Vec<Vec<Row>>> {
-            Ok((0..self.results)
-                .map(|_| {
-                    vec![Row {
-                        values: vec![SqlValue::Int(1)],
-                    }]
-                })
-                .collect())
+            if let Some(n) = self.short_results {
+                return Ok((0..n)
+                    .map(|_| {
+                        vec![Row {
+                            values: vec![SqlValue::Int(1)],
+                        }]
+                    })
+                    .collect());
+            }
+            let mut results = Vec::with_capacity(statements.len());
+            for (sql, params) in statements {
+                results.push(self.query_all(&sql, params).await?);
+            }
+            Ok(results)
         }
-    }
-
-    /// Denies all DDL with a privilege error: DBA-prepared schema missing a
-    /// required index plus no DDL grant must keep failing fast.
-    struct DenyExec;
-
-    #[async_trait]
-    impl SqlExecutor for DenyExec {
-        async fn execute(&self, _sql: &str, _params: Vec<SqlValue>) -> Result<u64> {
-            Err(Error::Backend("ORA-01031: insufficient privileges".into()))
-        }
-        async fn execute_batch(&self, _statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
+        async fn begin_unit(&self) -> Result<()> {
             Ok(())
         }
-        async fn query_row(&self, sql: &str, _params: Vec<SqlValue>) -> Result<Option<Row>> {
-            match sql {
-                "PROBE TABLE" => Ok(Some(Row {
-                    values: vec![SqlValue::Int(1)],
-                })),
-                _ => Ok(None),
-            }
-        }
-        async fn query_all(&self, _sql: &str, _params: Vec<SqlValue>) -> Result<Vec<Row>> {
-            Ok(Vec::new())
+        async fn end_unit(&self, _commit: bool) -> Result<()> {
+            Ok(())
         }
     }
 
-    /// Regression test for the CI failure in `live_stale_point_read_is_conflict`:
-    /// a parallel DROP TABLE between probe and CREATE INDEX (ORA-00942) must
-    /// restart the pass and converge, not abort startup.
+    /// A parallel DROP TABLE between probe and CREATE INDEX (ORA-00942)
+    /// restarts the pass and converges instead of aborting startup.
     #[tokio::test]
     async fn ensure_schema_survives_concurrent_drop() {
         let exec = Arc::new(RacyExec::new(1));
@@ -1087,8 +1056,10 @@ mod tests {
     /// retried away.
     #[tokio::test]
     async fn ensure_schema_still_aborts_without_ddl_privilege() {
-        let exec = Arc::new(DenyExec);
-        let backend = SqlBackend::<DenyExec, TestDialect>::new(exec.clone());
+        let mut deny = RacyExec::new(0);
+        deny.deny_ddl = true;
+        let exec = Arc::new(deny);
+        let backend = SqlBackend::<RacyExec, TestDialect>::new(exec.clone());
         let err = backend.initialize().await.unwrap_err();
         assert!(
             err.to_string().contains("insufficient privileges"),
@@ -1147,8 +1118,10 @@ mod tests {
     async fn list_latest_rejects_short_results() {
         use crate::SqlExecutor as _;
         for results in [1, 2] {
-            let exec = Arc::new(ShortExec { results });
-            let backend = SqlBackend::<ShortExec, TestDialect>::new(exec.clone());
+            let mut short = RacyExec::new(0);
+            short.short_results = Some(results);
+            let exec = Arc::new(short);
+            let backend = SqlBackend::<RacyExec, TestDialect>::new(exec.clone());
             let err = backend
                 .list(b"k", None, ListOptions::default())
                 .await
@@ -1165,7 +1138,9 @@ mod tests {
     /// A commit lookup with no rows surfaces a backend error.
     #[tokio::test]
     async fn commit_rejects_missing_metadata() {
-        let backend = SqlBackend::<ShortExec, TestDialect>::new(Arc::new(ShortExec { results: 0 }));
+        let mut short = RacyExec::new(0);
+        short.short_results = Some(0);
+        let backend = SqlBackend::<RacyExec, TestDialect>::new(Arc::new(short));
         let err = backend
             .commit(ReadSet::default(), vec![])
             .await

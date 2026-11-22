@@ -25,5 +25,5 @@ rustc-ice-*.txt
 
 *.env*
 
-# CI-generated per-crate Sonar coverage reports (see scripts/lcov-per-crate.sh)
+# CI-generated per-crate Sonar coverage reports (split in the sonarcloud job)
 crates/*/lcov-*.info
