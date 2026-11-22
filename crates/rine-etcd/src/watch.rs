@@ -12,14 +12,7 @@
 //! derive from the same total revision order and share the per-watcher
 //! `next_rev` cursor, so deliveries are gap-free and duplicate-free.
 
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicI64, Ordering},
-    },
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -98,15 +91,11 @@ fn to_proto_event(e: &Event, want_prev: bool) -> mvccpb::Event {
 
 pub(crate) struct WatchService {
     backend: Arc<dyn Backend>,
-    next_id: Arc<AtomicI64>,
 }
 
 impl WatchService {
     pub fn new(backend: Arc<dyn Backend>) -> Self {
-        Self {
-            backend,
-            next_id: Arc::new(AtomicI64::new(1)),
-        }
+        Self { backend }
     }
 }
 
@@ -120,7 +109,9 @@ impl Watch for WatchService {
     ) -> Result<tonic::Response<Self::WatchStream>, tonic::Status> {
         let mut inbound = request.into_inner();
         let backend = self.backend.clone();
-        let next_id = self.next_id.clone();
+        // Watch IDs only need to be unique within this stream: the client
+        // binds each pending watch to the Created response on its own stream.
+        let mut next_id = 1i64;
         let (tx, rx) = mpsc::channel::<Result<WatchResponse, tonic::Status>>(64);
 
         tokio::spawn(async move {
@@ -144,7 +135,7 @@ impl Watch for WatchService {
                         use crate::etcdserverpb::watch_request::RequestUnion;
                         match req.request_union {
                             Some(RequestUnion::CreateRequest(c)) => {
-                                handle_create(&backend, &next_id, &tx, &mut watchers, c).await;
+                                handle_create(&backend, &mut next_id, &tx, &mut watchers, c).await;
                             }
                             Some(RequestUnion::CancelRequest(WatchCancelRequest { watch_id })) => {
                                 watchers.remove(&watch_id);
@@ -307,7 +298,7 @@ fn watch_events(w: &Watcher, events: &[Event]) -> Vec<mvccpb::Event> {
 
 async fn handle_create(
     backend: &Arc<dyn Backend>,
-    next_id: &AtomicI64,
+    next_id: &mut i64,
     tx: &mpsc::Sender<Result<WatchResponse, tonic::Status>>,
     watchers: &mut HashMap<i64, Watcher>,
     c: WatchCreateRequest,
@@ -315,7 +306,9 @@ async fn handle_create(
     let id = if c.watch_id > 0 && !watchers.contains_key(&c.watch_id) {
         c.watch_id
     } else {
-        next_id.fetch_add(1, Ordering::Relaxed)
+        let id = *next_id;
+        *next_id += 1;
+        id
     };
     let cur = backend.current_revision().await;
     let start = if c.start_revision == 0 {
@@ -522,8 +515,8 @@ mod tests {
     ) -> (Vec<WatchResponse>, HashMap<i64, Watcher>) {
         let (tx, mut rx) = mpsc::channel(16);
         let mut watchers = HashMap::new();
-        let next_id = AtomicI64::new(1);
-        handle_create(backend, &next_id, &tx, &mut watchers, c).await;
+        let mut next_id = 1i64;
+        handle_create(backend, &mut next_id, &tx, &mut watchers, c).await;
         drop(tx);
         let mut out = Vec::new();
         while let Some(r) = rx.recv().await {
@@ -561,10 +554,10 @@ mod tests {
         let mut taken = watchers;
         let (out, _) = {
             let (tx, mut rx) = mpsc::channel(16);
-            let next_id = AtomicI64::new(100);
+            let mut next_id = 100i64;
             handle_create(
                 &backend,
-                &next_id,
+                &mut next_id,
                 &tx,
                 &mut taken,
                 WatchCreateRequest {
@@ -625,14 +618,8 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         drop(rx);
         let mut watchers = HashMap::new();
-        handle_create(
-            &backend,
-            &AtomicI64::new(1),
-            &tx,
-            &mut watchers,
-            create(b"h", 0),
-        )
-        .await;
+        let mut next_id = 1i64;
+        handle_create(&backend, &mut next_id, &tx, &mut watchers, create(b"h", 0)).await;
         assert!(watchers.is_empty());
     }
 

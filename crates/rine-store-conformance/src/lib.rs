@@ -81,10 +81,10 @@ pub async fn kv_update<B: Backend>(
 ) -> Result<Revision> {
     let (_, prev) = kv_get(b, &key, 0).await?;
     let Some(prev) = prev else {
-        return Err(Error::KeyExists);
+        return Err(Error::Conflict);
     };
     if expected_mod_revision != 0 && prev.mod_revision != expected_mod_revision {
-        return Err(Error::Backend("mod revision mismatch".into()));
+        return Err(Error::Conflict);
     }
     let revision = b.current_revision().await + 1;
     let reads = ReadSet {

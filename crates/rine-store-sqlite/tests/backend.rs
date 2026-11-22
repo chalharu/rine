@@ -432,11 +432,11 @@ async fn sqlite_conformance_helper_edges() {
     let err = kv_update(&b, Bytes::from("gone"), Bytes::from("x"), 0, 0)
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::KeyExists), "got {err:?}");
+    assert!(matches!(err, Error::Conflict), "got {err:?}");
     let err = kv_update(&b, Bytes::from("e"), Bytes::from("x"), 1, 999)
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::Backend(_)), "got {err:?}");
+    assert!(matches!(err, Error::Conflict), "got {err:?}");
     let (_, prev) = kv_delete(&b, b"missing").await.unwrap();
     assert!(prev.is_none());
 }

@@ -10,14 +10,14 @@
 //! `/health`, `/version`, `/metrics` (Prometheus text exposition).
 
 pub mod backend;
-pub mod cluster;
+mod cluster;
 pub mod error;
-pub mod http;
-pub mod kv;
-pub mod lease;
+mod http;
+mod kv;
+mod lease;
 pub mod memory;
 pub mod server;
-pub mod watch;
+mod watch;
 
 pub mod mvccpb {
     tonic::include_proto!("mvccpb");

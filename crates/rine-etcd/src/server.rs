@@ -64,12 +64,20 @@ impl EtcdServer {
         let writes: crate::backend::CommitLock = Arc::new(tokio::sync::Mutex::new(()));
         let leases = LeaseManager::new(self.backend.clone(), writes.clone());
         leases.spawn_expiry_loop();
+        // One metrics registry for every listener: per-listener state would
+        // multiply the process collector and gauge sets by listener count.
+        let http = HttpState::new(self.backend.clone());
         let mut set = tokio::task::JoinSet::new();
         for l in listeners {
-            let (backend, leases, writes) = (self.backend.clone(), leases.clone(), writes.clone());
+            let (backend, leases, writes, http) = (
+                self.backend.clone(),
+                leases.clone(),
+                writes.clone(),
+                http.clone(),
+            );
             let addr = l.addr;
             set.spawn(async move {
-                Self::serve_on(l.addr, l.tls, backend, leases, writes)
+                Self::serve_on(l.addr, l.tls, backend, leases, writes, http)
                     .await
                     .map_err(|e| anyhow::anyhow!("listener {addr}: {e:#}"))
             });
@@ -86,6 +94,7 @@ impl EtcdServer {
         backend: Arc<dyn Backend>,
         leases: LeaseManager,
         writes: crate::backend::CommitLock,
+        http: HttpState,
     ) -> anyhow::Result<()> {
         let scheme = if tls.is_some() { "https" } else { "http" };
         let client_url = format!("{scheme}://{addr}");
@@ -118,7 +127,6 @@ impl EtcdServer {
             .add_service(health_service);
         let (grpc_tx, grpc_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<Conn, std::io::Error>>();
-        let http = HttpState::new(backend);
         let listener = TcpListener::bind(addr).await?;
         tokio::spawn(accept_loop(listener, tls, grpc_tx, http));
         router

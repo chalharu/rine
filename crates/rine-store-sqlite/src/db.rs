@@ -12,7 +12,7 @@ use std::{
 
 use async_trait::async_trait;
 use rine_etcd::{
-    backend::{BackendFactory, Event, Revision},
+    backend::BackendFactory,
     error::{Error, Result},
 };
 use rine_store_executor::{Row, SqlExecutor, SqlValue};
@@ -20,6 +20,7 @@ use rusqlite::{ToSql, types::ToSqlOutput};
 use tokio::sync::Mutex;
 
 /// Live SQLite connection. `Clone` shares the same underlying connection.
+#[derive(Clone)]
 pub struct SqliteDb {
     conn: Arc<Mutex<rusqlite::Connection>>,
     /// Serializes transaction scopes on the shared connection: an open
@@ -33,16 +34,6 @@ pub struct SqliteDb {
     /// releases it). Separate calls, so the guard lives here instead of
     /// on the stack.
     unit_guard: Arc<std::sync::Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>,
-}
-
-impl Clone for SqliteDb {
-    fn clone(&self) -> Self {
-        Self {
-            conn: self.conn.clone(),
-            tx: self.tx.clone(),
-            unit_guard: self.unit_guard.clone(),
-        }
-    }
 }
 
 impl std::fmt::Debug for SqliteDb {
@@ -125,7 +116,7 @@ impl SqliteDb {
         let guard = self.conn.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || op(&guard).map_err(cvt_error))
             .await
-            .map_err(|e| Error::task("db task failed", e))?
+            .map_err(|e| Error::Backend(e.into()))?
     }
 }
 
@@ -219,10 +210,6 @@ fn read_col(row: &rusqlite::Row, idx: usize) -> Result<SqlValue, rusqlite::Error
 
 #[async_trait]
 impl SqlExecutor for SqliteDb {
-    async fn try_commit_put(&self, _event: &Event) -> Result<Option<Revision>> {
-        Ok(None)
-    }
-
     async fn execute_batch(&self, statements: Vec<(String, Vec<SqlValue>)>) -> Result<()> {
         // Inside a commit unit the connection already holds BEGIN IMMEDIATE;
         // run the statements directly instead of nesting a second transaction.

@@ -4,7 +4,6 @@
 //! `LIMIT 1` instead of `ROWNUM = 1`. The compact-revision bookkeeping is an
 //! update-then-insert pair (SQLite has no `MERGE`).
 
-use rine_etcd::backend::ListOptions;
 use rine_store_executor::Dialect;
 
 /// SQLite SQL dialect.
@@ -47,6 +46,10 @@ impl Dialect for SqliteDialect {
         "SELECT created FROM rine ORDER BY id DESC LIMIT 1".into()
     }
 
+    fn row_limit(_: usize) -> String {
+        " LIMIT ?".into()
+    }
+
     fn bind(_: usize) -> String {
         "?".into()
     }
@@ -56,31 +59,6 @@ impl Dialect for SqliteDialect {
             "SELECT {COLS} FROM rine WHERE created >= ? AND created <= ? AND name <> 'compact_rev_key' ORDER BY id",
             COLS = Self::cols(),
         )
-    }
-
-    /// Latest read split into rows + count so each uses the covering index:
-    /// rows in index order with LIMIT, count without touching values. No
-    /// `COUNT(*) OVER ()` sort over the full range. Both statements run in
-    /// one `query_batch` (one read transaction).
-    fn live_range_queries(
-        end: Option<&[u8]>,
-        opts: &ListOptions,
-    ) -> (Option<String>, Option<String>) {
-        let (predicate, _) = Self::range_predicate(end);
-        let filter = format!("{predicate} AND deleted = 0 AND name <> 'compact_rev_key'");
-        let rows = (!opts.count_only).then(|| {
-            let cols = if opts.keys_only {
-                "id, name, created, deleted, create_revision, prev_revision, lease, version, NULL"
-            } else {
-                Self::cols()
-            };
-            let limit = if opts.limit > 0 { " LIMIT ?" } else { "" };
-            format!("SELECT {cols} FROM rine WHERE {filter} ORDER BY name, id{limit}")
-        });
-        // Point lookups and unlimited ranges derive the count from the rows.
-        let count = Self::needs_count(end, opts)
-            .then(|| format!("SELECT COUNT(*) FROM rine WHERE {filter}"));
-        (rows, count)
     }
 
     /// Commit lookup in one statement, mirroring the Oracle fast path:
@@ -144,6 +122,7 @@ impl Dialect for SqliteDialect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rine_etcd::backend::ListOptions;
 
     #[test]
     fn binds_are_positional_qmark() {

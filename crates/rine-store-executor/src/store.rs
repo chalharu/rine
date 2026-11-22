@@ -622,7 +622,7 @@ impl<E: SqlExecutor + 'static, D: Dialect> Backend for SqlBackend<E, D> {
         let this = self.clone();
         tokio::spawn(async move { this.commit_inner(reads, events).await })
             .await
-            .map_err(|error| Error::task("commit task failed", error))?
+            .map_err(|error| Error::Backend(error.into()))?
     }
 
     async fn list(
@@ -904,11 +904,8 @@ mod tests {
         fn events_sql() -> String {
             String::new()
         }
-        fn live_range_queries(
-            _end: Option<&[u8]>,
-            _opts: &ListOptions,
-        ) -> (Option<String>, Option<String>) {
-            (Some(String::new()), Some(String::new()))
+        fn row_limit(_: usize) -> String {
+            String::new()
         }
         fn commit_state_sql(_names: usize) -> String {
             String::new()

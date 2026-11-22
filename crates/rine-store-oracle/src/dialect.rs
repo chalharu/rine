@@ -3,7 +3,6 @@
 //! Placeholder style is covered by unit tests below; the live XE test in CI
 //! covers Oracle against a real database.
 
-use rine_etcd::backend::ListOptions;
 use rine_store_executor::Dialect;
 
 /// Oracle DDL for the `rine` table.
@@ -81,32 +80,8 @@ impl Dialect for OracleDialect {
          VALUES (0, 'compact_rev_key', 0, 0, 0, :1, 0)"
     }
 
-    /// Latest read split into rows + count: rows in index order with
-    /// `FETCH FIRST`, count from a covering index. Both run in one
-    /// `query_batch` on one connection.
-    fn live_range_queries(
-        end: Option<&[u8]>,
-        opts: &ListOptions,
-    ) -> (Option<String>, Option<String>) {
-        let (predicate, binds) = Self::range_predicate(end);
-        let filter = format!("{predicate} AND deleted = 0 AND name <> 'compact_rev_key'");
-        let rows = (!opts.count_only).then(|| {
-            let cols = if opts.keys_only {
-                "id, name, created, deleted, create_revision, prev_revision, lease, version, NULL AS value"
-            } else {
-                Self::cols()
-            };
-            let limit = if opts.limit > 0 {
-                format!(" FETCH FIRST {} ROWS ONLY", Self::bind(binds + 1))
-            } else {
-                String::new()
-            };
-            format!("SELECT {cols} FROM rine WHERE {filter} ORDER BY name, id{limit}")
-        });
-        // Point lookups and unlimited ranges derive the count from the rows.
-        let count = Self::needs_count(end, opts)
-            .then(|| format!("SELECT COUNT(*) FROM rine WHERE {filter}"));
-        (rows, count)
+    fn row_limit(bind: usize) -> String {
+        format!(" FETCH FIRST {} ROWS ONLY", Self::bind(bind))
     }
 
     fn commit_state_sql(names: usize) -> String {
@@ -153,6 +128,7 @@ impl Dialect for OracleDialect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rine_etcd::backend::ListOptions;
 
     #[test]
     fn binds_are_oracle_style() {

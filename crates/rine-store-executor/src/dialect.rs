@@ -74,7 +74,7 @@ pub trait Dialect: Send + Sync + 'static {
     }
 
     /// Latest-range pushdown: split value and count retrieval so a limited
-    /// range can serve rows in index order with LIMIT while the count uses
+    /// range can serve rows in index order with a limit while the count uses
     /// a covering index (a single-statement `COUNT(*) OVER ()` forces an
     /// ORDER BY sort over the full range into a temp B-tree). The first
     /// element is the rows query (`None` for `count_only`), the second the
@@ -84,7 +84,32 @@ pub trait Dialect: Send + Sync + 'static {
     fn live_range_queries(
         end: Option<&[u8]>,
         opts: &ListOptions,
-    ) -> (Option<String>, Option<String>);
+    ) -> (Option<String>, Option<String>) {
+        let (predicate, binds) = Self::range_predicate(end);
+        let filter = format!("{predicate} AND deleted = 0 AND name <> 'compact_rev_key'");
+        let rows = (!opts.count_only).then(|| {
+            let cols = if opts.keys_only {
+                "id, name, created, deleted, create_revision, prev_revision, lease, version, NULL AS value"
+            } else {
+                Self::cols()
+            };
+            let limit = if opts.limit > 0 {
+                Self::row_limit(binds + 1)
+            } else {
+                String::new()
+            };
+            format!("SELECT {cols} FROM rine WHERE {filter} ORDER BY name, id{limit}")
+        });
+        // Point lookups and unlimited ranges derive the count from the rows.
+        let count = Self::needs_count(end, opts)
+            .then(|| format!("SELECT COUNT(*) FROM rine WHERE {filter}"));
+        (rows, count)
+    }
+
+    /// Row-limit suffix for [`live_range_queries`](Self::live_range_queries):
+    /// `bind` is the 1-based placeholder index following the key binds
+    /// (positional `?` dialects ignore it).
+    fn row_limit(bind: usize) -> String;
 
     /// Commit lookup: current revision, highest physical id, key,
     /// latest physical id for that key, and its live revision (or NULL).
