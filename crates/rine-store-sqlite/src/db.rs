@@ -64,9 +64,30 @@ impl SqliteDb {
 
     /// Open (or create) a SQLite database file.
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
-        let conn = rusqlite::Connection::open(path)?;
-        Self::tune(&conn)?;
-        Ok(Self::new(conn))
+        // A failover peer may be creating or converting the same file right
+        // now — notably the WAL switch, which needs EXCLUSIVE and does not
+        // reliably honor the busy timeout. Retry transient locks (10s); a
+        // rival startup finishes in milliseconds, so anything else failing
+        // here is real and fails fast.
+        let mut waits = 0;
+        loop {
+            let conn = rusqlite::Connection::open(&path)?;
+            match Self::tune(&conn) {
+                Ok(()) => return Ok(Self::new(conn)),
+                Err(e)
+                    if matches!(
+                        e.sqlite_error_code(),
+                        Some(
+                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                        )
+                    ) && waits < 100 =>
+                {
+                    waits += 1;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Open a private in-memory database (tests).
@@ -79,6 +100,10 @@ impl SqliteDb {
     /// WAL for multi-process visibility, `FULL` sync per commit, and a busy
     /// timeout so a commit unit waits for a rival writer instead of failing.
     fn tune(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+        // First: a failover peer or rolling restart may be opening the same
+        // file right now, and every statement below (including the WAL
+        // switch itself, which needs EXCLUSIVE) can block on its locks.
+        conn.busy_timeout(Duration::from_secs(30))?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         // Use a single WAL sync per commit without sacrificing crash durability.
         let journal: String =
@@ -89,7 +114,6 @@ impl SqliteDb {
                 Some(format!("failed to enable WAL: journal_mode is {journal}")),
             ));
         }
-        conn.busy_timeout(Duration::from_secs(30))?;
         Ok(())
     }
 
