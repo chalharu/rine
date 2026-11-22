@@ -216,15 +216,7 @@ func (f *perfFixture) leaseExpiryPhase() {
 		// Keep the lease alive while the 300 setup puts run: on slow
 		// disks the sequential puts alone can outlast the 2s TTL, which
 		// would fail the puts instead of measuring the drain.
-		keepCtx, stopKeepAlive := context.WithCancel(ctx)
-		keepCh, err := f.c.KeepAlive(keepCtx, grant.ID)
-		noError(t, err)
-		keepDone := make(chan struct{})
-		go func() {
-			defer close(keepDone)
-			for range keepCh {
-			}
-		}()
+		stopKeepAlive := keepAliveDuring(t, ctx, f.c, grant.ID)
 		const leased = 300
 		for i := range leased {
 			if _, err := f.c.Put(ctx, f.p+"l/"+strconv.Itoa(i), f.value, clientv3.WithLease(grant.ID)); err != nil {
@@ -233,7 +225,6 @@ func (f *perfFixture) leaseExpiryPhase() {
 			}
 		}
 		stopKeepAlive()
-		<-keepDone
 		deadline := time.Now().Add(2 * time.Second)
 		if d := time.Until(deadline); d > 0 {
 			time.Sleep(d)
@@ -252,6 +243,30 @@ func (f *perfFixture) leaseExpiryPhase() {
 		}
 		t.Logf("300-key expiry drained in %v", time.Since(start))
 	})
+}
+
+// keepAliveDuring renews id until the returned stop func runs, then
+// waits for the client stream to close. Draining the responses is
+// mandatory: an unconsumed channel stalls renewals and the lease would
+// expire early.
+func keepAliveDuring(t *testing.T, ctx context.Context, c *clientv3.Client, id clientv3.LeaseID) (stop func()) {
+	t.Helper()
+	keepCtx, cancel := context.WithCancel(ctx)
+	keepCh, err := c.KeepAlive(keepCtx, id)
+	noError(t, err)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		renewals := 0
+		for range keepCh {
+			renewals++
+		}
+		t.Logf("lease %x renewed %d times during setup", id, renewals)
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
 }
 
 func TestPerformance(t *testing.T) {

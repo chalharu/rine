@@ -45,6 +45,12 @@ jobs:
           if-no-files-found: error
       - name: clippy
         run: cargo clippy --workspace --tests
+      - name: install taplo
+        uses: taiki-e/install-action@v2.90.6
+        with:
+          tool: taplo@0.10.0
+      - name: taplo fmt check
+        run: taplo fmt --check
   oracle-xe:
     name: integration tests (Oracle XE)
     runs-on: ubuntu-latest
