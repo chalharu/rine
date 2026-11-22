@@ -309,6 +309,12 @@ async fn accept_loop(
                 continue;
             }
         };
+        // Small gRPC responses must not wait for Nagle: without this, a
+        // response split across packets stalls ~40ms on the client's
+        // delayed ACK. tonic/hyper cannot set it — the socket is ours.
+        if let Err(e) = sock.set_nodelay(true) {
+            tracing::warn!("set_nodelay failed: {e}");
+        }
         let (grpc_tx, http) = (grpc_tx.clone(), http.clone());
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
