@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	go.etcd.io/etcd/api/v3 v3.5.35
 	go.etcd.io/etcd/client/v3 v3.5.35
-	google.golang.org/grpc v1.83.2
+	google.golang.org/grpc v1.84.0
 )
 
 require (
