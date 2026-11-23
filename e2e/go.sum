@@ -35,6 +35,8 @@ github.com/yuin/goldmark v1.1.27/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9de
 github.com/yuin/goldmark v1.2.1/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 go.etcd.io/etcd/api/v3 v3.5.35 h1:lB//Av9mFrkljv94XDNAY+qiyQA9W6S/TTA2Uwx2jsI=
 go.etcd.io/etcd/api/v3 v3.5.35/go.mod h1:z1FGQolu/tpmQ2MPFwQNt7G3cXBiSkTevZBhfOtEArQ=
+go.etcd.io/etcd/api/v3 v3.5.36 h1:fVtqQtpUwNtLRJYcLwRxvyErQ0CyTO1qGPL72cY0ABk=
+go.etcd.io/etcd/api/v3 v3.5.36/go.mod h1:Oiubjfb00oghUN6ndZdJjeF188HtSb5UPIJYTNvRU4w=
 go.etcd.io/etcd/client/pkg/v3 v3.5.35 h1:nUZutZyJVvsKddK6zddXMBxIhmVi0SzPMBRS0FnNM3o=
 go.etcd.io/etcd/client/pkg/v3 v3.5.35/go.mod h1:0MNjMMqajrOI0/l8OLFkJBhE5Vm6BAi7cerKlrO38hw=
 go.etcd.io/etcd/client/v3 v3.5.35 h1:dk0aSLjY5D1eOR0SNnPXWOWCVA9yIzJoB8a912qxmoI=
