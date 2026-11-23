@@ -1,0 +1,50 @@
+[workspace]
+members = [
+  "crates/rine",
+  "crates/rine-etcd",
+  "crates/rine-store-conformance",
+  "crates/rine-store-executor",
+  "crates/rine-store-oracle",
+  "crates/rine-store-sqlite",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MPL-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "=1.0.104"
+async-trait = "=0.1.92"
+bytes = "=1.12.2"
+clap = { features = ["derive", "env"], version = "=4.6.8" }
+dotenvy = "=0.15.7"
+http-body-util = "=0.1.5"
+hyper = { features = ["http1", "server"], version = "=1.12.0" }
+hyper-util = { features = ["tokio"], version = "=0.1.21" }
+oracledb = "=26.0.0-beta.6"
+prometheus = { features = ["process"], version = "=0.14.0" }
+prost = "=0.14.6"
+protoc-bin-vendored = "=3.3.0"
+rcgen = "=0.14.10"
+rine-etcd = { path = "crates/rine-etcd" }
+rine-store-conformance = { path = "crates/rine-store-conformance" }
+rine-store-executor = { path = "crates/rine-store-executor" }
+rine-store-oracle = { path = "crates/rine-store-oracle" }
+rine-store-sqlite = { path = "crates/rine-store-sqlite" }
+rusqlite = { features = ["bundled"], version = "=0.43.0" }
+rustls = { features = ["ring", "std", "tls12"], version = "=0.23.46" }
+thiserror = "=2.0.21"
+tokio = { features = ["full"], version = "=1.54.1" }
+tokio-rustls = { default-features = false, features = [
+  "ring",
+  "tls12",
+], version = "=0.26.6" }
+tokio-stream = { features = ["sync"], version = "=0.1.19" }
+tonic = { features = ["tls-ring", "transport"], version = "=0.14.9" }
+tonic-health = "=0.14.9"
+tonic-prost = "=0.14.9"
+tonic-prost-build = "=0.14.9"
+tracing = "=0.1.44"
+tracing-subscriber = { features = ["env-filter"], version = "=0.3.23" }
