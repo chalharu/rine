@@ -18,7 +18,7 @@ version = "0.1.0"
 anyhow = "=1.0.104"
 async-trait = "=0.1.92"
 bytes = "=1.12.2"
-clap = { features = ["derive", "env"], version = "=4.6.8" }
+clap = { features = ["derive", "env"], version = "=4.6.9" }
 dotenvy = "=0.15.7"
 http-body-util = "=0.1.5"
 hyper = { features = ["http1", "server"], version = "=1.12.0" }
