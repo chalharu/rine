@@ -119,12 +119,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          (cd dist && sha256sum ./* > SHA256SUMS)
+          # Only the compressed tarballs are published: the raw rine-*
+          # binaries are Docker build inputs, not release artifacts.
+          (cd dist && sha256sum rine-*.tar.gz > SHA256SUMS)
           # Prereleases (vX.Y.Z-*) are marked as such; stable releases are not.
           pre=""
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then pre="--prerelease"; fi
           # shellcheck disable=SC2086
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes $pre dist/*
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes $pre dist/rine-*.tar.gz dist/SHA256SUMS
   docker:
     name: publish image to GitHub Packages
     runs-on: ubuntu-latest
