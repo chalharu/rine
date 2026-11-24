@@ -304,3 +304,73 @@ jobs:
         env:
           SONAR_HOST_URL: https://sonarcloud.io
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+  # Release pipeline dry run: everything the tag workflow does except
+  # the two publishing steps (GitHub Release creation, ghcr push), so a
+  # release can only break in ways PRs already cover.
+  build-assets:
+    name: release pipeline dry run (binaries only)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: arm64
+    env:
+      TRIPLE: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+      VERSION_INPUT: 0.0.0-ci
+    steps:
+      - uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          lookup-only: true
+      - name: set crate version
+        run: |
+          version="${VERSION_INPUT#v}"
+          sed -i "0,/^version = \".*\"/s//version = \"$version\"/" Cargo.toml
+          python3 - "$version" <<'EOF'
+          import re, sys
+          version = sys.argv[1]
+          members = {
+              "rine", "rine-etcd", "rine-store-conformance",
+              "rine-store-executor", "rine-store-oracle", "rine-store-sqlite",
+          }
+          current, out = None, []
+          for line in open("Cargo.lock"):
+              m = re.match(r'name = "([^"]+)"', line)
+              if m:
+                  current = m.group(1)
+              if current in members and re.match(r'version = "', line):
+                  line = f'version = "{version}"\n'
+                  current = None
+              out.append(line)
+          open("Cargo.lock", "w").writelines(out)
+          EOF
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+      - name: build release binary
+        run: cargo build --locked --release -p rine
+      - name: stage artifacts
+        run: |
+          mkdir -p "stage/rine" dist
+          cp target/release/rine "stage/rine/rine"
+          cp LICENSE "stage/rine/LICENSE"
+          tar -czf "dist/rine-${RELEASE_VERSION}-${TRIPLE}.tar.gz" -C stage rine
+          cp target/release/rine "dist/rine-${ARCH}"
+      - name: upload artifacts
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
