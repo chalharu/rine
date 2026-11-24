@@ -11,18 +11,21 @@ use crate::{
         SnapshotRequest, SnapshotResponse, StatusRequest, StatusResponse,
         alarm_request::AlarmAction, cluster_server::Cluster, maintenance_server::Maintenance,
     },
+    http::Metrics,
 };
 
 pub(crate) struct ClusterService {
     backend: Arc<dyn Backend>,
     client_url: String,
+    metrics: Arc<Metrics>,
 }
 
 impl ClusterService {
-    pub fn new(backend: Arc<dyn Backend>, client_url: String) -> Self {
+    pub fn new(backend: Arc<dyn Backend>, client_url: String, metrics: Arc<Metrics>) -> Self {
         Self {
             backend,
             client_url,
+            metrics,
         }
     }
 }
@@ -33,27 +36,32 @@ impl Cluster for ClusterService {
         &self,
         _request: tonic::Request<MemberListRequest>,
     ) -> Result<tonic::Response<MemberListResponse>, tonic::Status> {
-        let rev = self.backend.current_revision().await;
-        Ok(tonic::Response::new(MemberListResponse {
-            header: Some(header(rev)),
-            members: vec![Member {
-                id: MEMBER_ID,
-                name: "rine".into(),
-                peer_ur_ls: vec![self.client_url.clone()],
-                client_ur_ls: vec![self.client_url.clone()],
-                is_learner: false,
-            }],
-        }))
+        self.metrics
+            .observe("etcdserverpb.Cluster", "MemberList", async {
+                let rev = self.backend.current_revision().await;
+                Ok(tonic::Response::new(MemberListResponse {
+                    header: Some(header(rev)),
+                    members: vec![Member {
+                        id: MEMBER_ID,
+                        name: "rine".into(),
+                        peer_ur_ls: vec![self.client_url.clone()],
+                        client_ur_ls: vec![self.client_url.clone()],
+                        is_learner: false,
+                    }],
+                }))
+            })
+            .await
     }
 }
 
 pub(crate) struct MaintenanceService {
     backend: Arc<dyn Backend>,
+    metrics: Arc<Metrics>,
 }
 
 impl MaintenanceService {
-    pub fn new(backend: Arc<dyn Backend>) -> Self {
-        Self { backend }
+    pub fn new(backend: Arc<dyn Backend>, metrics: Arc<Metrics>) -> Self {
+        Self { backend, metrics }
     }
 }
 
@@ -66,20 +74,24 @@ impl Maintenance for MaintenanceService {
         &self,
         _request: tonic::Request<StatusRequest>,
     ) -> Result<tonic::Response<StatusResponse>, tonic::Status> {
-        let rev = self.backend.current_revision().await;
-        let size = self.backend.db_size().await;
-        Ok(tonic::Response::new(StatusResponse {
-            header: Some(header(rev)),
-            version: VERSION.into(),
-            db_size: size,
-            leader: MEMBER_ID,
-            raft_index: rev.max(0) as u64,
-            raft_term: 0,
-            raft_applied_index: rev.max(0) as u64,
-            errors: Vec::new(),
-            db_size_in_use: size,
-            is_learner: false,
-        }))
+        self.metrics
+            .observe("etcdserverpb.Maintenance", "Status", async {
+                let rev = self.backend.current_revision().await;
+                let size = self.backend.db_size().await;
+                Ok(tonic::Response::new(StatusResponse {
+                    header: Some(header(rev)),
+                    version: VERSION.into(),
+                    db_size: size,
+                    leader: MEMBER_ID,
+                    raft_index: rev.max(0) as u64,
+                    raft_term: 0,
+                    raft_applied_index: rev.max(0) as u64,
+                    errors: Vec::new(),
+                    db_size_in_use: size,
+                    is_learner: false,
+                }))
+            })
+            .await
     }
 
     /// Alarm is a read-only stub: rine runs no quota or corruption watcher,
@@ -89,16 +101,20 @@ impl Maintenance for MaintenanceService {
         &self,
         request: tonic::Request<AlarmRequest>,
     ) -> Result<tonic::Response<AlarmResponse>, tonic::Status> {
-        let req = request.into_inner();
-        if req.action != AlarmAction::Get as i32 {
-            return Err(tonic::Status::invalid_argument(
-                "rine: alarms cannot be raised or cleared",
-            ));
-        }
-        Ok(tonic::Response::new(AlarmResponse {
-            header: Some(header(self.backend.current_revision().await)),
-            alarms: Vec::new(),
-        }))
+        self.metrics
+            .observe("etcdserverpb.Maintenance", "Alarm", async {
+                let req = request.into_inner();
+                if req.action != AlarmAction::Get as i32 {
+                    return Err(tonic::Status::invalid_argument(
+                        "rine: alarms cannot be raised or cleared",
+                    ));
+                }
+                Ok(tonic::Response::new(AlarmResponse {
+                    header: Some(header(self.backend.current_revision().await)),
+                    alarms: Vec::new(),
+                }))
+            })
+            .await
     }
 
     /// Snapshot is intentionally unsupported: rine stores data in SQLite /
@@ -110,10 +126,14 @@ impl Maintenance for MaintenanceService {
         &self,
         _request: tonic::Request<SnapshotRequest>,
     ) -> Result<tonic::Response<Self::SnapshotStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented(
-            "rine: snapshot save is not supported; back up the backend directly \
-             (SQLite: copy the database file; Oracle: RMAN or Data Pump)",
-        ))
+        self.metrics
+            .observe("etcdserverpb.Maintenance", "Snapshot", async {
+                Err(tonic::Status::unimplemented(
+                    "rine: snapshot save is not supported; back up the backend directly \
+                     (SQLite: copy the database file; Oracle: RMAN or Data Pump)",
+                ))
+            })
+            .await
     }
 }
 
@@ -125,7 +145,10 @@ mod tests {
     #[tokio::test]
     async fn alarm_get_is_empty_and_mutations_rejected() {
         use crate::etcdserverpb::AlarmRequest;
-        let svc = MaintenanceService::new(Arc::new(MemoryBackend::new()));
+        let svc = MaintenanceService::new(
+            Arc::new(MemoryBackend::new()),
+            Arc::new(crate::http::Metrics::new()),
+        );
         let ok = svc
             .alarm(tonic::Request::new(AlarmRequest {
                 action: AlarmAction::Get as i32,
@@ -149,7 +172,10 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_fails_fast_with_guidance() {
-        let svc = MaintenanceService::new(Arc::new(MemoryBackend::new()));
+        let svc = MaintenanceService::new(
+            Arc::new(MemoryBackend::new()),
+            Arc::new(crate::http::Metrics::new()),
+        );
         let err = svc
             .snapshot(tonic::Request::new(SnapshotRequest {}))
             .await

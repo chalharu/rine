@@ -87,11 +87,20 @@ impl WriteBatch {
 pub(crate) struct KvService {
     backend: Arc<dyn Backend>,
     writes: CommitLock,
+    metrics: Arc<crate::http::Metrics>,
 }
 
 impl KvService {
-    pub fn new(backend: Arc<dyn Backend>, writes: CommitLock) -> Self {
-        Self { backend, writes }
+    pub fn new(
+        backend: Arc<dyn Backend>,
+        writes: CommitLock,
+        metrics: Arc<crate::http::Metrics>,
+    ) -> Self {
+        Self {
+            backend,
+            writes,
+            metrics,
+        }
     }
 
     // ---- core handlers (shared by unary RPCs and Txn branches) ----
@@ -121,7 +130,9 @@ impl KvService {
                 (old != new).then(|| (event.key.clone(), old, new))
             })
             .collect();
+        let start = std::time::Instant::now();
         let fresh = self.backend.commit(batch.reads, batch.events).await?;
+        self.metrics.observe_commit(start.elapsed());
         for (key, old, new) in changes {
             if old != 0 {
                 self.backend.lease_detach(old, &key).await?;
@@ -575,86 +586,106 @@ impl Kv for KvService {
         &self,
         request: tonic::Request<RangeRequest>,
     ) -> Result<tonic::Response<RangeResponse>, tonic::Status> {
-        Ok(tonic::Response::new(
-            self.do_range(&request.into_inner(), None).await?,
-        ))
+        self.metrics.mvcc_range.inc();
+        self.metrics
+            .observe("etcdserverpb.KV", "Range", async {
+                Ok(tonic::Response::new(
+                    self.do_range(&request.into_inner(), None).await?,
+                ))
+            })
+            .await
     }
 
     async fn put(
         &self,
         request: tonic::Request<PutRequest>,
     ) -> Result<tonic::Response<PutResponse>, tonic::Status> {
-        let guard = self.writes.clone().lock_owned().await;
-        // No `batch()` revision fetch: `do_put` sets `base` from its own
-        // predecessor fetch for unary puts, so the initial value is dead.
-        let mut batch = WriteBatch {
-            base: 0,
-            reads: ReadSet::default(),
-            events: Vec::new(),
-        };
-        let mut response = self.do_put(&request.into_inner(), &mut batch, true).await?;
-        let fresh = self.commit(batch, guard).await.map_err(status_err)?;
-        if let Some(h) = response.header.as_mut() {
-            h.revision = fresh;
-        }
-        Ok(tonic::Response::new(response))
+        self.metrics.mvcc_put.inc();
+        self.metrics
+            .observe("etcdserverpb.KV", "Put", async {
+                let guard = self.writes.clone().lock_owned().await;
+                // No `batch()` revision fetch: `do_put` sets `base` from its own
+                // predecessor fetch for unary puts, so the initial value is dead.
+                let mut batch = WriteBatch {
+                    base: 0,
+                    reads: ReadSet::default(),
+                    events: Vec::new(),
+                };
+                let mut response = self.do_put(&request.into_inner(), &mut batch, true).await?;
+                let fresh = self.commit(batch, guard).await.map_err(status_err)?;
+                if let Some(h) = response.header.as_mut() {
+                    h.revision = fresh;
+                }
+                Ok(tonic::Response::new(response))
+            })
+            .await
     }
 
     async fn delete_range(
         &self,
         request: tonic::Request<DeleteRangeRequest>,
     ) -> Result<tonic::Response<DeleteRangeResponse>, tonic::Status> {
-        let guard = self.writes.clone().lock_owned().await;
-        let mut batch = self.batch().await;
-        let mut response = self.do_delete(&request.into_inner(), &mut batch).await?;
-        let fresh = self.commit(batch, guard).await.map_err(status_err)?;
-        if let Some(h) = response.header.as_mut() {
-            h.revision = fresh;
-        }
-        Ok(tonic::Response::new(response))
+        self.metrics.mvcc_delete.inc();
+        self.metrics
+            .observe("etcdserverpb.KV", "DeleteRange", async {
+                let guard = self.writes.clone().lock_owned().await;
+                let mut batch = self.batch().await;
+                let mut response = self.do_delete(&request.into_inner(), &mut batch).await?;
+                let fresh = self.commit(batch, guard).await.map_err(status_err)?;
+                if let Some(h) = response.header.as_mut() {
+                    h.revision = fresh;
+                }
+                Ok(tonic::Response::new(response))
+            })
+            .await
     }
 
     async fn txn(
         &self,
         request: tonic::Request<TxnRequest>,
     ) -> Result<tonic::Response<TxnResponse>, tonic::Status> {
-        let guard = self.writes.clone().lock_owned().await;
-        let req = request.into_inner();
-        let mut batch = self.batch().await;
-        let mut response = self.do_txn(&req, 0, &mut batch).await?;
-        match self.commit(batch, guard).await {
-            Ok(fresh) => {
-                if let Some(h) = response.header.as_mut() {
-                    h.revision = fresh;
-                }
-                for op in &mut response.responses {
-                    Self::retarget(op, fresh);
-                }
-                Ok(tonic::Response::new(response))
-            }
-            Err(Error::Conflict) => {
-                // A guarded key moved under us. etcd reports this as a
-                // transaction conflict (succeeded=false), not an error: the
-                // staged success-branch writes were rolled back, so run the
-                // failure branch against the new state instead.
+        self.metrics.mvcc_txn.inc();
+        self.metrics
+            .observe("etcdserverpb.KV", "Txn", async {
                 let guard = self.writes.clone().lock_owned().await;
-                let mut retry = self.batch().await;
-                let mut responses = Vec::with_capacity(req.failure.len());
-                for op in &req.failure {
-                    responses.push(self.apply_op(op, 0, &mut retry).await?);
+                let req = request.into_inner();
+                let mut batch = self.batch().await;
+                let mut response = self.do_txn(&req, 0, &mut batch).await?;
+                match self.commit(batch, guard).await {
+                    Ok(fresh) => {
+                        if let Some(h) = response.header.as_mut() {
+                            h.revision = fresh;
+                        }
+                        for op in &mut response.responses {
+                            Self::retarget(op, fresh);
+                        }
+                        Ok(tonic::Response::new(response))
+                    }
+                    Err(Error::Conflict) => {
+                        // A guarded key moved under us. etcd reports this as a
+                        // transaction conflict (succeeded=false), not an error: the
+                        // staged success-branch writes were rolled back, so run the
+                        // failure branch against the new state instead.
+                        let guard = self.writes.clone().lock_owned().await;
+                        let mut retry = self.batch().await;
+                        let mut responses = Vec::with_capacity(req.failure.len());
+                        for op in &req.failure {
+                            responses.push(self.apply_op(op, 0, &mut retry).await?);
+                        }
+                        let fresh = self.commit(retry, guard).await.map_err(status_err)?;
+                        for op in &mut responses {
+                            Self::retarget(op, fresh);
+                        }
+                        Ok(tonic::Response::new(TxnResponse {
+                            header: Some(header(fresh)),
+                            succeeded: false,
+                            responses,
+                        }))
+                    }
+                    Err(other) => Err(status_err(other)),
                 }
-                let fresh = self.commit(retry, guard).await.map_err(status_err)?;
-                for op in &mut responses {
-                    Self::retarget(op, fresh);
-                }
-                Ok(tonic::Response::new(TxnResponse {
-                    header: Some(header(fresh)),
-                    succeeded: false,
-                    responses,
-                }))
-            }
-            Err(other) => Err(status_err(other)),
-        }
+            })
+            .await
     }
 
     async fn compact(
@@ -665,21 +696,25 @@ impl Kv for KvService {
         // watermark (live rows are never touched), and the backend serializes
         // the watermark plus each delete chunk on its own lock, so writers
         // keep committing between chunks instead of stalling.
-        let req = request.into_inner();
-        let cur = self.backend.current_revision().await;
-        if req.revision <= 0 || req.revision > cur {
-            return Err(tonic::Status::out_of_range(
-                "etcdserver: mvcc: required revision is a future revision",
-            ));
-        }
-        let rev = self
-            .backend
-            .compact(req.revision)
+        self.metrics
+            .observe("etcdserverpb.KV", "Compact", async {
+                let req = request.into_inner();
+                let cur = self.backend.current_revision().await;
+                if req.revision <= 0 || req.revision > cur {
+                    return Err(tonic::Status::out_of_range(
+                        "etcdserver: mvcc: required revision is a future revision",
+                    ));
+                }
+                let rev = self
+                    .backend
+                    .compact(req.revision)
+                    .await
+                    .map_err(status_err)?;
+                Ok(tonic::Response::new(CompactionResponse {
+                    header: Some(header(rev)),
+                }))
+            })
             .await
-            .map_err(status_err)?;
-        Ok(tonic::Response::new(CompactionResponse {
-            header: Some(header(rev)),
-        }))
     }
 }
 
@@ -826,7 +861,7 @@ mod eval_tests {
     async fn service() -> KvService {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let writes: CommitLock = Arc::new(tokio::sync::Mutex::new(()));
-        KvService::new(backend, writes)
+        KvService::new(backend, writes, Arc::new(crate::http::Metrics::new()))
     }
 
     fn cmp_value(key: &[u8]) -> Compare {
@@ -908,7 +943,11 @@ mod eval_tests {
             .await
             .unwrap();
         backend.compact(2).await.unwrap();
-        let svc2 = KvService::new(backend, Arc::new(tokio::sync::Mutex::new(())));
+        let svc2 = KvService::new(
+            backend,
+            Arc::new(tokio::sync::Mutex::new(())),
+            Arc::new(crate::http::Metrics::new()),
+        );
         let err = svc2
             .fetch(
                 b"k",

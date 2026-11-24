@@ -1,0 +1,159 @@
+# Tag-driven release: build the stripped binary natively per arch,
+# attach tarballs to a GitHub Release, and publish the image to
+# GitHub Packages. Everything except the two publishing steps is
+# mirrored by the release dry-run jobs in ci.yml, so a release can
+# only break in ways PRs already cover.
+name: release
+on:
+  push:
+    tags:
+      - 'v*'
+env:
+  CARGO_TERM_COLOR: always
+permissions:
+  contents: read
+jobs:
+  binaries:
+    name: release binary (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        # glibc ceiling matters: the image runs on distroless/cc-debian13
+        # (glibc 2.41), so build on the newest runners whose glibc stays
+        # at or below it (24.04 ships 2.39). Newer build glibc than the
+        # image's kills the container at exec.
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: arm64
+    env:
+      TRIPLE: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      # Read-only cache: saving from a tag build would let a poisoned
+      # cache flow into later builds.
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          lookup-only: true
+      # The tag wins over Cargo.toml: rewrite the workspace version so
+      # `--version`, /version and artifact names all agree with it.
+      - name: set crate version
+        env:
+          VERSION_INPUT: ${{ github.ref_name }}
+        run: |
+          version="${VERSION_INPUT#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag must look like vX.Y.Z, got $VERSION_INPUT" >&2
+            exit 1
+          fi
+          sed -i "0,/^version = \".*\"/s//version = \"$version\"/" Cargo.toml
+          # Keep Cargo.lock in sync so --locked still holds: only our own
+          # workspace members move, every dependency stays pinned.
+          python3 - "$version" <<'EOF'
+          import re, sys
+          version = sys.argv[1]
+          members = {
+              "rine", "rine-etcd", "rine-store-conformance",
+              "rine-store-executor", "rine-store-oracle", "rine-store-sqlite",
+          }
+          current, out = None, []
+          for line in open("Cargo.lock"):
+              m = re.match(r'name = "([^"]+)"', line)
+              if m:
+                  current = m.group(1)
+              if current in members and re.match(r'version = "', line):
+                  line = f'version = "{version}"\n'
+                  current = None
+              out.append(line)
+          open("Cargo.lock", "w").writelines(out)
+          EOF
+          grep -n '^version = ' Cargo.toml
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+      - name: build release binary
+        run: cargo build --locked --release -p rine
+      - name: stage artifacts
+        run: |
+          mkdir -p "stage/rine" dist
+          cp target/release/rine "stage/rine/rine"
+          cp LICENSE "stage/rine/LICENSE"
+          tar -czf "dist/rine-${RELEASE_VERSION}-${TRIPLE}.tar.gz" -C stage rine
+          cp target/release/rine "dist/rine-${ARCH}"
+      - name: upload artifacts
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+  github-release:
+    name: attach binaries to GitHub release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [binaries]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          (cd dist && sha256sum ./* > SHA256SUMS)
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes dist/*
+  docker:
+    name: publish image to GitHub Packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [binaries]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: dist-*
+          path: image
+          merge-multiple: true
+      # The Dockerfile copies prebuilt per-arch binaries (no compilation
+      # inside), so multi-arch needs no emulation: one stage, just COPY.
+      # Artifacts lose the exec bit on download, so restore it.
+      - name: prepare build context
+        run: |
+          chmod +x image/rine-amd64 image/rine-arm64
+          cp Dockerfile image/Dockerfile
+      - name: log in to GitHub Packages
+        uses: docker/login-action@v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: set up buildx
+        uses: docker/setup-buildx-action@v3.11.1
+      - name: build and push
+        uses: docker/build-push-action@v6.18.0
+        with:
+          context: image
+          file: image/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/chalharu/rine:${{ github.ref_name }}
+            ghcr.io/chalharu/rine:latest
