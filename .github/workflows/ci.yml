@@ -20,7 +20,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - &checkout
-        uses: actions/checkout@v5.1.0
+        uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -271,7 +271,7 @@ jobs:
       pull-requests: read
     needs: [unit, oracle-xe]
     steps:
-      - uses: actions/checkout@v5.1.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
