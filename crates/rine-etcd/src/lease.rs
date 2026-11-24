@@ -33,13 +33,18 @@ fn now_ms() -> u64 {
 pub(crate) struct LeaseManager {
     writes: CommitLock,
     backend: Arc<dyn Backend>,
+    metrics: Arc<crate::http::Metrics>,
 }
 
 impl LeaseManager {
     /// Delete many expired keys in one guarded commit instead of one commit
     /// per key: a mass expiry (node loss, TTL sync) must not stall all
     /// writers for seconds.
-    async fn expire_keys(backend: &Arc<dyn Backend>, pairs: Vec<(i64, Vec<u8>)>) {
+    async fn expire_keys(
+        backend: &Arc<dyn Backend>,
+        metrics: &crate::http::Metrics,
+        pairs: Vec<(i64, Vec<u8>)>,
+    ) {
         if pairs.is_empty() {
             return;
         }
@@ -75,11 +80,21 @@ impl LeaseManager {
             .collect();
         // A key that moved under us conflicts away and is retried on the
         // next expiry tick.
+        let start = std::time::Instant::now();
         let _ = backend.commit(reads, events).await;
+        metrics.observe_commit(start.elapsed());
     }
 
-    pub fn new(backend: Arc<dyn Backend>, writes: CommitLock) -> Self {
-        Self { writes, backend }
+    pub fn new(
+        backend: Arc<dyn Backend>,
+        writes: CommitLock,
+        metrics: Arc<crate::http::Metrics>,
+    ) -> Self {
+        Self {
+            backend,
+            writes,
+            metrics,
+        }
     }
 
     /// Poll for past-due leases and delete their keys. The 500ms cadence
@@ -91,6 +106,7 @@ impl LeaseManager {
     pub fn spawn_expiry_loop(&self) {
         let backend = self.backend.clone();
         let writes = self.writes.clone();
+        let metrics = self.metrics.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(500));
             loop {
@@ -106,6 +122,7 @@ impl LeaseManager {
                 let _guard = writes.lock().await;
                 Self::expire_keys(
                     &backend,
+                    &metrics,
                     expired
                         .into_iter()
                         .flat_map(|(id, keys)| keys.into_iter().map(move |k| (id, k)))
@@ -122,7 +139,12 @@ impl LeaseManager {
             return Ok(());
         }
         let _guard = self.writes.lock().await;
-        Self::expire_keys(&self.backend, keys.into_iter().map(|k| (id, k)).collect()).await;
+        Self::expire_keys(
+            &self.backend,
+            &self.metrics,
+            keys.into_iter().map(|k| (id, k)).collect(),
+        )
+        .await;
         Ok(())
     }
 }
@@ -130,11 +152,20 @@ impl LeaseManager {
 pub(crate) struct LeaseService {
     backend: Arc<dyn Backend>,
     leases: LeaseManager,
+    metrics: Arc<crate::http::Metrics>,
 }
 
 impl LeaseService {
-    pub fn new(backend: Arc<dyn Backend>, leases: LeaseManager) -> Self {
-        Self { backend, leases }
+    pub fn new(
+        backend: Arc<dyn Backend>,
+        leases: LeaseManager,
+        metrics: Arc<crate::http::Metrics>,
+    ) -> Self {
+        Self {
+            backend,
+            leases,
+            metrics,
+        }
     }
 }
 
@@ -144,36 +175,44 @@ impl Lease for LeaseService {
         &self,
         request: tonic::Request<LeaseGrantRequest>,
     ) -> Result<tonic::Response<LeaseGrantResponse>, tonic::Status> {
-        let req = request.into_inner();
-        if req.ttl <= 0 {
-            return Err(tonic::Status::invalid_argument(
-                "etcdserver: lease TTL must be positive",
-            ));
-        }
-        let id = self
-            .backend
-            .lease_grant(req.ttl, req.id, now_ms())
+        self.metrics
+            .observe("etcdserverpb.Lease", "LeaseGrant", async {
+                let req = request.into_inner();
+                if req.ttl <= 0 {
+                    return Err(tonic::Status::invalid_argument(
+                        "etcdserver: lease TTL must be positive",
+                    ));
+                }
+                let id = self
+                    .backend
+                    .lease_grant(req.ttl, req.id, now_ms())
+                    .await
+                    .map_err(status_err)?;
+                let rev = self.backend.current_revision().await;
+                Ok(tonic::Response::new(LeaseGrantResponse {
+                    header: Some(header(rev)),
+                    id,
+                    ttl: req.ttl,
+                    error: String::new(),
+                }))
+            })
             .await
-            .map_err(status_err)?;
-        let rev = self.backend.current_revision().await;
-        Ok(tonic::Response::new(LeaseGrantResponse {
-            header: Some(header(rev)),
-            id,
-            ttl: req.ttl,
-            error: String::new(),
-        }))
     }
 
     async fn lease_revoke(
         &self,
         request: tonic::Request<LeaseRevokeRequest>,
     ) -> Result<tonic::Response<LeaseRevokeResponse>, tonic::Status> {
-        let req = request.into_inner();
-        self.leases.revoke(req.id).await.map_err(status_err)?;
-        let rev = self.backend.current_revision().await;
-        Ok(tonic::Response::new(LeaseRevokeResponse {
-            header: Some(header(rev)),
-        }))
+        self.metrics
+            .observe("etcdserverpb.Lease", "LeaseRevoke", async {
+                let req = request.into_inner();
+                self.leases.revoke(req.id).await.map_err(status_err)?;
+                let rev = self.backend.current_revision().await;
+                Ok(tonic::Response::new(LeaseRevokeResponse {
+                    header: Some(header(rev)),
+                }))
+            })
+            .await
     }
 
     type LeaseKeepAliveStream = ReceiverStream<Result<LeaseKeepAliveResponse, tonic::Status>>;
@@ -182,73 +221,85 @@ impl Lease for LeaseService {
         &self,
         request: tonic::Request<tonic::Streaming<LeaseKeepAliveRequest>>,
     ) -> Result<tonic::Response<Self::LeaseKeepAliveStream>, tonic::Status> {
-        let mut inbound = request.into_inner();
-        let backend = self.backend.clone();
-        let (tx, rx) = mpsc::channel(32);
-        tokio::spawn(async move {
-            while let Ok(Some(req)) = inbound.message().await {
-                // A transient storage error surfaces as TTL 0 (unknown
-                // lease), exactly like a missing lease; the stream stays
-                // open so the next response can still succeed.
-                let ttl = backend
-                    .lease_keepalive(req.id, now_ms())
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0);
-                let rev = backend.current_revision().await;
-                let resp = LeaseKeepAliveResponse {
-                    header: Some(header(rev)),
-                    id: req.id,
-                    ttl,
-                };
-                if tx.send(Ok(resp)).await.is_err() {
-                    break;
-                }
-            }
-        });
-        Ok(tonic::Response::new(ReceiverStream::new(rx)))
+        self.metrics
+            .observe("etcdserverpb.Lease", "LeaseKeepAlive", async {
+                let mut inbound = request.into_inner();
+                let backend = self.backend.clone();
+                let (tx, rx) = mpsc::channel(32);
+                tokio::spawn(async move {
+                    while let Ok(Some(req)) = inbound.message().await {
+                        // A transient storage error surfaces as TTL 0 (unknown
+                        // lease), exactly like a missing lease; the stream stays
+                        // open so the next response can still succeed.
+                        let ttl = backend
+                            .lease_keepalive(req.id, now_ms())
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0);
+                        let rev = backend.current_revision().await;
+                        let resp = LeaseKeepAliveResponse {
+                            header: Some(header(rev)),
+                            id: req.id,
+                            ttl,
+                        };
+                        if tx.send(Ok(resp)).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                Ok(tonic::Response::new(ReceiverStream::new(rx)))
+            })
+            .await
     }
 
     async fn lease_time_to_live(
         &self,
         request: tonic::Request<LeaseTimeToLiveRequest>,
     ) -> Result<tonic::Response<LeaseTimeToLiveResponse>, tonic::Status> {
-        let req = request.into_inner();
-        let rev = self.backend.current_revision().await;
-        match self
-            .backend
-            .lease_lookup(req.id)
+        self.metrics
+            .observe("etcdserverpb.Lease", "LeaseTimeToLive", async {
+                let req = request.into_inner();
+                let rev = self.backend.current_revision().await;
+                match self
+                    .backend
+                    .lease_lookup(req.id)
+                    .await
+                    .map_err(status_err)?
+                {
+                    None => Err(tonic::Status::not_found(
+                        "etcdserver: requested lease not found",
+                    )),
+                    Some(state) => {
+                        let remain = state.expires_at_ms.saturating_sub(now_ms()) / 1000;
+                        let (ttl, granted, keys) = (remain as i64, state.granted_ttl, state.keys);
+                        Ok(tonic::Response::new(LeaseTimeToLiveResponse {
+                            header: Some(header(rev)),
+                            id: req.id,
+                            ttl,
+                            granted_ttl: granted,
+                            keys: if req.keys { keys } else { Vec::new() },
+                        }))
+                    }
+                }
+            })
             .await
-            .map_err(status_err)?
-        {
-            None => Err(tonic::Status::not_found(
-                "etcdserver: requested lease not found",
-            )),
-            Some(state) => {
-                let remain = state.expires_at_ms.saturating_sub(now_ms()) / 1000;
-                let (ttl, granted, keys) = (remain as i64, state.granted_ttl, state.keys);
-                Ok(tonic::Response::new(LeaseTimeToLiveResponse {
-                    header: Some(header(rev)),
-                    id: req.id,
-                    ttl,
-                    granted_ttl: granted,
-                    keys: if req.keys { keys } else { Vec::new() },
-                }))
-            }
-        }
     }
 
     async fn lease_leases(
         &self,
         _request: tonic::Request<LeaseLeasesRequest>,
     ) -> Result<tonic::Response<LeaseLeasesResponse>, tonic::Status> {
-        let rev = self.backend.current_revision().await;
-        let ids = self.backend.lease_ids().await.map_err(status_err)?;
-        Ok(tonic::Response::new(LeaseLeasesResponse {
-            header: Some(header(rev)),
-            leases: ids.into_iter().map(|id| LeaseStatus { id }).collect(),
-        }))
+        self.metrics
+            .observe("etcdserverpb.Lease", "LeaseLeases", async {
+                let rev = self.backend.current_revision().await;
+                let ids = self.backend.lease_ids().await.map_err(status_err)?;
+                Ok(tonic::Response::new(LeaseLeasesResponse {
+                    header: Some(header(rev)),
+                    leases: ids.into_iter().map(|id| LeaseStatus { id }).collect(),
+                }))
+            })
+            .await
     }
 }
 
@@ -264,7 +315,11 @@ mod tests {
     async fn manager() -> (LeaseManager, Arc<dyn Backend>) {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let writes: CommitLock = Arc::new(tokio::sync::Mutex::new(()));
-        let mgr = LeaseManager::new(backend.clone(), writes);
+        let mgr = LeaseManager::new(
+            backend.clone(),
+            writes,
+            Arc::new(crate::http::Metrics::new()),
+        );
         (mgr, backend)
     }
 
@@ -357,7 +412,11 @@ mod tests {
     #[tokio::test]
     async fn service_grant_revoke_timetolive_leases() {
         let (mgr, backend) = manager().await;
-        let svc = LeaseService::new(backend.clone(), mgr.clone());
+        let svc = LeaseService::new(
+            backend.clone(),
+            mgr.clone(),
+            Arc::new(crate::http::Metrics::new()),
+        );
         let err = svc
             .lease_grant(tonic::Request::new(LeaseGrantRequest { ttl: 0, id: 0 }))
             .await
@@ -439,10 +498,11 @@ mod expire_tests {
     #[tokio::test]
     async fn expire_keys_handles_empty_and_missing() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let metrics = crate::http::Metrics::new();
         // Nothing expired: no work, no commit.
-        LeaseManager::expire_keys(&backend, Vec::new()).await;
+        LeaseManager::expire_keys(&backend, &metrics, Vec::new()).await;
         // Listed but gone: observed empty, nothing to delete.
-        LeaseManager::expire_keys(&backend, vec![(7, b"absent".to_vec())]).await;
+        LeaseManager::expire_keys(&backend, &metrics, vec![(7, b"absent".to_vec())]).await;
         assert_eq!(backend.current_revision().await, 1);
         // A live key is deleted at a fresh revision.
         let key = Bytes::from("gone");
@@ -466,7 +526,7 @@ mod expire_tests {
             )
             .await
             .unwrap();
-        LeaseManager::expire_keys(&backend, vec![(7, b"gone".to_vec())]).await;
+        LeaseManager::expire_keys(&backend, &metrics, vec![(7, b"gone".to_vec())]).await;
         let (_, rows, _) = backend
             .list(b"gone", None, ListOptions::default())
             .await
@@ -479,7 +539,11 @@ mod expire_tests {
         use super::tests::{exists, grant};
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let writes: CommitLock = Arc::new(tokio::sync::Mutex::new(()));
-        let mgr = LeaseManager::new(backend.clone(), writes);
+        let mgr = LeaseManager::new(
+            backend.clone(),
+            writes,
+            Arc::new(crate::http::Metrics::new()),
+        );
         mgr.spawn_expiry_loop();
         // Expires immediately; the survivor keeps its lease entry.
         let quick = grant(&backend, 0, 0).await;

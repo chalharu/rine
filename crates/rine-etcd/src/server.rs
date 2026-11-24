@@ -20,7 +20,7 @@ use crate::{
         cluster_server::ClusterServer, kv_server::KvServer, lease_server::LeaseServer,
         maintenance_server::MaintenanceServer, watch_server::WatchServer,
     },
-    http::HttpState,
+    http::{HttpState, Metrics},
     kv::KvService,
     lease::{LeaseManager, LeaseService},
     watch::WatchService,
@@ -62,11 +62,12 @@ impl EtcdServer {
         // application; without this every TLS handshake panics.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let writes: crate::backend::CommitLock = Arc::new(tokio::sync::Mutex::new(()));
-        let leases = LeaseManager::new(self.backend.clone(), writes.clone());
-        leases.spawn_expiry_loop();
         // One metrics registry for every listener: per-listener state would
         // multiply the process collector and gauge sets by listener count.
-        let http = HttpState::new(self.backend.clone());
+        let metrics = Arc::new(Metrics::new());
+        let http = HttpState::with_metrics(self.backend.clone(), metrics.clone());
+        let leases = LeaseManager::new(self.backend.clone(), writes.clone(), metrics);
+        leases.spawn_expiry_loop();
         let mut set = tokio::task::JoinSet::new();
         for l in listeners {
             let (backend, leases, writes, http) = (
@@ -96,6 +97,7 @@ impl EtcdServer {
         writes: crate::backend::CommitLock,
         http: HttpState,
     ) -> anyhow::Result<()> {
+        let metrics = http.metrics();
         let scheme = if tls.is_some() { "https" } else { "http" };
         let client_url = format!("{scheme}://{addr}");
         tracing::info!(%addr, tls = tls.is_some(), "serving etcd-compatible gRPC");
@@ -114,15 +116,28 @@ impl EtcdServer {
             .set_serving::<MaintenanceServer<MaintenanceService>>()
             .await;
         let router = tonic::transport::Server::builder()
-            .add_service(KvServer::new(KvService::new(backend.clone(), writes)))
-            .add_service(WatchServer::new(WatchService::new(backend.clone())))
-            .add_service(LeaseServer::new(LeaseService::new(backend.clone(), leases)))
+            .add_service(KvServer::new(KvService::new(
+                backend.clone(),
+                writes,
+                metrics.clone(),
+            )))
+            .add_service(WatchServer::new(WatchService::new(
+                backend.clone(),
+                metrics.clone(),
+            )))
+            .add_service(LeaseServer::new(LeaseService::new(
+                backend.clone(),
+                leases,
+                metrics.clone(),
+            )))
             .add_service(ClusterServer::new(ClusterService::new(
                 backend.clone(),
                 client_url,
+                metrics.clone(),
             )))
             .add_service(MaintenanceServer::new(MaintenanceService::new(
                 backend.clone(),
+                metrics,
             )))
             .add_service(health_service);
         let (grpc_tx, grpc_rx) =

@@ -24,6 +24,7 @@ use crate::{
         WatchCancelRequest, WatchCreateRequest, WatchProgressRequest, WatchRequest, WatchResponse,
         watch_server::Watch,
     },
+    http::Metrics,
     kv::to_proto_kv,
     mvccpb,
 };
@@ -91,11 +92,12 @@ fn to_proto_event(e: &Event, want_prev: bool) -> mvccpb::Event {
 
 pub(crate) struct WatchService {
     backend: Arc<dyn Backend>,
+    metrics: Arc<Metrics>,
 }
 
 impl WatchService {
-    pub fn new(backend: Arc<dyn Backend>) -> Self {
-        Self { backend }
+    pub fn new(backend: Arc<dyn Backend>, metrics: Arc<Metrics>) -> Self {
+        Self { backend, metrics }
     }
 }
 
@@ -107,93 +109,101 @@ impl Watch for WatchService {
         &self,
         request: tonic::Request<tonic::Streaming<WatchRequest>>,
     ) -> Result<tonic::Response<Self::WatchStream>, tonic::Status> {
-        let mut inbound = request.into_inner();
-        let backend = self.backend.clone();
-        // Watch IDs only need to be unique within this stream: the client
-        // binds each pending watch to the Created response on its own stream.
-        let mut next_id = 1i64;
-        let (tx, rx) = mpsc::channel::<Result<WatchResponse, tonic::Status>>(64);
+        self.metrics
+            .observe("etcdserverpb.Watch", "Watch", async {
+                let mut inbound = request.into_inner();
+                let backend = self.backend.clone();
+                let metrics = self.metrics.clone();
+                // Watch IDs only need to be unique within this stream: the client
+                // binds each pending watch to the Created response on its own stream.
+                let mut next_id = 1i64;
+                let (tx, rx) = mpsc::channel::<Result<WatchResponse, tonic::Status>>(64);
 
-        tokio::spawn(async move {
-            let mut watchers: HashMap<i64, Watcher> = HashMap::new();
-            // Subscribe before reading current revision to avoid gaps.
-            let mut live = backend.subscribe();
-            let mut progress = tokio::time::interval(Duration::from_secs(10));
-            // Skip the immediate first tick.
-            progress.tick().await;
-            let mut catchup = tokio::time::interval(CATCH_UP_INTERVAL);
-            catchup.tick().await;
+                tokio::spawn(async move {
+                    let mut watchers: HashMap<i64, Watcher> = HashMap::new();
+                    // Subscribe before reading current revision to avoid gaps.
+                    let mut live = backend.subscribe();
+                    let mut progress = tokio::time::interval(Duration::from_secs(10));
+                    // Skip the immediate first tick.
+                    progress.tick().await;
+                    let mut catchup = tokio::time::interval(CATCH_UP_INTERVAL);
+                    catchup.tick().await;
 
-            loop {
-                tokio::select! {
-                    incoming = inbound.message() => {
-                        let msg = match incoming {
-                            Ok(m) => m,
-                            Err(_) => break,
-                        };
-                        let Some(req) = msg else { break };
-                        use crate::etcdserverpb::watch_request::RequestUnion;
-                        match req.request_union {
-                            Some(RequestUnion::CreateRequest(c)) => {
-                                handle_create(&backend, &mut next_id, &tx, &mut watchers, c).await;
-                            }
-                            Some(RequestUnion::CancelRequest(WatchCancelRequest { watch_id })) => {
-                                watchers.remove(&watch_id);
-                                let rev = backend.current_revision().await;
-                                let _ = tx.send(Ok(WatchResponse {
-                                    header: Some(header(rev)),
-                                    watch_id,
-                                    canceled: true,
-                                    ..Default::default()
-                                })).await;
-                            }
-                            Some(RequestUnion::ProgressRequest(WatchProgressRequest {})) => {
-                                let rev = backend.current_revision().await;
-                                for id in watchers.keys() {
-                                    let _ = tx.send(Ok(WatchResponse {
-                                        header: Some(header(rev)),
-                                        watch_id: *id,
-                                        ..Default::default()
-                                    })).await;
+                    loop {
+                        tokio::select! {
+                            incoming = inbound.message() => {
+                                let msg = match incoming {
+                                    Ok(m) => m,
+                                    Err(_) => break,
+                                };
+                                let Some(req) = msg else { break };
+                                use crate::etcdserverpb::watch_request::RequestUnion;
+                                match req.request_union {
+                                    Some(RequestUnion::CreateRequest(c)) => {
+                                        handle_create(&backend, &metrics, &mut next_id, &tx, &mut watchers, c).await;
+                                    }
+                                    Some(RequestUnion::CancelRequest(WatchCancelRequest { watch_id })) => {
+                                        remove_watcher(&mut watchers, &metrics, watch_id);
+                                        let rev = backend.current_revision().await;
+                                        let _ = tx.send(Ok(WatchResponse {
+                                            header: Some(header(rev)),
+                                            watch_id,
+                                            canceled: true,
+                                            ..Default::default()
+                                        })).await;
+                                    }
+                                    Some(RequestUnion::ProgressRequest(WatchProgressRequest {})) => {
+                                        let rev = backend.current_revision().await;
+                                        for id in watchers.keys() {
+                                            let _ = tx.send(Ok(WatchResponse {
+                                                header: Some(header(rev)),
+                                                watch_id: *id,
+                                                ..Default::default()
+                                            })).await;
+                                        }
+                                    }
+                                    None => {}
                                 }
                             }
-                            None => {}
+                            ev = live.recv() => {
+                                let batch = match ev {
+                                    Ok(e) => e,
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                        // Missed broadcasts: recover from the shared
+                                        // log when retention allows; only truly
+                                        // compacted watchers cancel (see `catch_up`).
+                                        catch_up(&backend, &metrics, &tx, &mut watchers).await;
+                                        continue;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                };
+                                let Some(last_rev) = batch.last().map(|e| e.revision) else { continue };
+                                emit_new(&mut watchers, &tx, last_rev, &batch).await;
+                            }
+                            _ = progress.tick() => {
+                                let rev = backend.current_revision().await;
+                                for (id, w) in &watchers {
+                                    if w.progress_notify {
+                                        let _ = tx.send(Ok(WatchResponse {
+                                            header: Some(header(rev)),
+                                            watch_id: *id,
+                                            ..Default::default()
+                                        })).await;
+                                    }
+                                }
+                            }
+                            _ = catchup.tick() => {
+                                catch_up(&backend, &metrics, &tx, &mut watchers).await;
+                            }
                         }
                     }
-                    ev = live.recv() => {
-                        let batch = match ev {
-                            Ok(e) => e,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                // Missed broadcasts: recover from the shared
-                                // log when retention allows; only truly
-                                // compacted watchers cancel (see `catch_up`).
-                                catch_up(&backend, &tx, &mut watchers).await;
-                                continue;
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        };
-                        let Some(last_rev) = batch.last().map(|e| e.revision) else { continue };
-                        emit_new(&mut watchers, &tx, last_rev, &batch).await;
-                    }
-                    _ = progress.tick() => {
-                        let rev = backend.current_revision().await;
-                        for (id, w) in &watchers {
-                            if w.progress_notify {
-                                let _ = tx.send(Ok(WatchResponse {
-                                    header: Some(header(rev)),
-                                    watch_id: *id,
-                                    ..Default::default()
-                                })).await;
-                            }
-                        }
-                    }
-                    _ = catchup.tick() => {
-                        catch_up(&backend, &tx, &mut watchers).await;
-                    }
-                }
-            }
-        });
-        Ok(tonic::Response::new(ReceiverStream::new(rx)))
+                    // Stream over: every watcher still registered here stops
+                    // being active (explicit cancels already decremented).
+                    metrics.watchers.sub(watchers.len() as f64);
+                });
+                Ok(tonic::Response::new(ReceiverStream::new(rx)))
+            })
+            .await
     }
 }
 
@@ -205,8 +215,17 @@ impl Watch for WatchService {
 /// duplicate-free. The fetch is capped to `CATCH_UP_MAX_SPAN` revisions so
 /// one catch-up after a long outage cannot balloon; the cursor resumes on
 /// the next tick.
+/// Drop one watcher, keeping the active-watcher gauge exact. Unknown IDs
+/// (double cancel) change nothing.
+fn remove_watcher(watchers: &mut HashMap<i64, Watcher>, metrics: &Metrics, id: i64) {
+    if watchers.remove(&id).is_some() {
+        metrics.watchers.dec();
+    }
+}
+
 async fn catch_up(
     backend: &Arc<dyn Backend>,
+    metrics: &Metrics,
     tx: &mpsc::Sender<Result<WatchResponse, tonic::Status>>,
     watchers: &mut HashMap<i64, Watcher>,
 ) {
@@ -237,7 +256,7 @@ async fn catch_up(
                 .map(|(id, _)| *id)
                 .collect();
             for id in stale {
-                watchers.remove(&id);
+                remove_watcher(watchers, metrics, id);
                 let _ = tx
                     .send(Ok(WatchResponse {
                         header: Some(header(compacted)),
@@ -298,11 +317,14 @@ fn watch_events(w: &Watcher, events: &[Event]) -> Vec<mvccpb::Event> {
 
 async fn handle_create(
     backend: &Arc<dyn Backend>,
+    metrics: &Metrics,
     next_id: &mut i64,
     tx: &mpsc::Sender<Result<WatchResponse, tonic::Status>>,
     watchers: &mut HashMap<i64, Watcher>,
     c: WatchCreateRequest,
 ) {
+    // Every path below inserts under a guaranteed-unused ID, so a
+    // successful insert always grows the active set by exactly one.
     let id = if c.watch_id > 0 && !watchers.contains_key(&c.watch_id) {
         c.watch_id
     } else {
@@ -373,6 +395,7 @@ async fn handle_create(
         }
     }
     watchers.insert(id, watcher);
+    metrics.watchers.inc();
 }
 
 #[cfg(test)]
@@ -513,10 +536,11 @@ mod tests {
         backend: &Arc<dyn Backend>,
         c: WatchCreateRequest,
     ) -> (Vec<WatchResponse>, HashMap<i64, Watcher>) {
+        let metrics = Metrics::new();
         let (tx, mut rx) = mpsc::channel(16);
         let mut watchers = HashMap::new();
         let mut next_id = 1i64;
-        handle_create(backend, &mut next_id, &tx, &mut watchers, c).await;
+        handle_create(backend, &metrics, &mut next_id, &tx, &mut watchers, c).await;
         drop(tx);
         let mut out = Vec::new();
         while let Some(r) = rx.recv().await {
@@ -555,8 +579,10 @@ mod tests {
         let (out, _) = {
             let (tx, mut rx) = mpsc::channel(16);
             let mut next_id = 100i64;
+            let metrics = Metrics::new();
             handle_create(
                 &backend,
+                &metrics,
                 &mut next_id,
                 &tx,
                 &mut taken,
@@ -613,13 +639,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watcher_gauge_tracks_create_and_remove() {
+        let backend = backend_with(&[]).await;
+        let metrics = Metrics::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let mut watchers = HashMap::new();
+        let mut next_id = 1i64;
+        handle_create(
+            &backend,
+            &metrics,
+            &mut next_id,
+            &tx,
+            &mut watchers,
+            create(b"h", 0),
+        )
+        .await;
+        assert_eq!(watchers.len(), 1);
+        assert_eq!(metrics.watchers.get(), 1.0);
+        remove_watcher(&mut watchers, &metrics, 1);
+        assert!(watchers.is_empty());
+        assert_eq!(metrics.watchers.get(), 0.0);
+        // Unknown IDs change nothing.
+        remove_watcher(&mut watchers, &metrics, 1);
+        assert_eq!(metrics.watchers.get(), 0.0);
+    }
+
+    #[tokio::test]
     async fn create_without_receiver_returns_early() {
         let backend = backend_with(&[]).await;
         let (tx, rx) = mpsc::channel(16);
         drop(rx);
         let mut watchers = HashMap::new();
+        let metrics = Metrics::new();
         let mut next_id = 1i64;
-        handle_create(&backend, &mut next_id, &tx, &mut watchers, create(b"h", 0)).await;
+        handle_create(
+            &backend,
+            &metrics,
+            &mut next_id,
+            &tx,
+            &mut watchers,
+            create(b"h", 0),
+        )
+        .await;
         assert!(watchers.is_empty());
     }
 
@@ -627,8 +688,9 @@ mod tests {
         backend: &Arc<dyn Backend>,
         watchers: &mut HashMap<i64, Watcher>,
     ) -> Vec<WatchResponse> {
+        let metrics = Metrics::new();
         let (tx, mut rx) = mpsc::channel(16);
-        catch_up(backend, &tx, watchers).await;
+        catch_up(backend, &metrics, &tx, watchers).await;
         drop(tx);
         let mut out = Vec::new();
         while let Some(r) = rx.recv().await {
