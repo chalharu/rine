@@ -275,7 +275,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/download-artifact@v7.0.0
+      - uses: actions/download-artifact@v8.0.2
         with:
           pattern: coverage-*
           path: coverage
