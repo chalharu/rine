@@ -19,3 +19,9 @@ excludes:
     action_name: actions/download-artifact
   - policy_name: action_ref_should_be_full_length_commit_sha
     action_name: SonarSource/sonarqube-scan-action
+  - policy_name: action_ref_should_be_full_length_commit_sha
+    action_name: docker/login-action
+  - policy_name: action_ref_should_be_full_length_commit_sha
+    action_name: docker/setup-buildx-action
+  - policy_name: action_ref_should_be_full_length_commit_sha
+    action_name: docker/build-push-action

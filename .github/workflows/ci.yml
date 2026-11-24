@@ -304,22 +304,44 @@ jobs:
         env:
           SONAR_HOST_URL: https://sonarcloud.io
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-  docker-image:
-    name: runtime image build (amd64, no push)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  # Release pipeline dry run: everything the tag workflow does except
+  # the two publishing steps (GitHub Release creation, ghcr push), so a
+  # release can only break in ways this job already covers.
+  build-assets:
+    name: release pipeline dry run (binaries only)
+    uses: ./.github/workflows/build-release-assets.yml
+    with:
+      version: 0.0.0-ci
     permissions:
       contents: read
+  docker-image:
+    name: runtime image build and smoke test (amd64, no push)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    needs: [build-assets]
     steps:
-      - *checkout
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4.4.0
         with:
-          toolchain: stable
-      - *rust-cache
+          persist-credentials: false
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: dist-amd64
+          path: image
       # Same layout as the release job: prebuilt binary beside the
       # Dockerfile, so Dockerfile rot fails here instead of at tag time.
-      - name: build release binary and image
+      - name: build image
         run: |
-          cargo build --locked --release -p rine
-          cp target/release/rine rine-amd64
-          docker build -f Dockerfile -t rine:ci .
+          cp Dockerfile image/Dockerfile
+          docker build -f image/Dockerfile -t rine:ci image
+      - name: smoke test image
+        run: |
+          docker run -d --name rine -p 2379:2379 -e RINE_LISTEN=0.0.0.0:2379 rine:ci
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:2379/health && break
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:2379/version
+          curl -sf http://127.0.0.1:2379/metrics | grep -q grpc_server_handled_total
+          docker stop rine
