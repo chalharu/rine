@@ -163,7 +163,7 @@ jobs:
       # versioned tag only so :latest never points at an alpha/rc.
       - name: build and push (prerelease)
         if: contains(github.ref_name, '-')
-        uses: docker/build-push-action@v6.18.0
+        uses: docker/build-push-action@v6.19.2
         with:
           context: image
           file: image/Dockerfile
@@ -172,7 +172,7 @@ jobs:
           tags: ghcr.io/chalharu/rine:${{ github.ref_name }}
       - name: build and push (stable)
         if: "!contains(github.ref_name, '-')"
-        uses: docker/build-push-action@v6.18.0
+        uses: docker/build-push-action@v6.19.2
         with:
           context: image
           file: image/Dockerfile
