@@ -17,7 +17,7 @@ workflows:
         - 'actions/upload-artifact@v7.0.2'
         - 'docker/build-push-action@v6.18.0'
         - 'docker/login-action@v3.6.0'
-        - 'docker/setup-buildx-action@v3.11.1'
+        - 'docker/setup-buildx-action@v3.12.0'
         - 'dtolnay/rust-toolchain@stable'
         - 'swatinem/rust-cache@v2.9.3'
 dependencies:
@@ -46,9 +46,9 @@ dependencies:
         commit: 'sha1-5e57cd118135c172c3672efd75eb46360885c0ef'
         owner_id: 5429470
         repo_id: 287743349
-    'docker/setup-buildx-action@v3.11.1':
-        ref: 'v3.11.1'
-        commit: 'sha1-e468171a9de216ec08956ac3ada2f0791b6bd435'
+    'docker/setup-buildx-action@v3.12.0':
+        ref: 'v3.12.0'
+        commit: 'sha1-8d2750c68a42422c14e847fe6c8ac0403b4cbd6f'
         owner_id: 5429470
         repo_id: 288485773
     'dtolnay/rust-toolchain@stable':
