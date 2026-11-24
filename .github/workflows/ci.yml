@@ -409,5 +409,9 @@ jobs:
           done
           if [ -z "$ok" ]; then docker logs rine; docker stop rine; exit 1; fi
           curl -sf http://127.0.0.1:2379/version
-          curl -sf http://127.0.0.1:2379/metrics | grep -q grpc_server_handled_total
+          # gRPC counters only render after RPC traffic, so pin the
+          # always-present gauges here (RPC accounting is covered by the
+          # unit test in http.rs and the e2e jobs above).
+          curl -sf http://127.0.0.1:2379/metrics | grep -q 'etcd_server_has_leader 1'
+          curl -sf http://127.0.0.1:2379/metrics | grep -q 'etcd_mvcc_watchers_total 0'
           docker stop rine
