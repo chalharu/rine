@@ -21,11 +21,14 @@ jobs:
       contents: read
     strategy:
       matrix:
+        # glibc floor matters: the image runs on distroless/base-debian12
+        # (glibc 2.36), so binaries must be built on 22.04 (glibc 2.35).
+        # Newer runners link newer glibc and the container dies at exec.
         include:
-          - runner: ubuntu-24.04
+          - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             arch: amd64
-          - runner: ubuntu-24.04-arm
+          - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             arch: arm64
     env:

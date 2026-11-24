@@ -315,11 +315,13 @@ jobs:
       contents: read
     strategy:
       matrix:
+        # Same glibc floor as the release job: the image runs on
+        # distroless/base-debian12 (glibc 2.36).
         include:
-          - runner: ubuntu-24.04
+          - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             arch: amd64
-          - runner: ubuntu-24.04-arm
+          - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             arch: arm64
     env:
@@ -400,10 +402,12 @@ jobs:
       - name: smoke test image
         run: |
           docker run -d --name rine -p 2379:2379 -e RINE_LISTEN=0.0.0.0:2379 rine:ci
+          ok=""
           for _ in $(seq 1 30); do
-            curl -sf http://127.0.0.1:2379/health && break
+            if curl -sf http://127.0.0.1:2379/health; then ok=1; break; fi
             sleep 2
           done
+          if [ -z "$ok" ]; then docker logs rine; docker stop rine; exit 1; fi
           curl -sf http://127.0.0.1:2379/version
           curl -sf http://127.0.0.1:2379/metrics | grep -q grpc_server_handled_total
           docker stop rine
