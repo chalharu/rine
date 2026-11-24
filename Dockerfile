@@ -5,8 +5,9 @@
 #
 # Pinned by digest (hadolint DL3006; renovate bumps it): `:latest` here
 # is only the tag the digest was taken from, the digest itself wins.
-# Same glibc floor caveat as the build runners (see the release workflow).
-FROM gcr.io/distroless/cc-debian12:latest@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa
+# Same glibc floor caveat as the build runners (see the release workflow):
+# debian13 ships glibc 2.41, comfortably above the 22.04-built 2.35.
+FROM gcr.io/distroless/cc-debian13:latest@sha256:dac90a25ffe03ebaace90cda886b081e61ab6cd77ac47eda51f7bcc15c320765
 ARG TARGETARCH
 COPY rine-${TARGETARCH} /rine
 EXPOSE 2379
