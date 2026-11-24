@@ -315,13 +315,13 @@ jobs:
       contents: read
     strategy:
       matrix:
-        # Same glibc floor as the release job: the image runs on
-        # distroless/base-debian12 (glibc 2.36).
+        # Same glibc ceiling as the release job: the image runs on
+        # distroless/cc-debian13 (glibc 2.41).
         include:
-          - runner: ubuntu-22.04
+          - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             arch: amd64
-          - runner: ubuntu-22.04-arm
+          - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             arch: arm64
     env:
