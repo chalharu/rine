@@ -23,6 +23,11 @@ rustc-ice-*.txt
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# CI-staged prebuilt binaries for Docker build contexts (release.yml,
+# ci.yml docker-image job). Never committed; always rebuilt from source.
+rine-amd64
+rine-arm64
+
 *.env*
 
 # CI-generated per-crate Sonar coverage reports (split in the sonarcloud job)

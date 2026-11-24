@@ -48,3 +48,9 @@ tonic-prost = "=0.14.9"
 tonic-prost-build = "=0.14.9"
 tracing = "=0.1.44"
 tracing-subscriber = { features = ["env-filter"], version = "=0.3.23" }
+
+# Release images ship this binary: strip symbols for size. Speed-critical
+# settings (opt-level, LTO) stay at Cargo defaults so measured backend
+# performance is what production runs.
+[profile.release]
+strip = true

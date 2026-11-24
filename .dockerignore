@@ -1,0 +1,6 @@
+.git
+.github
+target/
+e2e/
+coverage/
+*.log
