@@ -28,6 +28,12 @@ tonic-health.workspace = true
 tonic-prost.workspace = true
 tracing.workspace = true
 
+# `process_*` metrics need procfs, which only exists on Linux; the
+# `process` feature (and `process_collector` module) is unavailable
+# elsewhere, so enable it per-target instead of in the workspace.
+[target.'cfg(target_os = "linux")'.dependencies]
+prometheus = { features = ["process"], workspace = true }
+
 [build-dependencies]
 protoc-bin-vendored.workspace = true
 tonic-prost-build.workspace = true
