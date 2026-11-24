@@ -5,18 +5,21 @@
 //! load-balancer checks) reports the server down even though gRPC works.
 //! Only GET on these three paths is served; anything else is 404.
 //!
-//! `/metrics` carries an honest minimal set: `process_*`/`go_*` from the
-//! runtime collector plus `etcd_server_has_leader`, `etcd_server_is_leader`
-//! (both 1: single member by design) and `etcd_mvcc_db_total_size_in_bytes`
-//! (+ `_in_use_`) from the backend's O(1) accounting. raft/wal internals
-//! we don't have are omitted rather than faked.
+//! `/metrics` carries an honest minimal set: `etcd_server_has_leader`,
+//! `etcd_server_is_leader` (both 1: single member by design) and
+//! `etcd_mvcc_db_total_size_in_bytes` (+ `_in_use_`) from the backend's O(1)
+//! accounting, plus `process_*` from the runtime collector on Linux only
+//! (`procfs` does not exist elsewhere). raft/wal internals we don't have
+//! are omitted rather than faked.
 
 use std::{convert::Infallible, sync::Arc};
 
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Method, Request, Response, StatusCode, body::Incoming};
-use prometheus::{Encoder, Gauge, Registry, TextEncoder, process_collector::ProcessCollector};
+#[cfg(target_os = "linux")]
+use prometheus::process_collector::ProcessCollector;
+use prometheus::{Encoder, Gauge, Registry, TextEncoder};
 
 use crate::backend::{Backend, VERSION};
 
@@ -87,9 +90,10 @@ struct Metrics {
 impl Metrics {
     fn new() -> Self {
         let registry = Registry::new();
-        let process = ProcessCollector::for_self();
+        // `ProcessCollector` only exists on Linux (procfs-backed).
+        #[cfg(target_os = "linux")]
         registry
-            .register(Box::new(process))
+            .register(Box::new(ProcessCollector::for_self()))
             .expect("fresh registry");
         let gauge = |name: &str, help: &str| {
             let g = Gauge::new(name, help).expect("valid gauge");

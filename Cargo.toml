@@ -24,7 +24,7 @@ http-body-util = "=0.1.5"
 hyper = { features = ["http1", "server"], version = "=1.12.0" }
 hyper-util = { features = ["tokio"], version = "=0.1.21" }
 oracledb = "=26.0.0-beta.6"
-prometheus = { features = ["process"], version = "=0.14.0" }
+prometheus = { version = "=0.14.0" }
 prost = "=0.14.6"
 protoc-bin-vendored = "=3.3.0"
 rcgen = "=0.14.10"
