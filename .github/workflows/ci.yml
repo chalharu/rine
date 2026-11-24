@@ -391,8 +391,10 @@ jobs:
           path: image
       # Same layout as the release job: prebuilt binary beside the
       # Dockerfile, so Dockerfile rot fails here instead of at tag time.
+      # Artifacts lose the exec bit on download, so restore it.
       - name: build image
         run: |
+          chmod +x image/rine-amd64
           cp Dockerfile image/Dockerfile
           docker build -f image/Dockerfile -t rine:ci image
       - name: smoke test image

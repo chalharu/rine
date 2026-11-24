@@ -130,8 +130,11 @@ jobs:
           merge-multiple: true
       # The Dockerfile copies prebuilt per-arch binaries (no compilation
       # inside), so multi-arch needs no emulation: one stage, just COPY.
+      # Artifacts lose the exec bit on download, so restore it.
       - name: prepare build context
-        run: cp Dockerfile image/Dockerfile
+        run: |
+          chmod +x image/rine-amd64 image/rine-arm64
+          cp Dockerfile image/Dockerfile
       - name: log in to GitHub Packages
         uses: docker/login-action@v3.6.0
         with:
