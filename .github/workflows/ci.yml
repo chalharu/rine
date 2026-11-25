@@ -25,7 +25,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: 1.100.0
           components: llvm-tools-preview
       - &rust-cache
         uses: Swatinem/rust-cache@v2.9.3
@@ -84,7 +84,7 @@ jobs:
       - *checkout
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: 1.100.0
           components: llvm-tools-preview
       - *rust-cache
       - name: wait for Oracle XE (TCP + PDB open)
@@ -127,7 +127,7 @@ jobs:
       - *checkout
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: 1.100.0
       - *rust-cache
       - name: build rine
         run: cargo build --locked -p rine
@@ -211,7 +211,7 @@ jobs:
       - *checkout
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: 1.100.0
       - *rust-cache
       - name: wait for Oracle XE (TCP + PDB open)
         run: |
@@ -334,7 +334,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: 1.100.0
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           lookup-only: true
