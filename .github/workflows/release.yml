@@ -152,7 +152,7 @@ jobs:
           chmod +x image/rine-amd64 image/rine-arm64
           cp Dockerfile image/Dockerfile
       - name: log in to GitHub Packages
-        uses: docker/login-action@v3.6.0
+        uses: docker/login-action@v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
