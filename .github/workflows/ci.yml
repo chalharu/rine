@@ -300,7 +300,7 @@ jobs:
           done
           rm coverage/lcov-*.info
       - name: SonarCloud scan
-        uses: SonarSource/sonarqube-scan-action@v8.5.0
+        uses: SonarSource/sonarqube-scan-action@v8.5.1
         env:
           SONAR_HOST_URL: https://sonarcloud.io
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
