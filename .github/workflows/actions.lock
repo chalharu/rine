@@ -10,7 +10,7 @@ workflows:
         - 'dtolnay/rust-toolchain@stable'
         - 'sonarsource/sonarqube-scan-action@v8.5.1'
         - 'swatinem/rust-cache@v2.9.3'
-        - 'taiki-e/install-action@v2.90.8'
+        - 'taiki-e/install-action@v2.90.11'
     '.github/workflows/release.yml':
         - 'actions/checkout@v7.0.1'
         - 'actions/download-artifact@v8.0.2'
@@ -66,8 +66,8 @@ dependencies:
         commit: 'sha1-d1527c8f67ef9af357290475d4af4b0fab8f12e0'
         owner_id: 580492
         repo_id: 298565987
-    'taiki-e/install-action@v2.90.8':
-        ref: 'v2.90.8'
-        commit: 'sha1-fe3acb53a98b62c772db35de75ce0e4595e7ca8c'
+    'taiki-e/install-action@v2.90.11':
+        ref: 'v2.90.11'
+        commit: 'sha1-073e1fd0bc889c9aee68dbaaa927cde1b5653a83'
         owner_id: 43724913
         repo_id: 442947557
