@@ -7,7 +7,7 @@
 # is only the tag the digest was taken from, the digest itself wins.
 # Same glibc floor caveat as the build runners (see the release workflow):
 # debian13 ships glibc 2.41, comfortably above the 22.04-built 2.35.
-FROM gcr.io/distroless/cc-debian13:latest@sha256:dac90a25ffe03ebaace90cda886b081e61ab6cd77ac47eda51f7bcc15c320765
+FROM gcr.io/distroless/cc-debian13:latest@sha256:e8343d4a7da8bb210df0c3ea29de38bbadbba6c773bed0cd8bde506fca3a5c44
 ARG TARGETARCH
 COPY rine-${TARGETARCH} /rine
 EXPOSE 2379
