@@ -41,7 +41,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.100.0
+          toolchain: 1.100.1
       # Read-only cache: saving from a tag build would let a poisoned
       # cache flow into later builds.
       - uses: Swatinem/rust-cache@v2.9.3
